@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveTime, Utc};
+use chrono::NaiveDateTime;
 use serde::Deserialize;
 use serde_repr::Deserialize_repr;
 
@@ -49,6 +49,7 @@ pub enum AgeRating {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct Chapter {
     pub id: u16,
     pub range: String,
@@ -60,13 +61,13 @@ pub struct Chapter {
     pub title: Option<String>,
     pub pages_read: u16,
     pub total_reads: u16,
-    pub last_reading_progress_utc: DateTime<Utc>,
-    pub last_reading_progress: NaiveTime,
+    pub last_reading_progress_utc: NaiveDateTime,
+    pub last_reading_progress: NaiveDateTime,
     pub volume_id: u16,
-    pub created_utc: DateTime<Utc>,
-    pub last_modified_utc: DateTime<Utc>,
-    pub created: NaiveTime,
-    pub release_date: NaiveTime,
+    pub created_utc: NaiveDateTime,
+    pub last_modified_utc: NaiveDateTime,
+    pub created: NaiveDateTime,
+    pub release_date: NaiveDateTime,
     pub title_name: Option<String>,
     pub summary: Option<String>,
     pub volume_title: Option<String>,

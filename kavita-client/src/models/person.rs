@@ -20,6 +20,7 @@ pub enum PersonRole {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct Person {
     pub id: u16,
     pub name: Option<String>,

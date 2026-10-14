@@ -490,15 +490,22 @@ mod view_helper {
         .into()
     }
 
+    /// Kavita's sentinel name for the "no explicit volume" bucket that holds
+    /// loose chapters/specials, rather than a real volume number.
+    const SPECIAL_VOLUME_SENTINEL: &str = "-100000";
+
     /// Kavita volume names are usually just the number (e.g. `"1"`); prefix
-    /// them so the card reads "Volume 1" rather than a bare "1". Non-numeric
-    /// or empty names (specials, loose chapters) are shown as-is, falling back
-    /// to a plain "Volume" when blank.
+    /// them so the card reads "Volume 1" rather than a bare "1". The
+    /// `-100000` sentinel bucket is shown as "Special"; other non-numeric or
+    /// empty names (named specials, loose chapters) are shown as-is, falling
+    /// back to a plain "Volume" when blank.
     fn volume_label(name: &str) -> String {
         let name = name.trim();
 
         if name.is_empty() {
             "Volume".to_string()
+        } else if name == SPECIAL_VOLUME_SENTINEL {
+            "Special".to_string()
         } else if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
             format!("Volume {name}")
         } else {
@@ -747,6 +754,16 @@ mod tests {
         assert!(ui.find("Beneath the Trees").is_ok());
         assert!(ui.find("Volume 1").is_ok());
         assert!(ui.find("24 pages").is_ok());
+    }
+
+    #[test]
+    fn view_renders_the_special_volume_sentinel_as_special() {
+        let detail = series_detail(AsyncModel::Loaded(vec![volume("-100000", Some(183))]));
+
+        let mut ui = simulator(detail.view());
+
+        assert!(ui.find("Special").is_ok());
+        assert!(ui.find("Volume -100000").is_err());
     }
 
     #[test]
