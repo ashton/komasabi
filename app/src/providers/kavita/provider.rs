@@ -2,9 +2,9 @@ use kavita_client::client::KavitaClient;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::{
-    adapter::{ChapterAdapter, ItemAdapter, LibraryAdapter},
-    models::{chapter::Chapter, library::Library, library_item::LibraryItem},
-    providers::kavita::adapter::{KavitaChapterAdapter, KavitaItemAdapter, KavitaLibraryAdapter},
+    adapter::{ItemAdapter, LibraryAdapter},
+    models::{library::Library, library_item::LibraryItem, series_entry::SeriesEntry},
+    providers::kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, series_entries},
 };
 
 pub struct KavitaProvider {
@@ -85,44 +85,63 @@ impl KavitaProvider {
             .collect())
     }
 
-    /// Lists a series' chapters, flattened across its volumes. Uses the same
-    /// `/api/Series/volumes` call as before — Kavita nests each volume's
-    /// chapters in that response — so the chapters come back in volume order.
-    pub async fn list_chapters(&self, series_id: u16) -> Result<Vec<Chapter>, String> {
+    /// Lists a series' contents as display entries (numbered volumes and/or
+    /// loose chapters), using the same `/api/Series/volumes` call as before —
+    /// Kavita nests each volume's chapters in that response. See
+    /// [`series_entries`] for how volumes vs chapters are chosen.
+    pub async fn list_series_entries(&self, series_id: u16) -> Result<Vec<SeriesEntry>, String> {
         let volumes = self
             .client
             .list_volumes_from_series(series_id)
             .await
             .map_err(crate::error::log_and_stringify)?;
 
-        Ok(volumes
-            .into_iter()
-            .flat_map(|volume| volume.chapters)
-            .map(KavitaChapterAdapter::adapt_chapter)
-            .collect())
+        Ok(series_entries(volumes))
     }
 
-    /// Returns the cover image bytes for a chapter, reading from the on-disk
+    /// Returns the cover image bytes for a volume, reading from the on-disk
     /// cache first and only hitting Kavita on a miss (writing the result back).
-    /// `integration_id` namespaces the cache key so chapter ids from different
-    /// Kavita servers can't collide; the `ch-` segment keeps chapter covers
-    /// from colliding with series covers (which key on `{integration_id}-{id}`).
+    /// `integration_id` namespaces the cache key; the `vol-` segment keeps
+    /// volume covers from colliding with series covers (which key on
+    /// `{integration_id}-{id}`) or chapter covers (`-ch-`).
+    pub async fn volume_cover(
+        &self,
+        integration_id: &str,
+        volume_id: u16,
+    ) -> Result<Vec<u8>, String> {
+        self.cached_cover(
+            format!("{integration_id}-vol-{volume_id}"),
+            self.client.volume_cover(volume_id),
+        )
+        .await
+    }
+
+    /// Returns the cover image bytes for a chapter, cached like
+    /// [`volume_cover`](Self::volume_cover) but under a `ch-` key segment.
     pub async fn chapter_cover(
         &self,
         integration_id: &str,
         chapter_id: u16,
     ) -> Result<Vec<u8>, String> {
-        let key = format!("{integration_id}-ch-{chapter_id}");
+        self.cached_cover(
+            format!("{integration_id}-ch-{chapter_id}"),
+            self.client.chapter_cover(chapter_id),
+        )
+        .await
+    }
 
+    /// Shared cover-cache path: return the on-disk bytes for `key` on a hit,
+    /// otherwise await `fetch`, write the result back, and return it.
+    async fn cached_cover(
+        &self,
+        key: String,
+        fetch: impl std::future::Future<Output = Result<Vec<u8>, reqwest::Error>>,
+    ) -> Result<Vec<u8>, String> {
         if let Some(bytes) = crate::cache::read_cover(&key) {
             return Ok(bytes);
         }
 
-        let bytes = self
-            .client
-            .chapter_cover(chapter_id)
-            .await
-            .map_err(crate::error::log_and_stringify)?;
+        let bytes = fetch.await.map_err(crate::error::log_and_stringify)?;
 
         if let Err(error) = crate::cache::write_cover(&key, &bytes) {
             tracing::debug!("failed to cache cover for {key}: {error}");
@@ -136,22 +155,10 @@ impl KavitaProvider {
     /// `integration_id` namespaces the cache key so series ids from different
     /// Kavita servers can't collide.
     pub async fn cover(&self, integration_id: &str, series_id: u16) -> Result<Vec<u8>, String> {
-        let key = format!("{integration_id}-{series_id}");
-
-        if let Some(bytes) = crate::cache::read_cover(&key) {
-            return Ok(bytes);
-        }
-
-        let bytes = self
-            .client
-            .series_cover(series_id)
-            .await
-            .map_err(crate::error::log_and_stringify)?;
-
-        if let Err(error) = crate::cache::write_cover(&key, &bytes) {
-            tracing::debug!("failed to cache cover for {key}: {error}");
-        }
-
-        Ok(bytes)
+        self.cached_cover(
+            format!("{integration_id}-{series_id}"),
+            self.client.series_cover(series_id),
+        )
+        .await
     }
 }

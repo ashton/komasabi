@@ -3,16 +3,20 @@ use std::collections::{HashMap, HashSet};
 use iced::widget::image;
 use iced::{Element, Task};
 
-use crate::models::{AsyncModel, chapter::Chapter, integration::IntegrationType};
+use crate::models::{
+    AsyncModel,
+    integration::IntegrationType,
+    series_entry::{EntryKind, SeriesEntry, cover_key},
+};
 use crate::providers::kavita::provider::KavitaProvider;
 use crate::repository::{integration as integration_repository, library as library_repository};
 
-/// The two tabs shown above the chapter grid. `Details` carries no data of its
+/// The two tabs shown above the contents grid. `Details` carries no data of its
 /// own — it just renders the series' metadata in list form, as a counterpart
 /// to the quick stats already in the header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
-    Chapters,
+    Contents,
     Details,
 }
 
@@ -21,26 +25,26 @@ pub struct SeriesDetail {
     series_name: String,
     series_pages: Option<u16>,
     /// The external id of the library the series belongs to, used to resolve
-    /// the integration to fetch chapters and covers through.
+    /// the integration to fetch entries and covers through.
     library_external_id: String,
     /// The series' own (large, header) cover, once it has loaded.
     series_cover: Option<image::Handle>,
-    chapters: AsyncModel<Vec<Chapter>, String>,
-    /// Decoded chapter cover images, keyed by chapter `external_id`.
+    entries: AsyncModel<Vec<SeriesEntry>, String>,
+    /// Decoded entry cover images, keyed by [`SeriesEntry::cover_key`].
     covers: HashMap<String, image::Handle>,
-    /// `external_id`s whose cover is currently being fetched, so it isn't
-    /// requested more than once.
+    /// cover keys whose cover is currently being fetched, so it isn't requested
+    /// more than once.
     covers_in_flight: HashSet<String>,
     active_tab: Tab,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
-    ChaptersLoaded(Result<Vec<Chapter>, String>),
+    EntriesLoaded(Result<Vec<SeriesEntry>, String>),
     SeriesCoverLoaded(Option<Vec<u8>>),
-    /// Cover image bytes that have been loaded, keyed by chapter `external_id`.
-    /// Failed/omitted ids are simply absent.
-    ChapterCoversLoaded(Vec<(String, Vec<u8>)>),
+    /// Cover image bytes that have been loaded, keyed by [`SeriesEntry::cover_key`].
+    /// Failed/omitted entries are simply absent.
+    CoversLoaded(Vec<(String, Vec<u8>)>),
     TabSelected(Tab),
     BackPressed,
 }
@@ -60,12 +64,12 @@ impl SeriesDetail {
         series_pages: Option<u16>,
         library_external_id: String,
     ) -> (Self, Task<Message>) {
-        let chapters_task = Task::perform(
-            crate::runtime::on_tokio(fetch_chapters(
+        let entries_task = Task::perform(
+            crate::runtime::on_tokio(fetch_entries(
                 library_external_id.clone(),
                 series_external_id.clone(),
             )),
-            Message::ChaptersLoaded,
+            Message::EntriesLoaded,
         );
 
         let cover_task = Task::perform(
@@ -82,23 +86,23 @@ impl SeriesDetail {
                 series_pages,
                 library_external_id,
                 series_cover: None,
-                chapters: AsyncModel::Loading,
+                entries: AsyncModel::Loading,
                 covers: HashMap::new(),
                 covers_in_flight: HashSet::new(),
-                active_tab: Tab::Chapters,
+                active_tab: Tab::Contents,
             },
-            Task::batch([chapters_task, cover_task]),
+            Task::batch([entries_task, cover_task]),
         )
     }
 
     pub fn update(&mut self, message: Message) -> Action {
         match message {
-            Message::ChaptersLoaded(result) => {
+            Message::EntriesLoaded(result) => {
                 let loaded = result.is_ok();
-                self.chapters = result.into();
+                self.entries = result.into();
 
                 if loaded {
-                    match self.request_chapter_covers() {
+                    match self.request_entry_covers() {
                         Some(task) => Action::Run(task),
                         None => Action::None,
                     }
@@ -113,11 +117,10 @@ impl SeriesDetail {
             }
             Message::SeriesCoverLoaded(None) => Action::None,
 
-            Message::ChapterCoversLoaded(covers) => {
-                for (external_id, bytes) in covers {
-                    self.covers_in_flight.remove(&external_id);
-                    self.covers
-                        .insert(external_id, image::Handle::from_bytes(bytes));
+            Message::CoversLoaded(covers) => {
+                for (key, bytes) in covers {
+                    self.covers_in_flight.remove(&key);
+                    self.covers.insert(key, image::Handle::from_bytes(bytes));
                 }
 
                 Action::None
@@ -137,38 +140,42 @@ impl SeriesDetail {
             &self.series_name,
             self.series_pages,
             self.series_cover.as_ref(),
-            &self.chapters,
+            &self.entries,
             &self.covers,
             self.active_tab,
         )
     }
 
-    /// Builds a task to fetch covers for every loaded chapter whose cover isn't
+    /// Builds a task to fetch covers for every loaded entry whose cover isn't
     /// already cached or in flight, marking them in flight. Returns `None`
     /// when there's nothing left to fetch.
-    fn request_chapter_covers(&mut self) -> Option<Task<Message>> {
-        let AsyncModel::Loaded(chapters) = &self.chapters else {
+    fn request_entry_covers(&mut self) -> Option<Task<Message>> {
+        let AsyncModel::Loaded(entries) = &self.entries else {
             return None;
         };
 
-        let chapter_ids: Vec<String> = chapters
+        let pending: Vec<(String, EntryKind)> = entries
             .iter()
-            .map(|chapter| chapter.external_id.clone())
-            .filter(|id| !self.covers.contains_key(id) && !self.covers_in_flight.contains(id))
+            .filter(|entry| {
+                let key = entry.cover_key();
+                !self.covers.contains_key(&key) && !self.covers_in_flight.contains(&key)
+            })
+            .map(|entry| (entry.external_id.clone(), entry.kind))
             .collect();
 
-        if chapter_ids.is_empty() {
+        if pending.is_empty() {
             return None;
         }
 
-        self.covers_in_flight.extend(chapter_ids.iter().cloned());
+        self.covers_in_flight
+            .extend(pending.iter().map(|(id, kind)| cover_key(*kind, id)));
 
         Some(Task::perform(
-            crate::runtime::on_tokio(fetch_chapter_covers(
+            crate::runtime::on_tokio(fetch_entry_covers(
                 self.library_external_id.clone(),
-                chapter_ids,
+                pending,
             )),
-            Message::ChapterCoversLoaded,
+            Message::CoversLoaded,
         ))
     }
 }
@@ -200,15 +207,15 @@ async fn kavita_provider_for_library(
     }
 }
 
-async fn fetch_chapters(
+async fn fetch_entries(
     library_external_id: String,
     series_external_id: String,
-) -> Result<Vec<Chapter>, String> {
+) -> Result<Vec<SeriesEntry>, String> {
     let series_id = series_external_id
         .parse::<u16>()
         .map_err(|_| format!("series id {series_external_id} is not a valid Kavita id"))?;
     let (provider, _integration_id) = kavita_provider_for_library(&library_external_id).await?;
-    provider.list_chapters(series_id).await
+    provider.list_series_entries(series_id).await
 }
 
 /// Fetches the series' own cover, returning `None` on any error (a missing
@@ -224,40 +231,43 @@ async fn fetch_series_cover(
     provider.cover(&integration_id, series_id).await.ok()
 }
 
-/// Fetches covers for the given chapters, returning `(external_id, bytes)` for
-/// each one that resolved. Per-id and whole-batch failures are logged and
-/// omitted rather than surfaced, so a partial result still renders what it can.
-async fn fetch_chapter_covers(
+/// Fetches covers for the given entries, returning `(cover_key, bytes)` for each
+/// one that resolved. Per-entry and whole-batch failures are logged and omitted
+/// rather than surfaced, so a partial result still renders what it can.
+async fn fetch_entry_covers(
     library_external_id: String,
-    chapter_ids: Vec<String>,
+    entries: Vec<(String, EntryKind)>,
 ) -> Vec<(String, Vec<u8>)> {
-    match load_chapter_covers(library_external_id, chapter_ids).await {
+    match load_entry_covers(library_external_id, entries).await {
         Ok(covers) => covers,
         Err(error) => {
-            tracing::debug!("failed to load chapter covers: {error}");
+            tracing::debug!("failed to load entry covers: {error}");
             Vec::new()
         }
     }
 }
 
-async fn load_chapter_covers(
+async fn load_entry_covers(
     library_external_id: String,
-    chapter_ids: Vec<String>,
+    entries: Vec<(String, EntryKind)>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let (provider, integration_id) = kavita_provider_for_library(&library_external_id).await?;
 
     let mut covers = Vec::new();
-    for chapter_id in chapter_ids {
-        let Ok(parsed) = chapter_id.parse::<u16>() else {
-            tracing::debug!("skipping cover for non-numeric chapter id {chapter_id}");
+    for (external_id, kind) in entries {
+        let Ok(parsed) = external_id.parse::<u16>() else {
+            tracing::debug!("skipping cover for non-numeric id {external_id}");
             continue;
         };
 
-        match provider.chapter_cover(&integration_id, parsed).await {
-            Ok(bytes) => covers.push((chapter_id, bytes)),
-            Err(error) => {
-                tracing::debug!("failed to fetch cover for chapter {chapter_id}: {error}")
-            }
+        let result = match kind {
+            EntryKind::Volume => provider.volume_cover(&integration_id, parsed).await,
+            EntryKind::Chapter => provider.chapter_cover(&integration_id, parsed).await,
+        };
+
+        match result {
+            Ok(bytes) => covers.push((cover_key(kind, &external_id), bytes)),
+            Err(error) => tracing::debug!("failed to fetch cover for {external_id}: {error}"),
         }
     }
 
@@ -275,7 +285,7 @@ mod view_helper {
     };
 
     use super::Tab;
-    use crate::models::{AsyncModel, chapter::Chapter};
+    use crate::models::{AsyncModel, series_entry::SeriesEntry};
 
     type Covers = HashMap<String, image::Handle>;
 
@@ -283,27 +293,24 @@ mod view_helper {
     /// comic aspect ratio).
     const HEADER_COVER_WIDTH: f32 = 200.0;
 
-    /// Kavita's sentinel range for the "no explicit number" bucket (loose
-    /// chapters/specials), rather than a real chapter number.
-    const SPECIAL_SENTINEL: &str = "-100000";
-
     pub fn view<'a>(
         series_name: &'a str,
         series_pages: Option<u16>,
         series_cover: Option<&'a image::Handle>,
-        chapters: &'a AsyncModel<Vec<Chapter>, String>,
+        entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
         active_tab: Tab,
     ) -> Element<'a, super::Message> {
-        let chapter_count = match chapters {
-            AsyncModel::Loaded(chapters) => Some(chapters.len()),
+        let count = match entries {
+            AsyncModel::Loaded(entries) => Some(entries.len()),
             _ => None,
         };
+        let noun = contents_noun(entries);
 
         let content = column![
-            header(series_name, series_pages, chapter_count, series_cover),
-            tab_bar(active_tab),
-            tab_content(active_tab, series_name, series_pages, chapters, covers),
+            header(series_name, series_pages, count, noun, series_cover),
+            tab_bar(active_tab, noun.tab),
+            tab_content(active_tab, series_name, series_pages, entries, covers, noun),
         ]
         .spacing(24)
         .padding(24)
@@ -315,6 +322,46 @@ mod view_helper {
             .into()
     }
 
+    /// How to name a series' contents in the UI, derived from what the entries
+    /// actually are: all-volumes, all-chapters, or a mix.
+    #[derive(Clone, Copy)]
+    struct Noun {
+        /// Tab/section label, e.g. "Volumes".
+        tab: &'static str,
+        /// Singular form for the count chip, e.g. "volume".
+        singular: &'static str,
+    }
+
+    fn contents_noun(entries: &AsyncModel<Vec<SeriesEntry>, String>) -> Noun {
+        use crate::models::series_entry::EntryKind;
+
+        let AsyncModel::Loaded(entries) = entries else {
+            return Noun {
+                tab: "Contents",
+                singular: "item",
+            };
+        };
+
+        let has_volume = entries.iter().any(|e| e.kind == EntryKind::Volume);
+        let has_chapter = entries.iter().any(|e| e.kind == EntryKind::Chapter);
+
+        match (has_volume, has_chapter) {
+            (true, false) => Noun {
+                tab: "Volumes",
+                singular: "volume",
+            },
+            (false, true) => Noun {
+                tab: "Chapters",
+                singular: "chapter",
+            },
+            // Mixed, or empty — a neutral label covers both.
+            _ => Noun {
+                tab: "Contents",
+                singular: "item",
+            },
+        }
+    }
+
     fn top_bar<'a>() -> Element<'a, super::Message> {
         container(button("Back").on_press(super::Message::BackPressed))
             .padding(20)
@@ -324,7 +371,8 @@ mod view_helper {
     fn header<'a>(
         series_name: &'a str,
         series_pages: Option<u16>,
-        chapter_count: Option<usize>,
+        count: Option<usize>,
+        noun: Noun,
         series_cover: Option<&'a image::Handle>,
     ) -> Element<'a, super::Message> {
         row![
@@ -334,7 +382,7 @@ mod view_helper {
                     weight: iced::font::Weight::Bold,
                     ..Font::default()
                 }),
-                stats(series_pages, chapter_count),
+                stats(series_pages, count, noun),
             ]
             .spacing(16)
             .width(Fill),
@@ -345,15 +393,18 @@ mod view_helper {
 
     fn stats<'a>(
         series_pages: Option<u16>,
-        chapter_count: Option<usize>,
+        count: Option<usize>,
+        noun: Noun,
     ) -> Element<'a, super::Message> {
         let mut chips = row![].spacing(8);
 
-        if let Some(count) = chapter_count {
-            chips = chips.push(stat_chip(format!(
-                "{count} {}",
-                if count == 1 { "chapter" } else { "chapters" }
-            )));
+        if let Some(count) = count {
+            let unit = if count == 1 {
+                noun.singular.to_string()
+            } else {
+                format!("{}s", noun.singular)
+            };
+            chips = chips.push(stat_chip(format!("{count} {unit}")));
         }
 
         if let Some(pages) = series_pages {
@@ -391,9 +442,9 @@ mod view_helper {
             .into()
     }
 
-    fn tab_bar<'a>(active_tab: Tab) -> Element<'a, super::Message> {
+    fn tab_bar<'a>(active_tab: Tab, contents_label: &'a str) -> Element<'a, super::Message> {
         row![
-            tab_button("Chapters", Tab::Chapters, active_tab),
+            tab_button(contents_label, Tab::Contents, active_tab),
             tab_button("Details", Tab::Details, active_tab),
         ]
         .spacing(8)
@@ -428,34 +479,35 @@ mod view_helper {
         active_tab: Tab,
         series_name: &'a str,
         series_pages: Option<u16>,
-        chapters: &'a AsyncModel<Vec<Chapter>, String>,
+        entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
+        noun: Noun,
     ) -> Element<'a, super::Message> {
         match active_tab {
-            Tab::Chapters => chapters_body(chapters, covers),
-            Tab::Details => details_body(series_name, series_pages, chapters),
+            Tab::Contents => contents_body(entries, covers),
+            Tab::Details => details_body(series_name, series_pages, entries, noun),
         }
     }
 
-    fn chapters_body<'a>(
-        chapters: &'a AsyncModel<Vec<Chapter>, String>,
+    fn contents_body<'a>(
+        entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
-        match chapters {
-            AsyncModel::Loaded(chapters) if chapters.is_empty() => empty_state(),
-            AsyncModel::Loaded(chapters) => chapters_grid(chapters, covers),
+        match entries {
+            AsyncModel::Loaded(entries) if entries.is_empty() => empty_state(),
+            AsyncModel::Loaded(entries) => entries_grid(entries, covers),
             AsyncModel::Error(error) => error_state(error),
             AsyncModel::NotLoaded | AsyncModel::Loading => loading_state(),
         }
     }
 
-    fn chapters_grid<'a>(
-        chapters: &'a [Chapter],
+    fn entries_grid<'a>(
+        entries: &'a [SeriesEntry],
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
-        let cards = chapters
+        let cards = entries
             .iter()
-            .map(|chapter| chapter_card(chapter, covers.get(&chapter.external_id)));
+            .map(|entry| entry_card(entry, covers.get(&entry.cover_key())));
 
         container(
             grid(cards)
@@ -467,8 +519,8 @@ mod view_helper {
         .into()
     }
 
-    fn chapter_card<'a>(
-        chapter: &'a Chapter,
+    fn entry_card<'a>(
+        entry: &'a SeriesEntry,
         cover: Option<&image::Handle>,
     ) -> Element<'a, super::Message> {
         column![
@@ -477,36 +529,13 @@ mod view_helper {
                 .height(Fill)
                 .clip(true)
                 .style(cover_box_style),
-            text(chapter_label(chapter)).size(13),
-            pages_label(chapter.pages),
+            text(&entry.label).size(13),
+            pages_label(entry.pages),
         ]
         .width(Fill)
         .spacing(4)
         .align_x(Center)
         .into()
-    }
-
-    /// Builds a chapter's card label: a distinct title wins; otherwise the
-    /// chapter number is prefixed so the card reads "#1" rather than a bare
-    /// "1". Specials (and Kavita's `-100000` sentinel range) fall back to
-    /// "Special".
-    fn chapter_label(chapter: &Chapter) -> String {
-        if let Some(title) = chapter
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-        {
-            return title.to_string();
-        }
-
-        let range = chapter.range.trim();
-
-        if chapter.is_special || range.is_empty() || range == SPECIAL_SENTINEL {
-            "Special".to_string()
-        } else {
-            format!("#{range}")
-        }
     }
 
     /// Renders a cover if its handle has loaded, otherwise nothing (the styled
@@ -548,10 +577,11 @@ mod view_helper {
     fn details_body<'a>(
         series_name: &'a str,
         series_pages: Option<u16>,
-        chapters: &'a AsyncModel<Vec<Chapter>, String>,
+        entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
+        noun: Noun,
     ) -> Element<'a, super::Message> {
-        let chapter_count = match chapters {
-            AsyncModel::Loaded(chapters) => chapters.len().to_string(),
+        let count = match entries {
+            AsyncModel::Loaded(entries) => entries.len().to_string(),
             AsyncModel::Loading | AsyncModel::NotLoaded | AsyncModel::Error(_) => "—".to_string(),
         };
 
@@ -561,7 +591,7 @@ mod view_helper {
 
         column![
             detail_row("Title", series_name.to_string()),
-            detail_row("Chapters", chapter_count),
+            detail_row(noun.tab, count),
             detail_row("Pages", pages),
         ]
         .spacing(12)
@@ -579,7 +609,7 @@ mod view_helper {
     }
 
     fn empty_state<'a>() -> Element<'a, super::Message> {
-        container(text("Nenhum capítulo encontrado nesta série"))
+        container(text("Nenhum conteúdo encontrado nesta série"))
             .center_x(Fill)
             .padding(40)
             .into()
@@ -600,31 +630,39 @@ mod tests {
 
     use super::*;
 
-    fn chapter(range: &str, pages: Option<u16>) -> Chapter {
-        Chapter {
-            external_id: range.to_string(),
-            range: range.to_string(),
-            title: None,
-            is_special: false,
+    fn volume_entry(id: &str, label: &str, pages: Option<u16>) -> SeriesEntry {
+        SeriesEntry {
+            external_id: id.to_string(),
+            kind: EntryKind::Volume,
+            label: label.to_string(),
             pages,
         }
     }
 
-    fn series_detail(chapters: AsyncModel<Vec<Chapter>, String>) -> SeriesDetail {
+    fn chapter_entry(id: &str, label: &str, pages: Option<u16>) -> SeriesEntry {
+        SeriesEntry {
+            external_id: id.to_string(),
+            kind: EntryKind::Chapter,
+            label: label.to_string(),
+            pages,
+        }
+    }
+
+    fn series_detail(entries: AsyncModel<Vec<SeriesEntry>, String>) -> SeriesDetail {
         SeriesDetail {
             series_name: "Beneath the Trees".to_string(),
             series_pages: Some(183),
             library_external_id: "lib-1".to_string(),
             series_cover: None,
-            chapters,
+            entries,
             covers: HashMap::new(),
             covers_in_flight: HashSet::new(),
-            active_tab: Tab::Chapters,
+            active_tab: Tab::Contents,
         }
     }
 
     #[test]
-    fn new_starts_in_loading_with_the_chapters_tab_active() {
+    fn new_starts_in_loading_with_the_contents_tab_active() {
         let (detail, _task) = SeriesDetail::new(
             "1".to_string(),
             "One Piece".to_string(),
@@ -632,39 +670,43 @@ mod tests {
             "lib-1".to_string(),
         );
 
-        assert!(matches!(detail.chapters, AsyncModel::Loading));
-        assert_eq!(detail.active_tab, Tab::Chapters);
+        assert!(matches!(detail.entries, AsyncModel::Loading));
+        assert_eq!(detail.active_tab, Tab::Contents);
         assert!(detail.series_cover.is_none());
     }
 
     #[test]
-    fn chapters_loaded_ok_stores_chapters_and_requests_covers() {
+    fn entries_loaded_ok_stores_entries_and_requests_covers() {
         let mut detail = series_detail(AsyncModel::Loading);
 
-        let action = detail.update(Message::ChaptersLoaded(Ok(vec![chapter("1", Some(24))])));
+        let action = detail.update(Message::EntriesLoaded(Ok(vec![chapter_entry(
+            "1",
+            "#1",
+            Some(24),
+        )])));
 
         assert!(matches!(action, Action::Run(_)));
-        assert!(matches!(detail.chapters, AsyncModel::Loaded(ref c) if c.len() == 1));
-        assert!(detail.covers_in_flight.contains("1"));
+        assert!(matches!(detail.entries, AsyncModel::Loaded(ref e) if e.len() == 1));
+        assert!(detail.covers_in_flight.contains("ch:1"));
     }
 
     #[test]
-    fn chapters_loaded_empty_does_not_request_covers() {
+    fn entries_loaded_empty_does_not_request_covers() {
         let mut detail = series_detail(AsyncModel::Loading);
 
-        let action = detail.update(Message::ChaptersLoaded(Ok(vec![])));
+        let action = detail.update(Message::EntriesLoaded(Ok(vec![])));
 
         assert!(matches!(action, Action::None));
     }
 
     #[test]
-    fn chapters_loaded_error_stores_the_error() {
+    fn entries_loaded_error_stores_the_error() {
         let mut detail = series_detail(AsyncModel::Loading);
 
-        let action = detail.update(Message::ChaptersLoaded(Err("boom".to_string())));
+        let action = detail.update(Message::EntriesLoaded(Err("boom".to_string())));
 
         assert!(matches!(action, Action::None));
-        assert!(matches!(detail.chapters, AsyncModel::Error(ref e) if e == "boom"));
+        assert!(matches!(detail.entries, AsyncModel::Error(ref e) if e == "boom"));
     }
 
     #[test]
@@ -688,38 +730,53 @@ mod tests {
     }
 
     #[test]
-    fn chapter_covers_loaded_inserts_handles_and_clears_in_flight() {
-        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter("1", None)]));
-        detail.covers_in_flight.insert("1".to_string());
+    fn covers_loaded_inserts_handles_and_clears_in_flight() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        detail.covers_in_flight.insert("ch:1".to_string());
 
-        let action = detail.update(Message::ChapterCoversLoaded(vec![(
-            "1".to_string(),
+        let action = detail.update(Message::CoversLoaded(vec![(
+            "ch:1".to_string(),
             vec![1, 2, 3, 4],
         )]));
 
         assert!(matches!(action, Action::None));
-        assert!(detail.covers.contains_key("1"));
-        assert!(!detail.covers_in_flight.contains("1"));
+        assert!(detail.covers.contains_key("ch:1"));
+        assert!(!detail.covers_in_flight.contains("ch:1"));
     }
 
     #[test]
-    fn request_chapter_covers_skips_cached_and_in_flight_chapters() {
+    fn request_entry_covers_marks_volume_and_chapter_covers_by_kind() {
         let mut detail = series_detail(AsyncModel::Loaded(vec![
-            chapter("cached", None),
-            chapter("in-flight", None),
-            chapter("fresh", None),
+            volume_entry("5", "Volume 1", None),
+            chapter_entry("5", "#1", None),
+        ]));
+
+        let task = detail.request_entry_covers();
+
+        assert!(task.is_some());
+        // Same numeric id, different kinds — must not collide.
+        assert!(detail.covers_in_flight.contains("vol:5"));
+        assert!(detail.covers_in_flight.contains("ch:5"));
+    }
+
+    #[test]
+    fn request_entry_covers_skips_cached_and_in_flight_entries() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![
+            chapter_entry("cached", "#1", None),
+            chapter_entry("in-flight", "#2", None),
+            chapter_entry("fresh", "#3", None),
         ]));
         detail
             .covers
-            .insert("cached".to_string(), image::Handle::from_bytes(vec![0]));
-        detail.covers_in_flight.insert("in-flight".to_string());
+            .insert("ch:cached".to_string(), image::Handle::from_bytes(vec![0]));
+        detail.covers_in_flight.insert("ch:in-flight".to_string());
 
-        let task = detail.request_chapter_covers();
+        let task = detail.request_entry_covers();
 
         assert!(task.is_some());
-        assert!(detail.covers_in_flight.contains("fresh"));
-        assert!(detail.covers_in_flight.contains("in-flight"));
-        assert!(!detail.covers_in_flight.contains("cached"));
+        assert!(detail.covers_in_flight.contains("ch:fresh"));
+        assert!(detail.covers_in_flight.contains("ch:in-flight"));
+        assert!(!detail.covers_in_flight.contains("ch:cached"));
     }
 
     #[test]
@@ -742,8 +799,8 @@ mod tests {
     }
 
     #[test]
-    fn view_renders_the_series_name_and_chapter_cards() {
-        let detail = series_detail(AsyncModel::Loaded(vec![chapter("1", Some(24))]));
+    fn view_renders_the_series_name_and_entry_cards() {
+        let detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", Some(24))]));
 
         let mut ui = simulator(detail.view());
 
@@ -753,51 +810,51 @@ mod tests {
     }
 
     #[test]
-    fn view_renders_a_distinct_chapter_title_over_the_number() {
-        let titled = Chapter {
-            title: Some("The Reckoning".to_string()),
-            ..chapter("3", None)
-        };
-        let detail = series_detail(AsyncModel::Loaded(vec![titled]));
-
-        let mut ui = simulator(detail.view());
-
-        assert!(ui.find("The Reckoning").is_ok());
-        assert!(ui.find("#3").is_err());
-    }
-
-    #[test]
-    fn view_renders_a_special_chapter_as_special() {
-        let special = Chapter {
-            is_special: true,
-            ..chapter("-100000", None)
-        };
-        let detail = series_detail(AsyncModel::Loaded(vec![special]));
-
-        let mut ui = simulator(detail.view());
-
-        assert!(ui.find("Special").is_ok());
-    }
-
-    #[test]
-    fn view_renders_the_chapter_count_in_the_header() {
+    fn view_names_the_tab_and_count_volumes_when_entries_are_volumes() {
         let detail = series_detail(AsyncModel::Loaded(vec![
-            chapter("1", None),
-            chapter("2", None),
+            volume_entry("1", "Volume 1", None),
+            volume_entry("2", "Volume 2", None),
         ]));
 
         let mut ui = simulator(detail.view());
 
+        assert!(ui.find("Volumes").is_ok());
+        assert!(ui.find("2 volumes").is_ok());
+    }
+
+    #[test]
+    fn view_names_the_tab_and_count_chapters_when_entries_are_chapters() {
+        let detail = series_detail(AsyncModel::Loaded(vec![
+            chapter_entry("1", "#1", None),
+            chapter_entry("2", "#2", None),
+        ]));
+
+        let mut ui = simulator(detail.view());
+
+        assert!(ui.find("Chapters").is_ok());
         assert!(ui.find("2 chapters").is_ok());
     }
 
     #[test]
-    fn view_renders_the_empty_state_when_there_are_no_chapters() {
+    fn view_uses_a_neutral_label_for_mixed_contents() {
+        let detail = series_detail(AsyncModel::Loaded(vec![
+            volume_entry("1", "Volume 1", None),
+            chapter_entry("2", "#2", None),
+        ]));
+
+        let mut ui = simulator(detail.view());
+
+        assert!(ui.find("Contents").is_ok());
+        assert!(ui.find("2 items").is_ok());
+    }
+
+    #[test]
+    fn view_renders_the_empty_state_when_there_are_no_entries() {
         let detail = series_detail(AsyncModel::Loaded(vec![]));
 
         let mut ui = simulator(detail.view());
 
-        assert!(ui.find("Nenhum capítulo encontrado nesta série").is_ok());
+        assert!(ui.find("Nenhum conteúdo encontrado nesta série").is_ok());
     }
 
     #[test]
@@ -835,13 +892,12 @@ mod tests {
 
     #[test]
     fn details_tab_lists_the_series_metadata() {
-        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter("1", None)]));
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
         detail.active_tab = Tab::Details;
 
         let mut ui = simulator(detail.view());
 
         assert!(ui.find("Title").is_ok());
-        assert!(ui.find("Chapters").is_ok());
         assert!(ui.find("Pages").is_ok());
     }
 }
