@@ -1,4 +1,4 @@
-use crate::models::{library::Library, library_item::LibraryItem, volume::Volume};
+use crate::models::{chapter::Chapter, library::Library, library_item::LibraryItem};
 
 pub trait ItemAdapter<T> {
     fn adapt_item(source: T) -> LibraryItem;
@@ -8,6 +8,6 @@ pub trait LibraryAdapter<T> {
     fn adapt_library(source: T, integration_id: &str) -> Library;
 }
 
-pub trait VolumeAdapter<T> {
-    fn adapt_volume(source: T) -> Volume;
+pub trait ChapterAdapter<T> {
+    fn adapt_chapter(source: T) -> Chapter;
 }

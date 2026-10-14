@@ -1,16 +1,16 @@
 use kavita_client::models::{
+    chapter::Chapter as KavitaChapter,
     library::{KavitaLibrary, KavitaLibraryType},
     series::Series as KavitaSeries,
-    volume::Volume as KavitaVolume,
 };
 use uuid::Uuid;
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter, VolumeAdapter},
+    adapter::{ChapterAdapter, ItemAdapter, LibraryAdapter},
     models::{
+        chapter::Chapter,
         library::{Library, LibraryType},
         library_item::LibraryItem,
-        volume::Volume,
     },
 };
 
@@ -28,14 +28,22 @@ impl ItemAdapter<KavitaSeries> for KavitaItemAdapter {
     }
 }
 
-pub struct KavitaVolumeAdapter;
+pub struct KavitaChapterAdapter;
 
-impl VolumeAdapter<KavitaVolume> for KavitaVolumeAdapter {
-    fn adapt_volume(source: KavitaVolume) -> Volume {
-        Volume {
+impl ChapterAdapter<KavitaChapter> for KavitaChapterAdapter {
+    fn adapt_chapter(source: KavitaChapter) -> Chapter {
+        // Kavita fills `title`/`title_name` with the bare chapter number when
+        // there's no real title, so a title is only meaningful when it differs
+        // from the range we'd show anyway.
+        let title = source
+            .title_name
+            .filter(|title| !title.trim().is_empty() && title.trim() != source.range.trim());
+
+        Chapter {
             external_id: source.id.to_string(),
-            name: source.name,
-            series_id: source.series_id.to_string(),
+            range: source.range,
+            title,
+            is_special: source.is_special,
             pages: (source.pages > 0).then_some(source.pages),
         }
     }
@@ -157,32 +165,58 @@ mod tests {
     }
 
     #[test]
-    fn adapt_volume_maps_fields_and_pages() {
-        let source = KavitaVolume {
+    fn adapt_chapter_maps_fields_and_pages() {
+        let source = KavitaChapter {
             id: 9,
-            name: "1".to_string(),
-            series_id: 1,
+            range: "1".to_string(),
+            is_special: false,
             pages: 24,
-            ..KavitaVolume::default()
+            ..KavitaChapter::default()
         };
 
-        let volume = KavitaVolumeAdapter::adapt_volume(source);
+        let chapter = KavitaChapterAdapter::adapt_chapter(source);
 
-        assert_eq!(volume.external_id, "9");
-        assert_eq!(volume.name, "1");
-        assert_eq!(volume.series_id, "1");
-        assert_eq!(volume.pages, Some(24));
+        assert_eq!(chapter.external_id, "9");
+        assert_eq!(chapter.range, "1");
+        assert!(!chapter.is_special);
+        assert_eq!(chapter.pages, Some(24));
     }
 
     #[test]
-    fn adapt_volume_maps_zero_pages_to_none() {
-        let source = KavitaVolume {
+    fn adapt_chapter_maps_zero_pages_to_none() {
+        let source = KavitaChapter {
             pages: 0,
-            ..KavitaVolume::default()
+            ..KavitaChapter::default()
         };
 
-        let volume = KavitaVolumeAdapter::adapt_volume(source);
+        let chapter = KavitaChapterAdapter::adapt_chapter(source);
 
-        assert_eq!(volume.pages, None);
+        assert_eq!(chapter.pages, None);
+    }
+
+    #[test]
+    fn adapt_chapter_ignores_a_title_that_just_repeats_the_range() {
+        let source = KavitaChapter {
+            range: "3".to_string(),
+            title_name: Some("3".to_string()),
+            ..KavitaChapter::default()
+        };
+
+        let chapter = KavitaChapterAdapter::adapt_chapter(source);
+
+        assert_eq!(chapter.title, None);
+    }
+
+    #[test]
+    fn adapt_chapter_keeps_a_distinct_title() {
+        let source = KavitaChapter {
+            range: "3".to_string(),
+            title_name: Some("The Reckoning".to_string()),
+            ..KavitaChapter::default()
+        };
+
+        let chapter = KavitaChapterAdapter::adapt_chapter(source);
+
+        assert_eq!(chapter.title, Some("The Reckoning".to_string()));
     }
 }

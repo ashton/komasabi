@@ -1,8 +1,8 @@
+pub mod chapter;
 pub mod integration;
 pub mod job;
 pub mod library;
 pub mod library_item;
-pub mod volume;
 
 #[derive(Debug, Default)]
 pub enum AsyncModel<T, E> {
