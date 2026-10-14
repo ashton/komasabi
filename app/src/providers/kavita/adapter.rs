@@ -1,14 +1,16 @@
 use kavita_client::models::{
     library::{KavitaLibrary, KavitaLibraryType},
     series::Series as KavitaSeries,
+    volume::Volume as KavitaVolume,
 };
 use uuid::Uuid;
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
+    adapter::{ItemAdapter, LibraryAdapter, VolumeAdapter},
     models::{
         library::{Library, LibraryType},
         library_item::LibraryItem,
+        volume::Volume,
     },
 };
 
@@ -21,6 +23,19 @@ impl ItemAdapter<KavitaSeries> for KavitaItemAdapter {
             name: source.name,
             library_id: source.library_id.to_string(),
             cover: source.cover_image,
+            pages: (source.pages > 0).then_some(source.pages),
+        }
+    }
+}
+
+pub struct KavitaVolumeAdapter;
+
+impl VolumeAdapter<KavitaVolume> for KavitaVolumeAdapter {
+    fn adapt_volume(source: KavitaVolume) -> Volume {
+        Volume {
+            external_id: source.id.to_string(),
+            name: source.name,
+            series_id: source.series_id.to_string(),
             pages: (source.pages > 0).then_some(source.pages),
         }
     }
@@ -139,5 +154,35 @@ mod tests {
         let item = KavitaItemAdapter::adapt_item(source);
 
         assert_eq!(item.pages, None);
+    }
+
+    #[test]
+    fn adapt_volume_maps_fields_and_pages() {
+        let source = KavitaVolume {
+            id: 9,
+            name: "1".to_string(),
+            series_id: 1,
+            pages: 24,
+            ..KavitaVolume::default()
+        };
+
+        let volume = KavitaVolumeAdapter::adapt_volume(source);
+
+        assert_eq!(volume.external_id, "9");
+        assert_eq!(volume.name, "1");
+        assert_eq!(volume.series_id, "1");
+        assert_eq!(volume.pages, Some(24));
+    }
+
+    #[test]
+    fn adapt_volume_maps_zero_pages_to_none() {
+        let source = KavitaVolume {
+            pages: 0,
+            ..KavitaVolume::default()
+        };
+
+        let volume = KavitaVolumeAdapter::adapt_volume(source);
+
+        assert_eq!(volume.pages, None);
     }
 }

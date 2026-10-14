@@ -66,6 +66,8 @@ pub enum Message {
     CoversLoaded(Vec<(String, Vec<u8>)>),
     Scrolled(ScrollMetrics),
     ContentOverflowChecked(bool),
+    /// A series card was clicked; carries the item's `external_id`.
+    SeriesSelected(String),
     BackPressed,
 }
 
@@ -91,6 +93,12 @@ pub struct ScrollMetrics {
 pub enum Action {
     None,
     Run(Task<Message>),
+    OpenSeries {
+        series_external_id: String,
+        series_name: String,
+        series_pages: Option<u16>,
+        library_external_id: String,
+    },
     BackPressed,
 }
 
@@ -305,8 +313,39 @@ impl Browse {
                 self.request_next_page().unwrap_or(Action::None)
             }
 
+            Message::SeriesSelected(external_id) => {
+                let Some(library_external_id) =
+                    self.pagination.as_ref().map(|p| p.external_id.clone())
+                else {
+                    return Action::None;
+                };
+
+                let Some(item) = self.loaded_item(&external_id) else {
+                    return Action::None;
+                };
+
+                Action::OpenSeries {
+                    series_external_id: item.external_id.clone(),
+                    series_name: item.name.clone(),
+                    series_pages: item.pages,
+                    library_external_id,
+                }
+            }
+
             Message::BackPressed => Action::BackPressed,
         }
+    }
+
+    /// Finds a currently-loaded item by its `external_id`, if present.
+    fn loaded_item(&self, external_id: &str) -> Option<&LibraryItem> {
+        let AsyncModel::Loaded(items) = &self.items else {
+            return None;
+        };
+
+        items
+            .iter()
+            .flatten()
+            .find(|item| item.external_id == external_id)
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
@@ -774,15 +813,23 @@ mod view_helper {
         item: &'a LibraryItem,
         cover: Option<&image::Handle>,
     ) -> Element<'a, super::Message> {
-        column![
+        let content = column![
             thumbnail(cover),
             text(&item.name).size(13),
             pages_label(item.pages)
         ]
         .width(Fill)
+        .height(Fill)
         .spacing(4)
-        .align_x(Center)
-        .into()
+        .align_x(Center);
+
+        button(content)
+            .on_press(super::Message::SeriesSelected(item.external_id.clone()))
+            .padding(0)
+            .width(Fill)
+            .height(Fill)
+            .style(button::text)
+            .into()
     }
 
     /// Placeholder for an item whose data has been evicted from memory
@@ -976,6 +1023,70 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert!(matches!(browse.items, AsyncModel::Error(ref error) if error == "boom"));
+    }
+
+    #[test]
+    fn update_series_selected_returns_open_series_with_item_metadata() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            Some(pagination(true, false)),
+        );
+
+        let action = browse.update(Message::SeriesSelected("One Piece".to_string()));
+
+        match action {
+            Action::OpenSeries {
+                series_external_id,
+                series_name,
+                series_pages,
+                library_external_id,
+            } => {
+                assert_eq!(series_external_id, "One Piece");
+                assert_eq!(series_name, "One Piece");
+                assert_eq!(series_pages, Some(42));
+                assert_eq!(library_external_id, "lib-1");
+            }
+            other => panic!("expected OpenSeries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_series_selected_for_an_unknown_item_returns_none() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, false)),
+        );
+
+        let action = browse.update(Message::SeriesSelected("Berserk".to_string()));
+
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn update_series_selected_without_pagination_returns_none() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            None,
+        );
+
+        let action = browse.update(Message::SeriesSelected("One Piece".to_string()));
+
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn clicking_an_item_card_sends_series_selected() {
+        let browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            Some(pagination(true, false)),
+        );
+
+        let mut ui = simulator(browse.view());
+        let _ = ui.click("One Piece").expect("item card should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::SeriesSelected("One Piece".to_string())]);
     }
 
     #[test]

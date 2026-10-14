@@ -2,9 +2,9 @@ use kavita_client::client::KavitaClient;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
-    models::{library::Library, library_item::LibraryItem},
-    providers::kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter},
+    adapter::{ItemAdapter, LibraryAdapter, VolumeAdapter},
+    models::{library::Library, library_item::LibraryItem, volume::Volume},
+    providers::kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, KavitaVolumeAdapter},
 };
 
 pub struct KavitaProvider {
@@ -83,6 +83,48 @@ impl KavitaProvider {
             .into_iter()
             .map(KavitaItemAdapter::adapt_item)
             .collect())
+    }
+
+    pub async fn list_volumes(&self, series_id: u16) -> Result<Vec<Volume>, String> {
+        let volumes = self
+            .client
+            .list_volumes_from_series(series_id)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        Ok(volumes
+            .into_iter()
+            .map(KavitaVolumeAdapter::adapt_volume)
+            .collect())
+    }
+
+    /// Returns the cover image bytes for a volume, reading from the on-disk
+    /// cache first and only hitting Kavita on a miss (writing the result back).
+    /// `integration_id` namespaces the cache key so volume ids from different
+    /// Kavita servers can't collide; the `vol-` segment keeps volume covers
+    /// from colliding with series covers (which key on `{integration_id}-{id}`).
+    pub async fn volume_cover(
+        &self,
+        integration_id: &str,
+        volume_id: u16,
+    ) -> Result<Vec<u8>, String> {
+        let key = format!("{integration_id}-vol-{volume_id}");
+
+        if let Some(bytes) = crate::cache::read_cover(&key) {
+            return Ok(bytes);
+        }
+
+        let bytes = self
+            .client
+            .volume_cover(volume_id)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        if let Err(error) = crate::cache::write_cover(&key, &bytes) {
+            tracing::debug!("failed to cache cover for {key}: {error}");
+        }
+
+        Ok(bytes)
     }
 
     /// Returns the cover image bytes for a series, reading from the on-disk

@@ -14,7 +14,7 @@ mod screen;
 
 use crate::{
     menu::{Menu, MenuItem},
-    screen::{Home, browse, home, integration, library, settings},
+    screen::{Home, browse, home, integration, library, series_detail, settings},
 };
 use iced::{
     Element,
@@ -38,6 +38,7 @@ enum Message {
     Home(home::Message),
     Library(library::Message),
     Browse(browse::Message),
+    SeriesDetail(series_detail::Message),
     Integrations(integration::Message),
 }
 
@@ -124,6 +125,31 @@ impl SabitaApp {
                     browse::Action::None => Task::none(),
                     browse::Action::Run(task) => task.map(Message::Browse),
                     browse::Action::BackPressed => self.open_library(),
+                    browse::Action::OpenSeries {
+                        series_external_id,
+                        series_name,
+                        series_pages,
+                        library_external_id,
+                    } => self.open_series_detail(
+                        series_external_id,
+                        series_name,
+                        series_pages,
+                        library_external_id,
+                    ),
+                }
+            }
+
+            Message::SeriesDetail(msg) => {
+                let Screen::SeriesDetail(series_detail) = &mut self.screen else {
+                    return Task::none();
+                };
+
+                match series_detail.update(msg) {
+                    series_detail::Action::None => Task::none(),
+                    series_detail::Action::Run(task) => task.map(Message::SeriesDetail),
+                    series_detail::Action::Back(library_external_id) => {
+                        self.open_browse_remote(library_external_id)
+                    }
                 }
             }
 
@@ -183,6 +209,9 @@ impl SabitaApp {
             Screen::Home(home) => home.view().map(Message::Home),
             Screen::Library(library) => library.view().map(Message::Library),
             Screen::Browse(browse) => browse.view().map(Message::Browse),
+            Screen::SeriesDetail(series_detail) => {
+                series_detail.view().map(Message::SeriesDetail)
+            }
             Screen::Settings(settings) => settings.view().map(Message::Settings),
             Screen::Integrations(integrations) => integrations.view().map(Message::Integrations),
         };
@@ -237,6 +266,24 @@ impl SabitaApp {
         self.screen = Screen::Browse(params);
 
         task.map(Message::Browse)
+    }
+
+    fn open_series_detail(
+        &mut self,
+        series_external_id: String,
+        series_name: String,
+        series_pages: Option<u16>,
+        library_external_id: String,
+    ) -> Task<Message> {
+        let (params, task) = screen::SeriesDetail::new(
+            series_external_id,
+            series_name,
+            series_pages,
+            library_external_id,
+        );
+        self.screen = Screen::SeriesDetail(params);
+
+        task.map(Message::SeriesDetail)
     }
 
     fn open_integrations(&mut self) -> Task<Message> {
