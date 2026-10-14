@@ -17,6 +17,7 @@ pub struct KavitaItemAdapter;
 impl ItemAdapter<KavitaSeries> for KavitaItemAdapter {
     fn adapt_item(source: KavitaSeries) -> LibraryItem {
         LibraryItem {
+            external_id: source.id.to_string(),
             name: source.name,
             library_id: source.library_id.to_string(),
             cover: source.cover_image,
@@ -111,8 +112,9 @@ mod tests {
     #[test]
     fn adapt_item_maps_fields_and_pages() {
         let source = KavitaSeries {
+            id: 1,
             name: "One Piece".to_string(),
-            cover_image: "/api/image/series-cover?seriesId=1".to_string(),
+            cover_image: "1.png".to_string(),
             library_id: 7,
             pages: 42,
             ..KavitaSeries::default()
@@ -120,8 +122,9 @@ mod tests {
 
         let item = KavitaItemAdapter::adapt_item(source);
 
+        assert_eq!(item.external_id, "1");
         assert_eq!(item.name, "One Piece");
-        assert_eq!(item.cover, "/api/image/series-cover?seriesId=1");
+        assert_eq!(item.cover, "1.png");
         assert_eq!(item.library_id, "7");
         assert_eq!(item.pages, Some(42));
     }

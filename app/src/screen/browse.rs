@@ -1,4 +1,7 @@
+use std::collections::{HashMap, HashSet};
+
 use iced::advanced::widget::Id as WidgetId;
+use iced::widget::image;
 use iced::{Element, Task};
 
 use crate::models::{AsyncModel, integration::IntegrationType, library_item::LibraryItem};
@@ -31,6 +34,13 @@ const ITEMS_SCROLLABLE_ID: &str = "browse-items";
 pub struct Browse {
     items: AsyncModel<Vec<Option<LibraryItem>>, String>,
     pagination: Option<Pagination>,
+    /// Decoded cover images, keyed by item `external_id`. Populated lazily as
+    /// pages load (see [`Browse::request_page_covers`]) and pruned alongside
+    /// page eviction so it doesn't grow without bound.
+    covers: HashMap<String, image::Handle>,
+    /// `external_id`s whose cover is currently being fetched, so a page isn't
+    /// requested more than once per session.
+    covers_in_flight: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -51,6 +61,9 @@ pub enum Message {
     ItemsLoaded(Result<Vec<LibraryItem>, String>),
     NextPageLoaded(Result<Vec<LibraryItem>, String>),
     PageRefetched(usize, Result<Vec<LibraryItem>, String>),
+    /// Cover image bytes that have been loaded for a page, keyed by item
+    /// `external_id`. Failed/omitted ids are simply absent.
+    CoversLoaded(Vec<(String, Vec<u8>)>),
     Scrolled(ScrollMetrics),
     ContentOverflowChecked(bool),
     BackPressed,
@@ -94,6 +107,8 @@ impl Browse {
                     loading_next: false,
                     refetching_pages: std::collections::HashSet::new(),
                 }),
+                covers: HashMap::new(),
+                covers_in_flight: HashSet::new(),
             },
             Task::perform(
                 crate::runtime::on_tokio(fetch_remote_items_page(external_id, 1, PAGE_SIZE)),
@@ -109,6 +124,8 @@ impl Browse {
             Self {
                 items: AsyncModel::Loaded(Vec::new()),
                 pagination: None,
+                covers: HashMap::new(),
+                covers_in_flight: HashSet::new(),
             },
             Task::none(),
         )
@@ -129,7 +146,10 @@ impl Browse {
                 self.items = result.into();
 
                 if loaded {
-                    Action::Run(measure_items_scrollable())
+                    Action::Run(with_cover_task(
+                        measure_items_scrollable(),
+                        self.request_page_covers(),
+                    ))
                 } else {
                     Action::None
                 }
@@ -170,12 +190,27 @@ impl Browse {
                     }
                 }
 
-                Action::Run(measure_items_scrollable())
+                self.prune_covers();
+
+                Action::Run(with_cover_task(
+                    measure_items_scrollable(),
+                    self.request_page_covers(),
+                ))
             }
 
             Message::NextPageLoaded(Err(_)) => {
                 if let Some(pagination) = &mut self.pagination {
                     pagination.loading_next = false;
+                }
+
+                Action::None
+            }
+
+            Message::CoversLoaded(covers) => {
+                for (external_id, bytes) in covers {
+                    self.covers_in_flight.remove(&external_id);
+                    self.covers
+                        .insert(external_id, image::Handle::from_bytes(bytes));
                 }
 
                 Action::None
@@ -240,7 +275,10 @@ impl Browse {
                     }
                 }
 
-                Action::None
+                match self.request_page_covers() {
+                    Some(task) => Action::Run(task),
+                    None => Action::None,
+                }
             }
 
             Message::PageRefetched(page_index, Err(error)) => {
@@ -272,7 +310,7 @@ impl Browse {
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
-        view_helper::view(&self.items)
+        view_helper::view(&self.items, &self.covers)
     }
 
     /// Requests the next page, if pagination is set up for it, there isn't
@@ -321,6 +359,60 @@ impl Browse {
             crate::runtime::on_tokio(fetch_remote_items_page(external_id, page_number, page_size)),
             move |result| Message::PageRefetched(page_index, result),
         ))
+    }
+
+    /// Builds a task to fetch covers for every currently-loaded item whose
+    /// cover isn't already cached or in flight, marking them in flight.
+    /// Returns `None` when there's no remote library or nothing left to fetch.
+    fn request_page_covers(&mut self) -> Option<Task<Message>> {
+        let library_external_id = self.pagination.as_ref()?.external_id.clone();
+
+        let AsyncModel::Loaded(items) = &self.items else {
+            return None;
+        };
+
+        let series_ids: Vec<String> = items
+            .iter()
+            .flatten()
+            .map(|item| item.external_id.clone())
+            .filter(|id| !self.covers.contains_key(id) && !self.covers_in_flight.contains(id))
+            .collect();
+
+        if series_ids.is_empty() {
+            return None;
+        }
+
+        self.covers_in_flight.extend(series_ids.iter().cloned());
+
+        Some(Task::perform(
+            crate::runtime::on_tokio(fetch_page_covers(library_external_id, series_ids)),
+            Message::CoversLoaded,
+        ))
+    }
+
+    /// Drops cached covers whose item is no longer loaded (e.g. was evicted),
+    /// keeping the cover map bounded to roughly the live item window.
+    fn prune_covers(&mut self) {
+        let AsyncModel::Loaded(items) = &self.items else {
+            return;
+        };
+
+        let present: HashSet<&str> = items
+            .iter()
+            .flatten()
+            .map(|item| item.external_id.as_str())
+            .collect();
+
+        self.covers.retain(|id, _| present.contains(id.as_str()));
+    }
+}
+
+/// Combines the viewport-measurement task that already runs after a page loads
+/// with an optional cover-fetch task, so both run from a single `Action::Run`.
+fn with_cover_task(measure: Task<Message>, covers: Option<Task<Message>>) -> Task<Message> {
+    match covers {
+        Some(covers) => Task::batch([measure, covers]),
+        None => measure,
     }
 }
 
@@ -539,20 +631,83 @@ async fn fetch_remote_items_page(
     }
 }
 
+/// Fetches covers for a page's series, returning `(external_id, bytes)` for
+/// each one that resolved. Per-id and whole-batch failures are logged and
+/// omitted rather than surfaced, so a partial result still renders what it can.
+async fn fetch_page_covers(
+    library_external_id: String,
+    series_ids: Vec<String>,
+) -> Vec<(String, Vec<u8>)> {
+    match load_page_covers(library_external_id, series_ids).await {
+        Ok(covers) => covers,
+        Err(error) => {
+            tracing::debug!("failed to load page covers: {error}");
+            Vec::new()
+        }
+    }
+}
+
+async fn load_page_covers(
+    library_external_id: String,
+    series_ids: Vec<String>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let library = library_repository::find_by_external_id(&library_external_id).await?;
+    let integration_id = library
+        .integration_id
+        .ok_or_else(|| "library has no associated integration".to_string())?;
+    let integration = integration_repository::find(&integration_id).await?;
+
+    match integration.integration_type {
+        IntegrationType::Kavita => {
+            let url = integration
+                .url
+                .ok_or_else(|| "integration is missing a url".to_string())?;
+            let api_key = integration
+                .api_key
+                .ok_or_else(|| "integration is missing an api key".to_string())?;
+
+            let provider = KavitaProvider::authenticate(url, api_key).await?;
+
+            let mut covers = Vec::new();
+            for series_id in series_ids {
+                let Ok(parsed) = series_id.parse::<u16>() else {
+                    tracing::debug!("skipping cover for non-numeric series id {series_id}");
+                    continue;
+                };
+
+                match provider.cover(&integration_id, parsed).await {
+                    Ok(bytes) => covers.push((series_id, bytes)),
+                    Err(error) => {
+                        tracing::debug!("failed to fetch cover for series {series_id}: {error}")
+                    }
+                }
+            }
+
+            Ok(covers)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 mod view_helper {
+    use std::collections::HashMap;
+
     use iced::{
-        Background, Border, Center, Element,
+        Background, Border, Center, ContentFit, Element,
         Length::Fill,
         Theme,
-        widget::{button, column, container, grid, row, scrollable, text},
+        widget::{button, column, container, grid, image, row, scrollable, text},
     };
 
     use crate::models::{AsyncModel, library_item::LibraryItem};
 
+    type Covers = HashMap<String, image::Handle>;
+
     pub fn view<'a>(
         items: &'a AsyncModel<Vec<Option<LibraryItem>>, String>,
+        covers: &'a Covers,
     ) -> Element<'a, super::Message> {
-        column![top_bar(), body(items)]
+        column![top_bar(), body(items, covers)]
             .width(Fill)
             .height(Fill)
             .into()
@@ -566,17 +721,21 @@ mod view_helper {
 
     fn body<'a>(
         items: &'a AsyncModel<Vec<Option<LibraryItem>>, String>,
+        covers: &'a Covers,
     ) -> Element<'a, super::Message> {
         match items {
             AsyncModel::Loaded(items) if items.is_empty() => empty_state(),
-            AsyncModel::Loaded(items) => items_scrollable(items),
+            AsyncModel::Loaded(items) => items_scrollable(items, covers),
             AsyncModel::Error(error) => error_state(error),
             AsyncModel::NotLoaded | AsyncModel::Loading => container(row![]).into(),
         }
     }
 
-    fn items_scrollable<'a>(items: &'a [Option<LibraryItem>]) -> Element<'a, super::Message> {
-        scrollable(items_grid(items))
+    fn items_scrollable<'a>(
+        items: &'a [Option<LibraryItem>],
+        covers: &'a Covers,
+    ) -> Element<'a, super::Message> {
+        scrollable(items_grid(items, covers))
             .id(iced::advanced::widget::Id::new(super::ITEMS_SCROLLABLE_ID))
             .width(Fill)
             .height(Fill)
@@ -591,9 +750,12 @@ mod view_helper {
             .into()
     }
 
-    fn items_grid<'a>(items: &'a [Option<LibraryItem>]) -> Element<'a, super::Message> {
+    fn items_grid<'a>(
+        items: &'a [Option<LibraryItem>],
+        covers: &'a Covers,
+    ) -> Element<'a, super::Message> {
         let cards = items.iter().map(|item| match item {
-            Some(item) => item_card(item),
+            Some(item) => item_card(item, covers.get(&item.external_id)),
             None => evicted_card(),
         });
 
@@ -608,9 +770,12 @@ mod view_helper {
         .into()
     }
 
-    fn item_card<'a>(item: &'a LibraryItem) -> Element<'a, super::Message> {
+    fn item_card<'a>(
+        item: &'a LibraryItem,
+        cover: Option<&image::Handle>,
+    ) -> Element<'a, super::Message> {
         column![
-            thumbnail(),
+            thumbnail(cover),
             text(&item.name).size(13),
             pages_label(item.pages)
         ]
@@ -624,13 +789,25 @@ mod view_helper {
     /// because it was scrolled far off-screen; keeps the grid's item count
     /// (and thus its scroll geometry) stable.
     fn evicted_card<'a>() -> Element<'a, super::Message> {
-        container(thumbnail()).width(Fill).height(Fill).into()
+        container(thumbnail(None)).width(Fill).height(Fill).into()
     }
 
-    fn thumbnail<'a>() -> Element<'a, super::Message> {
-        container(row![])
+    /// Renders an item's cover if it has loaded, otherwise the same styled
+    /// grey box used as a placeholder (and for evicted items).
+    fn thumbnail<'a>(handle: Option<&image::Handle>) -> Element<'a, super::Message> {
+        let inner: Element<'a, super::Message> = match handle {
+            Some(handle) => image(handle.clone())
+                .width(Fill)
+                .height(Fill)
+                .content_fit(ContentFit::Cover)
+                .into(),
+            None => row![].into(),
+        };
+
+        container(inner)
             .width(Fill)
             .height(Fill)
+            .clip(true)
             .style(|theme: &Theme| container::Style {
                 background: Some(Background::Color(
                     theme.extended_palette().background.strong.color,
@@ -673,10 +850,22 @@ mod tests {
 
     fn library_item(name: &str, pages: Option<u16>) -> LibraryItem {
         LibraryItem {
+            external_id: name.to_string(),
             name: name.to_string(),
             cover: String::new(),
             library_id: "1".to_string(),
             pages,
+        }
+    }
+
+    /// Builds a `Browse` with empty cover state, so tests only have to specify
+    /// the `items`/`pagination` they care about.
+    fn browse(items: AsyncModel<Vec<Option<LibraryItem>>, String>, pagination: Option<Pagination>) -> Browse {
+        Browse {
+            items,
+            pagination,
+            covers: HashMap::new(),
+            covers_in_flight: HashSet::new(),
         }
     }
 
@@ -744,10 +933,7 @@ mod tests {
 
     #[test]
     fn update_items_loaded_stores_result_and_checks_the_viewport() {
-        let mut browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
         let action = browse.update(Message::ItemsLoaded(Ok(vec![library_item(
             "One Piece",
@@ -760,10 +946,7 @@ mod tests {
 
     #[test]
     fn update_items_loaded_with_a_full_page_keeps_has_more_true() {
-        let mut browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
         let full_page: Vec<_> = (0..PAGE_SIZE)
             .map(|i| library_item(&format!("Item {i}"), None))
@@ -776,10 +959,7 @@ mod tests {
 
     #[test]
     fn update_items_loaded_with_a_short_page_clears_has_more() {
-        let mut browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
         browse.update(Message::ItemsLoaded(Ok(vec![library_item(
             "Only one", None,
@@ -790,10 +970,7 @@ mod tests {
 
     #[test]
     fn update_items_loaded_stores_error_and_returns_no_action() {
-        let mut browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
         let action = browse.update(Message::ItemsLoaded(Err("boom".to_string())));
 
@@ -803,10 +980,7 @@ mod tests {
 
     #[test]
     fn update_back_pressed_returns_back_pressed_action() {
-        let mut browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: None,
-        };
+        let mut browse = browse(AsyncModel::Loading, None);
 
         let action = browse.update(Message::BackPressed);
 
@@ -815,14 +989,14 @@ mod tests {
 
     #[test]
     fn scrolling_near_the_bottom_requests_the_next_page() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(
+        let mut browse = browse(
+            AsyncModel::Loaded(
                 (0..PAGE_SIZE)
                     .map(|i| Some(library_item(&format!("Item {i}"), None)))
                     .collect(),
             ),
-            pagination: Some(pagination(true, false)),
-        };
+            Some(pagination(true, false)),
+        );
 
         let action = browse.update(Message::Scrolled(scroll_metrics(0.9)));
 
@@ -832,14 +1006,14 @@ mod tests {
 
     #[test]
     fn scrolling_away_from_the_bottom_does_not_request_a_page() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(
+        let mut browse = browse(
+            AsyncModel::Loaded(
                 (0..PAGE_SIZE)
                     .map(|i| Some(library_item(&format!("Item {i}"), None)))
                     .collect(),
             ),
-            pagination: Some(pagination(true, false)),
-        };
+            Some(pagination(true, false)),
+        );
 
         let action = browse.update(Message::Scrolled(scroll_metrics(0.3)));
 
@@ -849,10 +1023,10 @@ mod tests {
 
     #[test]
     fn scrolling_near_the_bottom_while_a_page_is_already_loading_does_nothing() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, true)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, true)),
+        );
 
         let action = browse.update(Message::Scrolled(scroll_metrics(0.95)));
 
@@ -861,10 +1035,10 @@ mod tests {
 
     #[test]
     fn scrolling_near_the_bottom_without_more_pages_does_nothing() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
 
         let action = browse.update(Message::Scrolled(scroll_metrics(0.95)));
 
@@ -873,10 +1047,10 @@ mod tests {
 
     #[test]
     fn next_page_loaded_appends_items_and_advances_pagination() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, true)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, true)),
+        );
 
         let action = browse.update(Message::NextPageLoaded(Ok(vec![library_item(
             "Berserk", None,
@@ -898,10 +1072,10 @@ mod tests {
 
     #[test]
     fn content_overflow_checked_true_does_not_request_a_page() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, false)),
+        );
 
         let action = browse.update(Message::ContentOverflowChecked(true));
 
@@ -911,10 +1085,10 @@ mod tests {
 
     #[test]
     fn content_overflow_checked_false_requests_the_next_page_to_fill_the_viewport() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, false)),
+        );
 
         let action = browse.update(Message::ContentOverflowChecked(false));
 
@@ -924,10 +1098,10 @@ mod tests {
 
     #[test]
     fn content_overflow_checked_false_without_more_pages_does_nothing() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
 
         let action = browse.update(Message::ContentOverflowChecked(false));
 
@@ -936,10 +1110,10 @@ mod tests {
 
     #[test]
     fn content_overflow_checked_false_while_already_loading_does_nothing() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, true)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, true)),
+        );
 
         let action = browse.update(Message::ContentOverflowChecked(false));
 
@@ -948,10 +1122,7 @@ mod tests {
 
     #[test]
     fn content_overflow_checked_false_without_pagination_does_nothing() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(Vec::new()),
-            pagination: None,
-        };
+        let mut browse = browse(AsyncModel::Loaded(Vec::new()), None);
 
         let action = browse.update(Message::ContentOverflowChecked(false));
 
@@ -960,10 +1131,10 @@ mod tests {
 
     #[test]
     fn next_page_loaded_error_resets_loading_flag_without_dropping_items() {
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: Some(pagination(true, true)),
-        };
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(true, true)),
+        );
 
         browse.update(Message::NextPageLoaded(Err("boom".to_string())));
 
@@ -982,10 +1153,7 @@ mod tests {
         let mut pagination_state = pagination(true, false);
         pagination_state.next_page = KEEP_PAGES_LOADED as u32 + 1;
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination_state),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination_state));
 
         let new_page: Vec<_> = (0..PAGE_SIZE)
             .map(|i| library_item(&format!("New {i}"), None))
@@ -1010,10 +1178,7 @@ mod tests {
             .map(|i| Some(library_item(&format!("Item {i}"), None)))
             .collect();
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(true, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(true, false)));
 
         let new_page: Vec<_> = (0..PAGE_SIZE)
             .map(|i| library_item(&format!("New {i}"), None))
@@ -1033,10 +1198,7 @@ mod tests {
             .map(|i| Some(library_item(&format!("Item {i}"), None)))
             .collect();
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
 
         browse.update(Message::Scrolled(scroll_metrics(0.99)));
 
@@ -1091,10 +1253,7 @@ mod tests {
             *slot = None;
         }
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
 
         // Scroll back up onto the evicted page 0.
         let action = browse.update(Message::Scrolled(scroll_metrics_at_page(60, 0)));
@@ -1109,10 +1268,7 @@ mod tests {
             .map(|i| Some(library_item(&format!("Item {i}"), None)))
             .collect();
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
 
         let action = browse.update(Message::Scrolled(scroll_metrics_at_page(60, 0)));
 
@@ -1129,10 +1285,7 @@ mod tests {
             *slot = None;
         }
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
 
         browse.update(Message::Scrolled(scroll_metrics_at_page(60, 0)));
         let action = browse.update(Message::Scrolled(scroll_metrics_at_page(60, 0)));
@@ -1149,10 +1302,7 @@ mod tests {
             *slot = None;
         }
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(false, false)),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
 
         // A tall viewport spanning pages 0 and 1 at once, both evicted.
         let metrics = ScrollMetrics {
@@ -1181,10 +1331,7 @@ mod tests {
         let mut pagination_state = pagination(false, false);
         pagination_state.refetching_pages.insert(0);
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination_state),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination_state));
 
         let refetched: Vec<_> = (0..PAGE_SIZE)
             .map(|i| library_item(&format!("Refetched {i}"), None))
@@ -1192,7 +1339,9 @@ mod tests {
 
         let action = browse.update(Message::PageRefetched(0, Ok(refetched)));
 
-        assert!(matches!(action, Action::None));
+        // A successful refetch now also kicks off a cover fetch for the
+        // spliced-in page, so it returns a task rather than `Action::None`.
+        assert!(matches!(action, Action::Run(_)));
         assert!(!browse.pagination.unwrap().refetching_pages.contains(&0));
 
         let AsyncModel::Loaded(items) = &browse.items else {
@@ -1213,10 +1362,7 @@ mod tests {
         let mut pagination_state = pagination(false, false);
         pagination_state.refetching_pages.insert(0);
 
-        let mut browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination_state),
-        };
+        let mut browse = browse(AsyncModel::Loaded(items), Some(pagination_state));
 
         let action = browse.update(Message::PageRefetched(0, Err("boom".to_string())));
 
@@ -1226,11 +1372,85 @@ mod tests {
     }
 
     #[test]
+    fn covers_loaded_inserts_handles_and_clears_in_flight() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        browse.covers_in_flight.insert("One Piece".to_string());
+
+        let action = browse.update(Message::CoversLoaded(vec![(
+            "One Piece".to_string(),
+            vec![1, 2, 3, 4],
+        )]));
+
+        assert!(matches!(action, Action::None));
+        assert!(browse.covers.contains_key("One Piece"));
+        assert!(!browse.covers_in_flight.contains("One Piece"));
+    }
+
+    #[test]
+    fn request_page_covers_skips_items_already_cached_or_in_flight() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![
+                Some(library_item("cached", None)),
+                Some(library_item("in-flight", None)),
+                Some(library_item("fresh", None)),
+            ]),
+            Some(pagination(false, false)),
+        );
+        browse
+            .covers
+            .insert("cached".to_string(), image::Handle::from_bytes(vec![0]));
+        browse.covers_in_flight.insert("in-flight".to_string());
+
+        // Only "fresh" should newly enter the in-flight set.
+        let task = browse.request_page_covers();
+
+        assert!(task.is_some());
+        assert!(browse.covers_in_flight.contains("fresh"));
+        assert!(browse.covers_in_flight.contains("in-flight"));
+        assert!(!browse.covers_in_flight.contains("cached"));
+    }
+
+    #[test]
+    fn request_page_covers_returns_none_when_everything_is_already_covered() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        browse
+            .covers
+            .insert("One Piece".to_string(), image::Handle::from_bytes(vec![0]));
+
+        assert!(browse.request_page_covers().is_none());
+    }
+
+    #[test]
+    fn prune_covers_drops_entries_for_evicted_items() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![None, Some(library_item("still-here", None))]),
+            Some(pagination(false, false)),
+        );
+        browse
+            .covers
+            .insert("evicted".to_string(), image::Handle::from_bytes(vec![0]));
+        browse
+            .covers
+            .insert("still-here".to_string(), image::Handle::from_bytes(vec![0]));
+
+        browse.prune_covers();
+
+        assert!(browse.covers.contains_key("still-here"));
+        assert!(!browse.covers.contains_key("evicted"));
+    }
+
+    #[test]
     fn view_renders_item_name_and_pages_when_loaded() {
-        let browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
-            pagination: None,
-        };
+        let browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            None,
+        );
 
         let mut ui = simulator(browse.view());
 
@@ -1240,10 +1460,10 @@ mod tests {
 
     #[test]
     fn view_does_not_render_pages_when_absent() {
-        let browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            pagination: None,
-        };
+        let browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            None,
+        );
 
         let mut ui = simulator(browse.view());
 
@@ -1253,10 +1473,7 @@ mod tests {
 
     #[test]
     fn view_renders_error_message_when_loading_failed() {
-        let browse = Browse {
-            items: AsyncModel::Error("boom".to_string()),
-            pagination: None,
-        };
+        let browse = browse(AsyncModel::Error("boom".to_string()), None);
 
         let mut ui = simulator(browse.view());
 
@@ -1265,10 +1482,7 @@ mod tests {
 
     #[test]
     fn clicking_back_sends_back_pressed_message() {
-        let browse = Browse {
-            items: AsyncModel::Loading,
-            pagination: None,
-        };
+        let browse = browse(AsyncModel::Loading, None);
 
         let mut ui = simulator(browse.view());
         let _ = ui.click("Back").expect("Back button should be found");
@@ -1280,10 +1494,10 @@ mod tests {
 
     #[test]
     fn view_renders_items_with_a_visible_non_collapsed_size() {
-        let browse = Browse {
-            items: AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
-            pagination: None,
-        };
+        let browse = browse(
+            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            None,
+        );
 
         let mut ui = simulator(browse.view());
         let bounds = ui
@@ -1301,10 +1515,7 @@ mod tests {
             .map(|i| Some(library_item(&format!("Item {i}"), None)))
             .collect();
 
-        let browse = Browse {
-            items: AsyncModel::Loaded(items),
-            pagination: Some(pagination(true, false)),
-        };
+        let browse = browse(AsyncModel::Loaded(items), Some(pagination(true, false)));
 
         let mut ui = simulator(browse.view());
         ui.point_at(iced::Point::new(100.0, 300.0));

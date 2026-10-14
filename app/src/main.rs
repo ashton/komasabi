@@ -1,4 +1,5 @@
 mod adapter;
+mod cache;
 pub mod database;
 mod error;
 mod icons;

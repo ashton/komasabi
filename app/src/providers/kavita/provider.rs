@@ -84,4 +84,28 @@ impl KavitaProvider {
             .map(KavitaItemAdapter::adapt_item)
             .collect())
     }
+
+    /// Returns the cover image bytes for a series, reading from the on-disk
+    /// cache first and only hitting Kavita on a miss (writing the result back).
+    /// `integration_id` namespaces the cache key so series ids from different
+    /// Kavita servers can't collide.
+    pub async fn cover(&self, integration_id: &str, series_id: u16) -> Result<Vec<u8>, String> {
+        let key = format!("{integration_id}-{series_id}");
+
+        if let Some(bytes) = crate::cache::read_cover(&key) {
+            return Ok(bytes);
+        }
+
+        let bytes = self
+            .client
+            .series_cover(series_id)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        if let Err(error) = crate::cache::write_cover(&key, &bytes) {
+            tracing::debug!("failed to cache cover for {key}: {error}");
+        }
+
+        Ok(bytes)
+    }
 }
