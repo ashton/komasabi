@@ -907,7 +907,10 @@ mod tests {
 
     /// Builds a `Browse` with empty cover state, so tests only have to specify
     /// the `items`/`pagination` they care about.
-    fn browse(items: AsyncModel<Vec<Option<LibraryItem>>, String>, pagination: Option<Pagination>) -> Browse {
+    fn browse(
+        items: AsyncModel<Vec<Option<LibraryItem>>, String>,
+        pagination: Option<Pagination>,
+    ) -> Browse {
         Browse {
             items,
             pagination,
@@ -1086,7 +1089,10 @@ mod tests {
 
         let messages: Vec<_> = ui.into_messages().collect();
 
-        assert_eq!(messages, vec![Message::SeriesSelected("One Piece".to_string())]);
+        assert_eq!(
+            messages,
+            vec![Message::SeriesSelected("One Piece".to_string())]
+        );
     }
 
     #[test]

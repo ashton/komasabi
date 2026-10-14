@@ -7,6 +7,7 @@ mod jobs;
 mod menu;
 mod models;
 mod providers;
+mod reader_launch;
 mod repository;
 mod runtime;
 mod schema;
@@ -209,9 +210,7 @@ impl SabitaApp {
             Screen::Home(home) => home.view().map(Message::Home),
             Screen::Library(library) => library.view().map(Message::Library),
             Screen::Browse(browse) => browse.view().map(Message::Browse),
-            Screen::SeriesDetail(series_detail) => {
-                series_detail.view().map(Message::SeriesDetail)
-            }
+            Screen::SeriesDetail(series_detail) => series_detail.view().map(Message::SeriesDetail),
             Screen::Settings(settings) => settings.view().map(Message::Settings),
             Screen::Integrations(integrations) => integrations.view().map(Message::Integrations),
         };

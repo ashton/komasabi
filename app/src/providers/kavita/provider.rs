@@ -3,12 +3,22 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::{
     adapter::{ItemAdapter, LibraryAdapter},
-    models::{library::Library, library_item::LibraryItem, series_entry::SeriesEntry},
-    providers::kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, series_entries},
+    models::{
+        library::Library,
+        library_item::LibraryItem,
+        series_entry::{EntryKind, SeriesEntry},
+    },
+    providers::{
+        PageRef, Provider,
+        kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, series_entries},
+    },
 };
 
 pub struct KavitaProvider {
     client: KavitaClient,
+    /// The Kavita API key, retained because the `/api/Reader/image` endpoint
+    /// authorizes on it as a query parameter rather than the bearer header.
+    api_key: String,
 }
 
 impl KavitaProvider {
@@ -36,6 +46,7 @@ impl KavitaProvider {
 
         Ok(Self {
             client: KavitaClient::new(url, http_client),
+            api_key,
         })
     }
 
@@ -99,6 +110,57 @@ impl KavitaProvider {
         Ok(series_entries(volumes))
     }
 
+    /// Resolves a series entry into the ordered pages to read. A chapter entry
+    /// is its own pages; a volume entry is the concatenation of its chapters'
+    /// pages, in `sort_order`. The volume's chapters come nested in the single
+    /// `/api/Volume` response, so a volume needs no per-chapter round trips.
+    pub async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String> {
+        let id = entry
+            .external_id
+            .parse::<u16>()
+            .map_err(|_| format!("entry id {} is not a valid Kavita id", entry.external_id))?;
+
+        match entry.kind {
+            EntryKind::Chapter => {
+                let chapter = self
+                    .client
+                    .chapter_detail(id)
+                    .await
+                    .map_err(crate::error::log_and_stringify)?;
+
+                Ok(chapter_pages(chapter.id, chapter.pages))
+            }
+            EntryKind::Volume => {
+                let volume = self
+                    .client
+                    .volume_detail(id)
+                    .await
+                    .map_err(crate::error::log_and_stringify)?;
+
+                let mut chapters = volume.chapters;
+                chapters.sort_by(|a, b| {
+                    a.sort_order
+                        .partial_cmp(&b.sort_order)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                Ok(chapters
+                    .into_iter()
+                    .flat_map(|chapter| chapter_pages(chapter.id, chapter.pages))
+                    .collect())
+            }
+        }
+    }
+
+    /// Fetches the bytes of a single reader page. Not cached here — the reader
+    /// launcher persists downloaded pages to the on-disk page cache instead.
+    pub async fn reader_image(&self, chapter_id: u16, page: u16) -> Result<Vec<u8>, String> {
+        self.client
+            .reader_image(chapter_id, page, &self.api_key)
+            .await
+            .map_err(crate::error::log_and_stringify)
+    }
+
     /// Returns the cover image bytes for a volume, reading from the on-disk
     /// cache first and only hitting Kavita on a miss (writing the result back).
     /// `integration_id` namespaces the cache key; the `vol-` segment keeps
@@ -160,5 +222,47 @@ impl KavitaProvider {
             self.client.series_cover(series_id),
         )
         .await
+    }
+}
+
+/// Expands a chapter into its 0-based page refs.
+fn chapter_pages(chapter_id: u16, pages: u16) -> Vec<PageRef> {
+    (0..pages)
+        .map(|page| PageRef { chapter_id, page })
+        .collect()
+}
+
+/// Exposes `KavitaProvider`'s operations through the backend-agnostic
+/// [`Provider`] trait. Each method defers to the inherent one of the same name
+/// (inherent methods win name resolution, so there's no recursion), letting
+/// [`ResolvedProvider`](crate::providers::ResolvedProvider) treat every backend
+/// uniformly.
+impl Provider for KavitaProvider {
+    async fn list_series_entries(&self, series_id: u16) -> Result<Vec<SeriesEntry>, String> {
+        self.list_series_entries(series_id).await
+    }
+
+    async fn cover(&self, integration_id: &str, series_id: u16) -> Result<Vec<u8>, String> {
+        self.cover(integration_id, series_id).await
+    }
+
+    async fn volume_cover(&self, integration_id: &str, volume_id: u16) -> Result<Vec<u8>, String> {
+        self.volume_cover(integration_id, volume_id).await
+    }
+
+    async fn chapter_cover(
+        &self,
+        integration_id: &str,
+        chapter_id: u16,
+    ) -> Result<Vec<u8>, String> {
+        self.chapter_cover(integration_id, chapter_id).await
+    }
+
+    async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String> {
+        self.reader_pages(entry).await
+    }
+
+    async fn reader_image(&self, chapter_id: u16, page: u16) -> Result<Vec<u8>, String> {
+        self.reader_image(chapter_id, page).await
     }
 }

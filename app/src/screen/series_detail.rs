@@ -5,11 +5,9 @@ use iced::{Element, Task};
 
 use crate::models::{
     AsyncModel,
-    integration::IntegrationType,
     series_entry::{EntryKind, SeriesEntry, cover_key},
 };
-use crate::providers::kavita::provider::KavitaProvider;
-use crate::repository::{integration as integration_repository, library as library_repository};
+use crate::providers::{Provider, provider_for_library};
 
 /// The two tabs shown above the contents grid. `Details` carries no data of its
 /// own — it just renders the series' metadata in list form, as a counterpart
@@ -36,6 +34,12 @@ pub struct SeriesDetail {
     /// more than once.
     covers_in_flight: HashSet<String>,
     active_tab: Tab,
+    /// Whether an entry is currently being prepared and opened in the reader.
+    /// Guards against double-launching while pages are still downloading.
+    launching: bool,
+    /// The last reader-launch failure, shown as a status banner until the next
+    /// attempt.
+    launch_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +51,10 @@ pub enum Message {
     CoversLoaded(Vec<(String, Vec<u8>)>),
     TabSelected(Tab),
     BackPressed,
+    /// A volume/chapter card was clicked; prepare it and open it in the reader.
+    EntrySelected(SeriesEntry),
+    /// The reader-launch task finished (the reader window is open, or it failed).
+    ReaderLaunched(Result<(), String>),
 }
 
 #[derive(Debug)]
@@ -90,6 +98,8 @@ impl SeriesDetail {
                 covers: HashMap::new(),
                 covers_in_flight: HashSet::new(),
                 active_tab: Tab::Contents,
+                launching: false,
+                launch_error: None,
             },
             Task::batch([entries_task, cover_task]),
         )
@@ -132,10 +142,45 @@ impl SeriesDetail {
             }
 
             Message::BackPressed => Action::Back(self.library_external_id.clone()),
+
+            Message::EntrySelected(entry) => {
+                // Ignore clicks while a launch is already in flight; the reader
+                // for the previous click is still being prepared.
+                if self.launching {
+                    return Action::None;
+                }
+
+                self.launching = true;
+                self.launch_error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::reader_launch::prepare_and_launch(
+                        self.library_external_id.clone(),
+                        self.series_name.clone(),
+                        entry,
+                    )),
+                    Message::ReaderLaunched,
+                ))
+            }
+
+            Message::ReaderLaunched(result) => {
+                self.launching = false;
+                if let Err(error) = result {
+                    tracing::debug!("failed to open reader: {error}");
+                    self.launch_error = Some(error);
+                }
+                Action::None
+            }
         }
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
+        let status = if self.launching {
+            Some("Preparando leitor…")
+        } else {
+            self.launch_error.as_deref()
+        };
+
         view_helper::view(
             &self.series_name,
             self.series_pages,
@@ -143,6 +188,7 @@ impl SeriesDetail {
             &self.entries,
             &self.covers,
             self.active_tab,
+            status,
         )
     }
 
@@ -180,33 +226,6 @@ impl SeriesDetail {
     }
 }
 
-/// Resolves the Kavita provider (and its integration id) for the library with
-/// `library_external_id`, authenticating against the stored credentials.
-async fn kavita_provider_for_library(
-    library_external_id: &str,
-) -> Result<(KavitaProvider, String), String> {
-    let library = library_repository::find_by_external_id(library_external_id).await?;
-    let integration_id = library
-        .integration_id
-        .ok_or_else(|| "library has no associated integration".to_string())?;
-    let integration = integration_repository::find(&integration_id).await?;
-
-    match integration.integration_type {
-        IntegrationType::Kavita => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-            let api_key = integration
-                .api_key
-                .ok_or_else(|| "integration is missing an api key".to_string())?;
-
-            let provider = KavitaProvider::authenticate(url, api_key).await?;
-            Ok((provider, integration_id))
-        }
-        _ => Err("this integration type is not supported yet".to_string()),
-    }
-}
-
 async fn fetch_entries(
     library_external_id: String,
     series_external_id: String,
@@ -214,7 +233,7 @@ async fn fetch_entries(
     let series_id = series_external_id
         .parse::<u16>()
         .map_err(|_| format!("series id {series_external_id} is not a valid Kavita id"))?;
-    let (provider, _integration_id) = kavita_provider_for_library(&library_external_id).await?;
+    let (provider, _integration_id) = provider_for_library(&library_external_id).await?;
     provider.list_series_entries(series_id).await
 }
 
@@ -225,9 +244,7 @@ async fn fetch_series_cover(
     series_external_id: String,
 ) -> Option<Vec<u8>> {
     let series_id = series_external_id.parse::<u16>().ok()?;
-    let (provider, integration_id) = kavita_provider_for_library(&library_external_id)
-        .await
-        .ok()?;
+    let (provider, integration_id) = provider_for_library(&library_external_id).await.ok()?;
     provider.cover(&integration_id, series_id).await.ok()
 }
 
@@ -251,7 +268,7 @@ async fn load_entry_covers(
     library_external_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (provider, integration_id) = kavita_provider_for_library(&library_external_id).await?;
+    let (provider, integration_id) = provider_for_library(&library_external_id).await?;
 
     let mut covers = Vec::new();
     for (external_id, kind) in entries {
@@ -300,6 +317,7 @@ mod view_helper {
         entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
         active_tab: Tab,
+        status: Option<&'a str>,
     ) -> Element<'a, super::Message> {
         let count = match entries {
             AsyncModel::Loaded(entries) => Some(entries.len()),
@@ -307,18 +325,37 @@ mod view_helper {
         };
         let noun = contents_noun(entries);
 
-        let content = column![
-            header(series_name, series_pages, count, noun, series_cover),
-            tab_bar(active_tab, noun.tab),
-            tab_content(active_tab, series_name, series_pages, entries, covers, noun),
-        ]
-        .spacing(24)
-        .padding(24)
-        .width(Fill);
+        let mut content = column![header(series_name, series_pages, count, noun, series_cover)]
+            .spacing(24)
+            .padding(24)
+            .width(Fill);
+
+        if let Some(status) = status {
+            content = content.push(status_banner(status));
+        }
+
+        content = content
+            .push(tab_bar(active_tab, noun.tab))
+            .push(tab_content(
+                active_tab,
+                series_name,
+                series_pages,
+                entries,
+                covers,
+                noun,
+            ));
 
         column![top_bar(), scrollable(content).width(Fill).height(Fill)]
             .width(Fill)
             .height(Fill)
+            .into()
+    }
+
+    /// A one-line status banner (reader preparing / last launch error).
+    fn status_banner<'a>(status: &'a str) -> Element<'a, super::Message> {
+        container(text(status).size(13))
+            .padding(8)
+            .width(Fill)
             .into()
     }
 
@@ -523,7 +560,7 @@ mod view_helper {
         entry: &'a SeriesEntry,
         cover: Option<&image::Handle>,
     ) -> Element<'a, super::Message> {
-        column![
+        let content = column![
             container(cover_image(cover))
                 .width(Fill)
                 .height(Fill)
@@ -533,9 +570,17 @@ mod view_helper {
             pages_label(entry.pages),
         ]
         .width(Fill)
+        .height(Fill)
         .spacing(4)
-        .align_x(Center)
-        .into()
+        .align_x(Center);
+
+        button(content)
+            .on_press(super::Message::EntrySelected(entry.clone()))
+            .padding(0)
+            .width(Fill)
+            .height(Fill)
+            .style(button::text)
+            .into()
     }
 
     /// Renders a cover if its handle has loaded, otherwise nothing (the styled
@@ -658,6 +703,8 @@ mod tests {
             covers: HashMap::new(),
             covers_in_flight: HashSet::new(),
             active_tab: Tab::Contents,
+            launching: false,
+            launch_error: None,
         }
     }
 
@@ -697,6 +744,30 @@ mod tests {
         let action = detail.update(Message::EntriesLoaded(Ok(vec![])));
 
         assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn entry_selected_is_ignored_while_a_launch_is_already_in_flight() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![]));
+        detail.launching = true;
+
+        let action = detail.update(Message::EntrySelected(chapter_entry("1", "#1", Some(24))));
+
+        // No new launch is kicked off; the in-flight one is left alone.
+        assert!(matches!(action, Action::None));
+        assert!(detail.launching);
+    }
+
+    #[test]
+    fn reader_launched_error_is_surfaced_and_clears_the_launching_flag() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![]));
+        detail.launching = true;
+
+        let action = detail.update(Message::ReaderLaunched(Err("boom".to_string())));
+
+        assert!(matches!(action, Action::None));
+        assert!(!detail.launching);
+        assert_eq!(detail.launch_error.as_deref(), Some("boom"));
     }
 
     #[test]

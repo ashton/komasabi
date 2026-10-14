@@ -9,18 +9,32 @@ use std::path::PathBuf;
 
 use directories::ProjectDirs;
 
-fn covers_dir() -> Option<PathBuf> {
+/// The app's cache root for this platform, or `None` if one can't be resolved.
+fn cache_root() -> Option<PathBuf> {
     Some(
         ProjectDirs::from("", "", "sabita")?
             .cache_dir()
-            .join("covers"),
+            .to_path_buf(),
     )
+}
+
+fn covers_dir() -> Option<PathBuf> {
+    Some(cache_root()?.join("covers"))
 }
 
 /// The on-disk path a cover with `key` would live at, or `None` if no cache
 /// directory could be resolved for this platform/environment.
 pub fn cover_path(key: &str) -> Option<PathBuf> {
     Some(covers_dir()?.join(key))
+}
+
+/// The directory a chapter/volume's downloaded reader pages live in, keyed by an
+/// opaque `key` the caller composes from safe identifiers (as with covers). The
+/// reader reads the page images straight from this folder, so they survive
+/// across runs and are reused when the same entry is opened again. Returns
+/// `None` if no cache directory could be resolved.
+pub fn pages_dir(key: &str) -> Option<PathBuf> {
+    Some(cache_root()?.join("pages").join(key))
 }
 
 /// Reads the cached bytes for `key`, or `None` on a miss (or any read error —

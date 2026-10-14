@@ -6,6 +6,7 @@ mod account;
 mod chapter;
 mod health;
 mod library;
+mod reader;
 mod series;
 mod volume;
 

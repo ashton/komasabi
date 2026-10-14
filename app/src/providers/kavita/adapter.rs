@@ -32,22 +32,24 @@ impl ItemAdapter<KavitaSeries> for KavitaItemAdapter {
 /// Flattens a series' volumes into the entries its detail grid should show,
 /// mirroring how Kavita itself models series contents:
 ///
-/// - A **numbered volume** (`min_number > 0`) is a bound book read as a unit,
-///   so it becomes a single volume card; its internal "default" chapter (whose
-///   number is the loose-leaf sentinel) is deliberately not descended into.
-/// - The **loose-leaf** volume (and the **specials** volume) hold chapters that
-///   aren't collected into a numbered volume — the individual issues/specials —
-///   so each of their chapters becomes its own chapter card.
+/// - A **bound volume** — a numbered volume holding just its single "default"
+///   chapter (the whole-volume stand-in, marked with the loose-leaf sentinel
+///   number) — is read as a unit, so it becomes a single volume card and isn't
+///   descended into.
+/// - Any other volume is descended into: each of its chapters becomes its own
+///   chapter card. This covers the **loose-leaf** and **specials** buckets
+///   (individual issues/specials) *and* a numbered volume that groups several
+///   real issues (e.g. a year/arc like "1991" holding issues #1–#5).
 ///
 /// A series with both (an ongoing title whose early issues are collected into
-/// volumes while recent ones are still loose) therefore shows volume cards for
-/// the collected part and chapter cards for the loose part — Kavita's
+/// bound volumes while recent ones are still loose) therefore shows volume cards
+/// for the collected part and chapter cards for the loose part — Kavita's
 /// "Storyline" ordering, preserved by iterating volumes in the order returned.
 pub fn series_entries(volumes: Vec<KavitaVolume>) -> Vec<SeriesEntry> {
     let mut entries = Vec::new();
 
     for volume in volumes {
-        if is_numbered_volume(&volume) {
+        if is_single_bound_volume(&volume) {
             entries.push(volume_entry(volume));
         } else {
             entries.extend(volume.chapters.into_iter().map(chapter_entry));
@@ -61,6 +63,17 @@ pub fn series_entries(volumes: Vec<KavitaVolume>) -> Vec<SeriesEntry> {
 /// sentinel buckets (loose-leaf / specials), both of which are negative.
 fn is_numbered_volume(volume: &KavitaVolume) -> bool {
     volume.min_number != LOOSE_LEAF_VOLUME_NUMBER && volume.min_number != SPECIAL_VOLUME_NUMBER
+}
+
+/// Whether a volume is a single bound unit: a numbered volume whose only chapter
+/// is its "default" chapter (the whole-volume stand-in Kavita marks with the
+/// loose-leaf sentinel number). Such a volume collapses to one volume card. A
+/// numbered volume that instead holds multiple real, separately-numbered
+/// chapters is *not* bound — its chapters are shown individually.
+fn is_single_bound_volume(volume: &KavitaVolume) -> bool {
+    is_numbered_volume(volume)
+        && volume.chapters.len() == 1
+        && volume.chapters[0].min_number == LOOSE_LEAF_VOLUME_NUMBER
 }
 
 fn volume_entry(volume: KavitaVolume) -> SeriesEntry {
@@ -299,6 +312,31 @@ mod tests {
     }
 
     #[test]
+    fn series_entries_descends_a_numbered_volume_that_groups_multiple_issues() {
+        // Series 288: a single numbered volume "1991" grouping five separately-
+        // numbered issues. Each issue must be its own chapter card, not collapsed
+        // into one "1991" volume card.
+        let volumes = vec![KavitaVolume {
+            id: 1485,
+            name: "1991".to_string(),
+            min_number: 1991.0,
+            max_number: 1991.0,
+            pages: 131,
+            chapters: (1..=5)
+                .map(|n| chapter(2108 + n, &n.to_string(), n as f32, 26))
+                .collect(),
+            ..KavitaVolume::default()
+        }];
+
+        let entries = series_entries(volumes);
+
+        assert_eq!(entries.len(), 5);
+        assert!(entries.iter().all(|e| e.kind == EntryKind::Chapter));
+        assert_eq!(entries[0].label, "#1");
+        assert_eq!(entries[4].label, "#5");
+    }
+
+    #[test]
     fn series_entries_shows_loose_leaf_chapters_as_chapter_cards() {
         // Series 345: one loose-leaf volume holding six real chapters.
         let chapters = (1..=6)
@@ -320,10 +358,7 @@ mod tests {
         // An ongoing series: volume 1 collected, issues 2-3 still loose.
         let volumes = vec![
             numbered_volume(10, "1", 1.0, 200),
-            loose_leaf_volume(vec![
-                chapter(20, "2", 2.0, 30),
-                chapter(21, "3", 3.0, 30),
-            ]),
+            loose_leaf_volume(vec![chapter(20, "2", 2.0, 30), chapter(21, "3", 3.0, 30)]),
         ];
 
         let entries = series_entries(volumes);

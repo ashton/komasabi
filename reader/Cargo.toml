@@ -1,0 +1,19 @@
+[package]
+name = "sabita-reader"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "sabita_reader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sabita-reader"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14.0", features = ["image", "advanced"] }
+image = "0.25"
+interprocess = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
