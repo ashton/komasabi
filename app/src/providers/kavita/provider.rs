@@ -225,10 +225,15 @@ impl KavitaProvider {
     }
 }
 
-/// Expands a chapter into its 0-based page refs.
+/// Expands a chapter into its 0-based page refs. The chapter id is stringified
+/// into the backend-opaque [`PageRef::chapter_id`]; the trait's `reader_image`
+/// parses it back to a Kavita id.
 fn chapter_pages(chapter_id: u16, pages: u16) -> Vec<PageRef> {
     (0..pages)
-        .map(|page| PageRef { chapter_id, page })
+        .map(|page| PageRef {
+            chapter_id: chapter_id.to_string(),
+            page,
+        })
         .collect()
 }
 
@@ -238,31 +243,50 @@ fn chapter_pages(chapter_id: u16, pages: u16) -> Vec<PageRef> {
 /// [`ResolvedProvider`](crate::providers::ResolvedProvider) treat every backend
 /// uniformly.
 impl Provider for KavitaProvider {
-    async fn list_series_entries(&self, series_id: u16) -> Result<Vec<SeriesEntry>, String> {
-        self.list_series_entries(series_id).await
+    async fn list_items(
+        &self,
+        library_external_id: &str,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Vec<LibraryItem>, String> {
+        self.list_series_of_library(library_external_id.to_string(), page, page_size)
+            .await
     }
 
-    async fn cover(&self, integration_id: &str, series_id: u16) -> Result<Vec<u8>, String> {
-        self.cover(integration_id, series_id).await
+    async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String> {
+        self.list_series_entries(parse_kavita_id(series_id)?).await
     }
 
-    async fn volume_cover(&self, integration_id: &str, volume_id: u16) -> Result<Vec<u8>, String> {
-        self.volume_cover(integration_id, volume_id).await
+    async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
+        self.cover(integration_id, parse_kavita_id(series_id)?).await
+    }
+
+    async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String> {
+        self.volume_cover(integration_id, parse_kavita_id(volume_id)?)
+            .await
     }
 
     async fn chapter_cover(
         &self,
         integration_id: &str,
-        chapter_id: u16,
+        chapter_id: &str,
     ) -> Result<Vec<u8>, String> {
-        self.chapter_cover(integration_id, chapter_id).await
+        self.chapter_cover(integration_id, parse_kavita_id(chapter_id)?)
+            .await
     }
 
     async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String> {
         self.reader_pages(entry).await
     }
 
-    async fn reader_image(&self, chapter_id: u16, page: u16) -> Result<Vec<u8>, String> {
-        self.reader_image(chapter_id, page).await
+    async fn reader_image(&self, chapter_id: &str, page: u16) -> Result<Vec<u8>, String> {
+        self.reader_image(parse_kavita_id(chapter_id)?, page).await
     }
+}
+
+/// Parses a backend-agnostic string id back into the numeric id Kavita's API
+/// uses, failing with a descriptive error rather than silently.
+fn parse_kavita_id(id: &str) -> Result<u16, String> {
+    id.parse::<u16>()
+        .map_err(|_| format!("id {id} is not a valid Kavita id"))
 }

@@ -48,9 +48,9 @@ pub async fn prepare_and_launch(
     series_name: String,
     entry: SeriesEntry,
 ) -> Result<(), String> {
-    let integration_id = integration_id_for_library(&library_external_id).await?;
+    let namespace = cache_namespace_for_library(&library_external_id).await?;
 
-    let dir = cache::pages_dir(&format!("{integration_id}-{}", entry.cover_key()))
+    let dir = cache::pages_dir(&format!("{namespace}-{}", entry.cover_key()))
         .ok_or("no cache directory available for reader pages")?;
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
@@ -65,14 +65,14 @@ pub async fn prepare_and_launch(
     spawn_reader(&dir, &socket_name)
 }
 
-/// The integration a library belongs to, resolved without authenticating a
-/// provider — just enough to compute the page cache folder up front. The
-/// provider itself is authenticated later, on the worker's own runtime.
-async fn integration_id_for_library(library_external_id: &str) -> Result<String, String> {
+/// The cache namespace for a library's reader pages, resolved without
+/// authenticating a provider — just enough to compute the page cache folder up
+/// front. A library's integration id namespaces remote pages; a local library
+/// (no integration) falls back to its own id. The provider itself is resolved
+/// later, on the worker's own runtime.
+async fn cache_namespace_for_library(library_external_id: &str) -> Result<String, String> {
     let library = library_repository::find_by_external_id(library_external_id).await?;
-    library
-        .integration_id
-        .ok_or_else(|| "library has no associated integration".to_string())
+    Ok(library.integration_id.unwrap_or(library.id))
 }
 
 /// Binds a uniquely-named local socket and spawns the worker thread that accepts
@@ -183,8 +183,8 @@ async fn download_session(
     while let Some(index) = next_page(&pending, current.load(Ordering::Relaxed)) {
         pending.remove(&index);
 
-        let page = plan[index];
-        match provider.reader_image(page.chapter_id, page.page).await {
+        let page = &plan[index];
+        match provider.reader_image(&page.chapter_id, page.page).await {
             Ok(bytes) => match write_page(dir, index, &bytes) {
                 Ok(()) => {
                     if send_command(stream, &ReaderCommand::PageReady { index }).is_err() {

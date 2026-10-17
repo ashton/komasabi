@@ -3,7 +3,7 @@ use diesel_derive_enum::DbEnum;
 
 use crate::schema::libraries;
 
-#[derive(Clone, Debug, DbEnum, PartialEq)]
+#[derive(Clone, Copy, Debug, DbEnum, PartialEq, Eq)]
 pub enum LibraryType {
     Manga,
     Comic,
@@ -18,6 +18,9 @@ impl LibraryType {
             LibraryType::Ebook => "Ebook",
         }
     }
+
+    /// Every library type, in display order — for pickers that offer one of each.
+    pub const ALL: [LibraryType; 3] = [LibraryType::Manga, LibraryType::Comic, LibraryType::Ebook];
 }
 
 #[derive(Clone, Debug, Queryable, Selectable, Insertable, PartialEq)]

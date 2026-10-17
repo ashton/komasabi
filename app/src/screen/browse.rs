@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use iced::advanced::widget::Id as WidgetId;
 use iced::widget::image;
 use iced::{Element, Task};
 
-use crate::models::{AsyncModel, integration::IntegrationType, library_item::LibraryItem};
-use crate::providers::kavita::provider::KavitaProvider;
-use crate::repository::{integration as integration_repository, library as library_repository};
+use crate::models::{AsyncModel, library_item::LibraryItem};
+use crate::providers::{Provider, provider_for_library};
+use crate::repository::library as library_repository;
 
 /// Number of items fetched per page, and the unit eviction operates on:
 /// pages are dropped from (or re-fetched back into) memory as a whole,
@@ -41,6 +42,9 @@ pub struct Browse {
     /// `external_id`s whose cover is currently being fetched, so a page isn't
     /// requested more than once per session.
     covers_in_flight: HashSet<String>,
+    /// Whether this library accepts imported items (true for local,
+    /// filesystem-backed libraries). Gates the "Import items" control.
+    importable: bool,
 }
 
 #[derive(Debug)]
@@ -69,6 +73,13 @@ pub enum Message {
     /// A series card was clicked; carries the item's `external_id`.
     SeriesSelected(String),
     BackPressed,
+    /// The "Import items" button was pressed; opens the file picker.
+    ImportPressed,
+    /// Files chosen in the picker to import into this library (`None` if
+    /// cancelled).
+    ImportSourcesPicked(Option<Vec<PathBuf>>),
+    /// The import finished, carrying how many items were added (or an error).
+    ItemsImported(Result<usize, String>),
 }
 
 /// The scroll state needed to tell which pages are actually on-screen.
@@ -103,7 +114,22 @@ pub enum Action {
 }
 
 impl Browse {
+    /// Opens a remote (integration-backed) library for browsing. Items can't be
+    /// imported into it, so the import control is hidden.
     pub fn new_remote(external_id: String) -> (Self, Task<Message>) {
+        Self::new_paginated(external_id, false)
+    }
+
+    /// Opens a local (filesystem-backed) library for browsing. Browsing works
+    /// identically to a remote library — the provider is resolved the same way —
+    /// but it additionally offers importing more items into the library.
+    pub fn new_local(external_id: String) -> (Self, Task<Message>) {
+        Self::new_paginated(external_id, true)
+    }
+
+    /// Shared setup for both library kinds: start on the first page and kick off
+    /// its load. `importable` is the only thing that differs between them.
+    fn new_paginated(external_id: String, importable: bool) -> (Self, Task<Message>) {
         (
             Self {
                 items: AsyncModel::Loading,
@@ -117,25 +143,12 @@ impl Browse {
                 }),
                 covers: HashMap::new(),
                 covers_in_flight: HashSet::new(),
+                importable,
             },
             Task::perform(
                 crate::runtime::on_tokio(fetch_remote_items_page(external_id, 1, PAGE_SIZE)),
                 Message::ItemsLoaded,
             ),
-        )
-    }
-
-    /// Browsing local folders isn't implemented yet; there's no provider to
-    /// query, so this just shows an empty list.
-    pub fn new_local(_library_id: String) -> (Self, Task<Message>) {
-        (
-            Self {
-                items: AsyncModel::Loaded(Vec::new()),
-                pagination: None,
-                covers: HashMap::new(),
-                covers_in_flight: HashSet::new(),
-            },
-            Task::none(),
         )
     }
 
@@ -333,7 +346,58 @@ impl Browse {
             }
 
             Message::BackPressed => Action::BackPressed,
+
+            Message::ImportPressed => {
+                Action::Run(Task::perform(pick_files(), Message::ImportSourcesPicked))
+            }
+
+            Message::ImportSourcesPicked(None) => Action::None,
+            Message::ImportSourcesPicked(Some(sources)) if sources.is_empty() => Action::None,
+            Message::ImportSourcesPicked(Some(sources)) => {
+                let Some(external_id) = self.pagination.as_ref().map(|p| p.external_id.clone())
+                else {
+                    return Action::None;
+                };
+
+                Action::Run(Task::perform(
+                    import_into_library(external_id, sources),
+                    Message::ItemsImported,
+                ))
+            }
+
+            Message::ItemsImported(Ok(count)) => {
+                tracing::debug!("imported {count} item(s) into the library");
+                // Re-scan from the first page so the new series show up.
+                self.reload()
+            }
+            Message::ItemsImported(Err(error)) => {
+                tracing::debug!("failed to import items: {error}");
+                Action::None
+            }
         }
+    }
+
+    /// Resets to the first page and reloads it, used after items are imported so
+    /// the freshly-added series appear.
+    fn reload(&mut self) -> Action {
+        let Some(pagination) = &mut self.pagination else {
+            return Action::None;
+        };
+
+        pagination.next_page = 2;
+        pagination.has_more = true;
+        pagination.loading_next = false;
+        pagination.refetching_pages.clear();
+        let external_id = pagination.external_id.clone();
+
+        self.items = AsyncModel::Loading;
+        self.covers.clear();
+        self.covers_in_flight.clear();
+
+        Action::Run(Task::perform(
+            crate::runtime::on_tokio(fetch_remote_items_page(external_id, 1, PAGE_SIZE)),
+            Message::ItemsLoaded,
+        ))
     }
 
     /// Finds a currently-loaded item by its `external_id`, if present.
@@ -349,7 +413,7 @@ impl Browse {
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
-        view_helper::view(&self.items, &self.covers)
+        view_helper::view(&self.items, &self.covers, self.importable)
     }
 
     /// Requests the next page, if pagination is set up for it, there isn't
@@ -646,28 +710,64 @@ async fn fetch_remote_items_page(
     page_number: u32,
     page_size: u32,
 ) -> Result<Vec<LibraryItem>, String> {
+    let (provider, _namespace) = provider_for_library(&external_id).await?;
+    provider
+        .list_items(&external_id, Some(page_number), Some(page_size))
+        .await
+}
+
+/// Opens the system picker for one or more comic/book files to import, `None` if
+/// the user cancels.
+async fn pick_files() -> Option<Vec<PathBuf>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+
+    rfd::AsyncFileDialog::new()
+        .set_directory(home)
+        .add_filter("Comics & Books", &["cbz", "cbr", "zip", "pdf", "epub", "doc"])
+        .pick_files()
+        .await
+        .map(|handles| {
+            handles
+                .into_iter()
+                .map(|handle| handle.path().to_path_buf())
+                .collect()
+        })
+}
+
+/// Copies each picked file into the library's folder so the next scan surfaces
+/// it as a new series — the same structural rule used when first importing a
+/// folder library. Only folder-backed libraries can take new items; a
+/// single-file library has no folder to grow into. Existing files are left
+/// untouched (never overwritten). Returns how many items were newly copied in.
+async fn import_into_library(external_id: String, sources: Vec<PathBuf>) -> Result<usize, String> {
     let library = library_repository::find_by_external_id(&external_id).await?;
-    let integration_id = library
-        .integration_id
-        .ok_or_else(|| "library has no associated integration".to_string())?;
-    let integration = integration_repository::find(&integration_id).await?;
+    let folder = library
+        .folder
+        .ok_or_else(|| "this library has no folder to import into".to_string())?;
+    let root = PathBuf::from(folder);
 
-    match integration.integration_type {
-        IntegrationType::Kavita => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-            let api_key = integration
-                .api_key
-                .ok_or_else(|| "integration is missing an api key".to_string())?;
-
-            let provider = KavitaProvider::authenticate(url, api_key).await?;
-            provider
-                .list_series_of_library(external_id, Some(page_number), Some(page_size))
-                .await
-        }
-        _ => Err("browsing is not supported for this integration type yet".to_string()),
+    if !root.is_dir() {
+        return Err("cannot import items into a single-file library".to_string());
     }
+
+    let mut imported = 0;
+    for source in sources {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let destination = root.join(name);
+
+        if destination.exists() {
+            tracing::debug!("skipping import of {}: already present", destination.display());
+            continue;
+        }
+
+        std::fs::copy(&source, &destination)
+            .map_err(|error| format!("could not copy {}: {error}", source.display()))?;
+        imported += 1;
+    }
+
+    Ok(imported)
 }
 
 /// Fetches covers for a page's series, returning `(external_id, bytes)` for
@@ -690,42 +790,19 @@ async fn load_page_covers(
     library_external_id: String,
     series_ids: Vec<String>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let library = library_repository::find_by_external_id(&library_external_id).await?;
-    let integration_id = library
-        .integration_id
-        .ok_or_else(|| "library has no associated integration".to_string())?;
-    let integration = integration_repository::find(&integration_id).await?;
+    let (provider, namespace) = provider_for_library(&library_external_id).await?;
 
-    match integration.integration_type {
-        IntegrationType::Kavita => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-            let api_key = integration
-                .api_key
-                .ok_or_else(|| "integration is missing an api key".to_string())?;
-
-            let provider = KavitaProvider::authenticate(url, api_key).await?;
-
-            let mut covers = Vec::new();
-            for series_id in series_ids {
-                let Ok(parsed) = series_id.parse::<u16>() else {
-                    tracing::debug!("skipping cover for non-numeric series id {series_id}");
-                    continue;
-                };
-
-                match provider.cover(&integration_id, parsed).await {
-                    Ok(bytes) => covers.push((series_id, bytes)),
-                    Err(error) => {
-                        tracing::debug!("failed to fetch cover for series {series_id}: {error}")
-                    }
-                }
+    let mut covers = Vec::new();
+    for series_id in series_ids {
+        match provider.cover(&namespace, &series_id).await {
+            Ok(bytes) => covers.push((series_id, bytes)),
+            Err(error) => {
+                tracing::debug!("failed to fetch cover for series {series_id}: {error}")
             }
-
-            Ok(covers)
         }
-        _ => Ok(Vec::new()),
     }
+
+    Ok(covers)
 }
 
 mod view_helper {
@@ -745,17 +822,22 @@ mod view_helper {
     pub fn view<'a>(
         items: &'a AsyncModel<Vec<Option<LibraryItem>>, String>,
         covers: &'a Covers,
+        importable: bool,
     ) -> Element<'a, super::Message> {
-        column![top_bar(), body(items, covers)]
+        column![top_bar(importable), body(items, covers)]
             .width(Fill)
             .height(Fill)
             .into()
     }
 
-    fn top_bar<'a>() -> Element<'a, super::Message> {
-        container(button("Back").on_press(super::Message::BackPressed))
-            .padding(20)
-            .into()
+    fn top_bar<'a>(importable: bool) -> Element<'a, super::Message> {
+        let mut bar = row![button("Back").on_press(super::Message::BackPressed)].spacing(10);
+
+        if importable {
+            bar = bar.push(button("Import items").on_press(super::Message::ImportPressed));
+        }
+
+        container(bar).padding(20).into()
     }
 
     fn body<'a>(
@@ -916,6 +998,18 @@ mod tests {
             pagination,
             covers: HashMap::new(),
             covers_in_flight: HashSet::new(),
+            importable: false,
+        }
+    }
+
+    /// An importable (local, filesystem-backed) `Browse`, for the import tests.
+    fn importable_browse(
+        items: AsyncModel<Vec<Option<LibraryItem>>, String>,
+        pagination: Option<Pagination>,
+    ) -> Browse {
+        Browse {
+            importable: true,
+            ..browse(items, pagination)
         }
     }
 
@@ -964,11 +1058,14 @@ mod tests {
     }
 
     #[test]
-    fn new_local_loads_an_empty_list_without_a_task() {
+    fn new_local_sets_up_paginated_browsing_and_allows_importing() {
         let (browse, _task) = Browse::new_local("library-id".to_string());
 
-        assert!(matches!(browse.items, AsyncModel::Loaded(ref items) if items.is_empty()));
-        assert!(browse.pagination.is_none());
+        assert!(matches!(browse.items, AsyncModel::Loading));
+        let pagination = browse.pagination.expect("pagination should be set up");
+        assert_eq!(pagination.external_id, "library-id");
+        assert_eq!(pagination.next_page, 2);
+        assert!(browse.importable);
     }
 
     #[test]
@@ -979,6 +1076,7 @@ mod tests {
         assert_eq!(pagination.next_page, 2);
         assert!(pagination.has_more);
         assert!(!pagination.loading_next);
+        assert!(!browse.importable);
     }
 
     #[test]
@@ -1102,6 +1200,103 @@ mod tests {
         let action = browse.update(Message::BackPressed);
 
         assert!(matches!(action, Action::BackPressed));
+    }
+
+    #[test]
+    fn view_shows_the_import_button_only_for_importable_libraries() {
+        let remote = browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+        let mut ui = simulator(remote.view());
+        assert!(ui.find("Import items").is_err());
+
+        let local = importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+        let mut ui = simulator(local.view());
+        assert!(ui.find("Import items").is_ok());
+    }
+
+    #[test]
+    fn clicking_import_sends_import_pressed() {
+        let browse = importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let mut ui = simulator(browse.view());
+        let _ = ui
+            .click("Import items")
+            .expect("Import items button should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::ImportPressed]);
+    }
+
+    #[test]
+    fn import_pressed_runs_a_task() {
+        let mut browse =
+            importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let action = browse.update(Message::ImportPressed);
+
+        assert!(matches!(action, Action::Run(_)));
+    }
+
+    #[test]
+    fn import_sources_picked_none_does_nothing() {
+        let mut browse =
+            importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let action = browse.update(Message::ImportSourcesPicked(None));
+
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn import_sources_picked_empty_does_nothing() {
+        let mut browse =
+            importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let action = browse.update(Message::ImportSourcesPicked(Some(Vec::new())));
+
+        assert!(matches!(action, Action::None));
+    }
+
+    #[test]
+    fn import_sources_picked_runs_an_import_task() {
+        let mut browse =
+            importable_browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let action = browse.update(Message::ImportSourcesPicked(Some(vec![PathBuf::from(
+            "/tmp/One Shot.cbz",
+        )])));
+
+        assert!(matches!(action, Action::Run(_)));
+    }
+
+    #[test]
+    fn items_imported_ok_resets_to_the_first_page_and_reloads() {
+        let mut browse = importable_browse(
+            AsyncModel::Loaded(vec![Some(library_item("Old", None))]),
+            Some(pagination(false, true)),
+        );
+
+        let action = browse.update(Message::ItemsImported(Ok(2)));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(browse.items, AsyncModel::Loading));
+        let pagination = browse.pagination.unwrap();
+        assert_eq!(pagination.next_page, 2);
+        assert!(pagination.has_more);
+        assert!(!pagination.loading_next);
+    }
+
+    #[test]
+    fn items_imported_err_keeps_the_current_list() {
+        let mut browse = importable_browse(
+            AsyncModel::Loaded(vec![Some(library_item("Still here", None))]),
+            Some(pagination(false, false)),
+        );
+
+        let action = browse.update(Message::ItemsImported(Err("boom".to_string())));
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(browse.items, AsyncModel::Loaded(ref items) if items.len() == 1));
     }
 
     #[test]

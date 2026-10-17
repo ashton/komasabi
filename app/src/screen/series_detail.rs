@@ -230,11 +230,8 @@ async fn fetch_entries(
     library_external_id: String,
     series_external_id: String,
 ) -> Result<Vec<SeriesEntry>, String> {
-    let series_id = series_external_id
-        .parse::<u16>()
-        .map_err(|_| format!("series id {series_external_id} is not a valid Kavita id"))?;
-    let (provider, _integration_id) = provider_for_library(&library_external_id).await?;
-    provider.list_series_entries(series_id).await
+    let (provider, _namespace) = provider_for_library(&library_external_id).await?;
+    provider.list_series_entries(&series_external_id).await
 }
 
 /// Fetches the series' own cover, returning `None` on any error (a missing
@@ -243,9 +240,8 @@ async fn fetch_series_cover(
     library_external_id: String,
     series_external_id: String,
 ) -> Option<Vec<u8>> {
-    let series_id = series_external_id.parse::<u16>().ok()?;
-    let (provider, integration_id) = provider_for_library(&library_external_id).await.ok()?;
-    provider.cover(&integration_id, series_id).await.ok()
+    let (provider, namespace) = provider_for_library(&library_external_id).await.ok()?;
+    provider.cover(&namespace, &series_external_id).await.ok()
 }
 
 /// Fetches covers for the given entries, returning `(cover_key, bytes)` for each
@@ -268,18 +264,13 @@ async fn load_entry_covers(
     library_external_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (provider, integration_id) = provider_for_library(&library_external_id).await?;
+    let (provider, namespace) = provider_for_library(&library_external_id).await?;
 
     let mut covers = Vec::new();
     for (external_id, kind) in entries {
-        let Ok(parsed) = external_id.parse::<u16>() else {
-            tracing::debug!("skipping cover for non-numeric id {external_id}");
-            continue;
-        };
-
         let result = match kind {
-            EntryKind::Volume => provider.volume_cover(&integration_id, parsed).await,
-            EntryKind::Chapter => provider.chapter_cover(&integration_id, parsed).await,
+            EntryKind::Volume => provider.volume_cover(&namespace, &external_id).await,
+            EntryKind::Chapter => provider.chapter_cover(&namespace, &external_id).await,
         };
 
         match result {

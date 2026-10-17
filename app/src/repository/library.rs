@@ -34,15 +34,24 @@ pub async fn find_by_external_id(remote_id: &str) -> Result<Library, String> {
         .map_err(crate::error::log_and_stringify)
 }
 
-pub async fn create_from_folder(folder: String, name: String) -> Result<Library, String> {
+/// Creates a local, filesystem-backed library over `path` (a folder or a single
+/// imported file). It gets its own id as its `external_id` so it resolves
+/// through [`provider_for_library`](crate::providers::provider_for_library) the
+/// same way a remote library does, and no integration.
+pub async fn create_local(
+    name: String,
+    kind: LibraryType,
+    path: String,
+) -> Result<Library, String> {
     use crate::schema::libraries::dsl::libraries;
 
+    let id = Uuid::new_v4().to_string();
     let new_library = Library {
-        id: Uuid::new_v4().to_string(),
-        kind: LibraryType::Comic,
+        id: id.clone(),
+        kind,
         name,
-        external_id: None,
-        folder: Some(folder),
+        external_id: Some(id),
+        folder: Some(path),
         cover: None,
         integration_id: None,
     };
