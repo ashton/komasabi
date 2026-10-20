@@ -5,9 +5,11 @@ use crate::repository::{integration as integration_repository, library as librar
 
 pub mod file_system;
 pub mod kavita;
+pub mod opds;
 
 use file_system::FileSystemProvider;
 use kavita::provider::KavitaProvider;
+use opds::provider::OpdsProvider;
 
 /// One page to fetch from a provider: an opaque, provider-defined `chapter_id`
 /// and the page's 0-based index within that chapter. A provider flattens a
@@ -52,6 +54,7 @@ pub trait Provider {
 pub enum ResolvedProvider {
     Kavita(KavitaProvider),
     FileSystem(FileSystemProvider),
+    Opds(OpdsProvider),
 }
 
 impl Provider for ResolvedProvider {
@@ -72,6 +75,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::FileSystem(provider) => {
                 Provider::list_items(provider, library_external_id, page, page_size).await
             }
+            ResolvedProvider::Opds(provider) => {
+                Provider::list_items(provider, library_external_id, page, page_size).await
+            }
         }
     }
 
@@ -81,6 +87,9 @@ impl Provider for ResolvedProvider {
                 Provider::list_series_entries(provider, series_id).await
             }
             ResolvedProvider::FileSystem(provider) => {
+                Provider::list_series_entries(provider, series_id).await
+            }
+            ResolvedProvider::Opds(provider) => {
                 Provider::list_series_entries(provider, series_id).await
             }
         }
@@ -94,6 +103,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::FileSystem(provider) => {
                 Provider::cover(provider, integration_id, series_id).await
             }
+            ResolvedProvider::Opds(provider) => {
+                Provider::cover(provider, integration_id, series_id).await
+            }
         }
     }
 
@@ -103,6 +115,9 @@ impl Provider for ResolvedProvider {
                 Provider::volume_cover(provider, integration_id, volume_id).await
             }
             ResolvedProvider::FileSystem(provider) => {
+                Provider::volume_cover(provider, integration_id, volume_id).await
+            }
+            ResolvedProvider::Opds(provider) => {
                 Provider::volume_cover(provider, integration_id, volume_id).await
             }
         }
@@ -120,6 +135,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::FileSystem(provider) => {
                 Provider::chapter_cover(provider, integration_id, chapter_id).await
             }
+            ResolvedProvider::Opds(provider) => {
+                Provider::chapter_cover(provider, integration_id, chapter_id).await
+            }
         }
     }
 
@@ -127,6 +145,7 @@ impl Provider for ResolvedProvider {
         match self {
             ResolvedProvider::Kavita(provider) => Provider::reader_pages(provider, entry).await,
             ResolvedProvider::FileSystem(provider) => Provider::reader_pages(provider, entry).await,
+            ResolvedProvider::Opds(provider) => Provider::reader_pages(provider, entry).await,
         }
     }
 
@@ -136,6 +155,9 @@ impl Provider for ResolvedProvider {
                 Provider::reader_image(provider, chapter_id, page).await
             }
             ResolvedProvider::FileSystem(provider) => {
+                Provider::reader_image(provider, chapter_id, page).await
+            }
+            ResolvedProvider::Opds(provider) => {
                 Provider::reader_image(provider, chapter_id, page).await
             }
         }
@@ -178,6 +200,14 @@ pub async fn provider_for_library(
 
             let provider = KavitaProvider::authenticate(url, api_key).await?;
             Ok((ResolvedProvider::Kavita(provider), integration_id))
+        }
+        IntegrationType::Opds => {
+            let url = integration
+                .url
+                .ok_or_else(|| "integration is missing a url".to_string())?;
+
+            let provider = OpdsProvider::connect(url, integration.username, integration.password);
+            Ok((ResolvedProvider::Opds(provider), integration_id))
         }
         _ => Err("this integration type is not supported yet".to_string()),
     }

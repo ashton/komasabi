@@ -40,15 +40,41 @@ pub async fn create(
     url: Option<String>,
     api_key: Option<String>,
 ) -> Result<Integration, String> {
-    use crate::schema::integrations::dsl::integrations;
-
-    let new_integration = Integration {
+    insert(Integration {
         id: Uuid::new_v4().to_string(),
         name,
         integration_type,
         url,
         api_key,
-    };
+        username: None,
+        password: None,
+    })
+    .await
+}
+
+/// Creates an integration authenticated with basic-auth credentials rather
+/// than an API key (an OPDS catalog). Blank credentials are stored as absent.
+pub async fn create_with_credentials(
+    name: String,
+    integration_type: IntegrationType,
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Integration, String> {
+    insert(Integration {
+        id: Uuid::new_v4().to_string(),
+        name,
+        integration_type,
+        url: Some(url),
+        api_key: None,
+        username: username.filter(|value| !value.is_empty()),
+        password: password.filter(|value| !value.is_empty()),
+    })
+    .await
+}
+
+async fn insert(new_integration: Integration) -> Result<Integration, String> {
+    use crate::schema::integrations::dsl::integrations;
 
     let mut conn = database::connect()
         .await

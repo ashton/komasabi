@@ -30,4 +30,8 @@ pub struct Integration {
     pub integration_type: IntegrationType,
     pub url: Option<String>,
     pub api_key: Option<String>,
+    /// Basic-auth credentials, for integrations that authenticate that way
+    /// (OPDS catalogs).
+    pub username: Option<String>,
+    pub password: Option<String>,
 }

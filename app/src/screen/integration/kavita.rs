@@ -227,6 +227,8 @@ mod tests {
             integration_type: IntegrationType::Kavita,
             url: Some("http://localhost:5000".to_string()),
             api_key: Some("api-key".to_string()),
+            username: None,
+            password: None,
         }
     }
 

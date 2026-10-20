@@ -1,4 +1,5 @@
 pub mod kavita;
+pub mod opds;
 
 use iced::{Element, Task, widget::container};
 
@@ -8,12 +9,14 @@ use crate::models::{
 };
 use crate::repository::integration as integration_repository;
 use kavita::Kavita;
+use opds::Opds;
 
 #[derive(Debug)]
 enum Step {
     List(AsyncModel<Vec<IntegrationModel>, String>),
     ChooseType,
     Kavita(Kavita),
+    Opds(Opds),
 }
 
 #[derive(Debug)]
@@ -35,6 +38,7 @@ pub enum Message {
     AddIntegrationPressed,
     TypeSelected(IntegrationType),
     Kavita(kavita::Message),
+    Opds(opds::Message),
 }
 
 #[derive(Debug)]
@@ -68,6 +72,11 @@ impl Integrations {
                 Action::None
             }
 
+            Message::TypeSelected(IntegrationType::Opds) => {
+                self.step = Step::Opds(Opds::default());
+                Action::None
+            }
+
             Message::TypeSelected(_) => Action::None,
 
             Message::Kavita(msg) => {
@@ -79,16 +88,33 @@ impl Integrations {
                     kavita::Action::None => Action::None,
                     kavita::Action::Run(task) => Action::Run(task.map(Message::Kavita)),
                     kavita::Action::BackPressed => self.reload_list(),
-                    kavita::Action::Created(integration) => {
-                        self.step = Step::List(AsyncModel::Loading);
-                        Action::Run(Task::future(async move {
-                            crate::jobs::sync_integration_libraries::spawn(integration.id);
-                            Message::IntegrationsLoaded(integration_repository::all().await)
-                        }))
-                    }
+                    kavita::Action::Created(integration) => self.integration_created(integration),
+                }
+            }
+
+            Message::Opds(msg) => {
+                let Step::Opds(opds) = &mut self.step else {
+                    return Action::None;
+                };
+
+                match opds.update(msg) {
+                    opds::Action::None => Action::None,
+                    opds::Action::Run(task) => Action::Run(task.map(Message::Opds)),
+                    opds::Action::BackPressed => self.reload_list(),
+                    opds::Action::Created(integration) => self.integration_created(integration),
                 }
             }
         }
+    }
+
+    /// Returns to the list once an integration is saved, kicking off the
+    /// background job that imports its libraries.
+    fn integration_created(&mut self, integration: IntegrationModel) -> Action {
+        self.step = Step::List(AsyncModel::Loading);
+        Action::Run(Task::future(async move {
+            crate::jobs::sync_integration_libraries::spawn(integration.id);
+            Message::IntegrationsLoaded(integration_repository::all().await)
+        }))
     }
 
     fn reload_list(&mut self) -> Action {
@@ -105,6 +131,7 @@ impl Integrations {
             Step::List(_) => container(iced::widget::row![]).into(),
             Step::ChooseType => view_helper::choose_type(),
             Step::Kavita(kavita) => kavita.view().map(Message::Kavita),
+            Step::Opds(opds) => opds.view().map(Message::Opds),
         }
     }
 }
@@ -118,6 +145,7 @@ mod view_helper {
         Theme,
         widget::{button, column, container, grid, row, svg, text},
     };
+    use iced_font_awesome::fa_icon_solid;
 
     pub fn list<'a>(integrations: &'a [IntegrationModel]) -> Element<'a, Message> {
         if integrations.is_empty() {
@@ -126,7 +154,24 @@ mod view_helper {
 
         let rows = integrations.iter().map(integration_row);
 
-        container(column(rows).spacing(8)).padding(20).into()
+        container(column![add_integration_button(), column(rows).spacing(8)].spacing(20))
+            .padding(20)
+            .into()
+    }
+
+    /// Always available above the integration list, so more integrations can be
+    /// added once the first exists.
+    fn add_integration_button<'a>() -> Element<'a, Message> {
+        button(
+            row![
+                fa_icon_solid("plus").size(14.0_f32),
+                text("Add Integration")
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::AddIntegrationPressed)
+        .into()
     }
 
     fn integration_row<'a>(integration: &'a IntegrationModel) -> Element<'a, Message> {
@@ -258,6 +303,8 @@ mod tests {
             integration_type: IntegrationType::Kavita,
             url: Some("http://localhost:5000".to_string()),
             api_key: Some("api-key".to_string()),
+            username: None,
+            password: None,
         }
     }
 
@@ -292,6 +339,22 @@ mod tests {
         let mut ui = simulator(integrations.view());
 
         assert!(ui.find("My Kavita").is_ok());
+    }
+
+    #[test]
+    fn view_renders_add_integration_button_when_integrations_exist() {
+        let integrations = Integrations {
+            step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui
+            .click("Add Integration")
+            .expect("Add Integration button should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::AddIntegrationPressed]);
     }
 
     #[test]
@@ -356,6 +419,56 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert!(matches!(integrations.step, Step::Kavita(_)));
+    }
+
+    #[test]
+    fn clicking_opds_square_sends_type_selected_message() {
+        let integrations = Integrations {
+            step: Step::ChooseType,
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui.click("OPDS").expect("OPDS square should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::TypeSelected(IntegrationType::Opds)]);
+    }
+
+    #[test]
+    fn update_type_selected_opds_shows_opds_form_step() {
+        let mut integrations = Integrations::default();
+
+        let action = integrations.update(Message::TypeSelected(IntegrationType::Opds));
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(integrations.step, Step::Opds(_)));
+    }
+
+    #[test]
+    fn update_opds_back_pressed_returns_to_list_and_reloads() {
+        let mut integrations = Integrations {
+            step: Step::Opds(Opds::default()),
+        };
+
+        let action = integrations.update(Message::Opds(opds::Message::BackPressed));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
+    }
+
+    #[test]
+    fn update_opds_created_returns_to_list_and_reloads() {
+        let mut integrations = Integrations {
+            step: Step::Opds(Opds::default()),
+        };
+
+        let action = integrations.update(Message::Opds(opds::Message::Created(Ok(
+            integration_model("My Catalog"),
+        ))));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
     }
 
     #[test]

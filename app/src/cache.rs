@@ -25,7 +25,7 @@ fn covers_dir() -> Option<PathBuf> {
 /// The on-disk path a cover with `key` would live at, or `None` if no cache
 /// directory could be resolved for this platform/environment.
 pub fn cover_path(key: &str) -> Option<PathBuf> {
-    Some(covers_dir()?.join(key))
+    Some(covers_dir()?.join(file_name(key)))
 }
 
 /// The directory a chapter/volume's downloaded reader pages live in, keyed by an
@@ -34,7 +34,36 @@ pub fn cover_path(key: &str) -> Option<PathBuf> {
 /// across runs and are reused when the same entry is opened again. Returns
 /// `None` if no cache directory could be resolved.
 pub fn pages_dir(key: &str) -> Option<PathBuf> {
-    Some(cache_root()?.join("pages").join(key))
+    Some(cache_root()?.join("pages").join(file_name(key)))
+}
+
+/// Where a whole downloaded file (e.g. a remote comic archive read page by
+/// page) is kept, keyed like covers.
+pub fn download_path(key: &str) -> Option<PathBuf> {
+    Some(cache_root()?.join("downloads").join(file_name(key)))
+}
+
+/// Longest key used verbatim as a file name; comfortably under the 255-byte
+/// limit of common filesystems.
+const MAX_KEY_LEN: usize = 160;
+
+/// The file name for `key`: the key itself when short enough, otherwise a
+/// stable hash of it. Provider ids can be long (an OPDS id encodes a URL), and
+/// a name past the filesystem's limit would make the cache silently miss.
+fn file_name(key: &str) -> String {
+    if key.len() <= MAX_KEY_LEN {
+        key.to_string()
+    } else {
+        format!("h-{:016x}", fnv1a(key.as_bytes()))
+    }
+}
+
+/// 64-bit FNV-1a: tiny, and stable across Rust versions and runs (unlike
+/// `DefaultHasher`), which an on-disk cache name needs.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Reads the cached bytes for `key`, or `None` on a miss (or any read error —
@@ -63,6 +92,17 @@ pub fn write_cover(key: &str, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_name_keeps_short_keys_and_hashes_long_ones_stably() {
+        assert_eq!(file_name("integration-42"), "integration-42");
+
+        let long = "x".repeat(MAX_KEY_LEN + 1);
+        let name = file_name(&long);
+        assert!(name.starts_with("h-") && name.len() == 18);
+        assert_eq!(name, file_name(&long));
+        assert_ne!(name, file_name(&"y".repeat(MAX_KEY_LEN + 1)));
+    }
 
     #[test]
     fn read_cover_returns_none_for_a_missing_key() {

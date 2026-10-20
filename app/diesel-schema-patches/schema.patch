@@ -1,6 +1,6 @@
 --- a/src/schema.rs
 +++ b/src/schema.rs
-@@ -1,20 +1,26 @@
+@@ -1,10 +1,13 @@
  // @generated automatically by Diesel CLI.
  
  diesel::table! {
@@ -14,7 +14,8 @@
 +        integration_type -> IntegrationTypeMapping,
          url -> Nullable<Text>,
          api_key -> Nullable<Text>,
-     }
+         username -> Nullable<Text>,
+@@ -13,10 +16,13 @@
  }
  
  diesel::table! {
@@ -30,7 +31,7 @@
          integration_id -> Nullable<Text>,
          error -> Nullable<Text>,
          created_at -> Timestamp,
-@@ -24,13 +30,16 @@
+@@ -26,13 +32,16 @@
  }
  
  diesel::table! {

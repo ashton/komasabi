@@ -10,6 +10,8 @@ diesel::table! {
         integration_type -> IntegrationTypeMapping,
         url -> Nullable<Text>,
         api_key -> Nullable<Text>,
+        username -> Nullable<Text>,
+        password -> Nullable<Text>,
     }
 }
 

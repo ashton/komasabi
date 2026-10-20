@@ -587,6 +587,8 @@ mod tests {
             integration_type: IntegrationType::Kavita,
             url: None,
             api_key: None,
+            username: None,
+            password: None,
         }
     }
 

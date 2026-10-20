@@ -7,15 +7,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Sabita is a desktop app, built with Rust and [`iced`](https://iced.rs/) (not Slint — the repo
 originated from a Slint template, hence the stale `README.md` and the enabled `slint` plugin in
 `.claude/settings.json`, but the UI toolkit actually in use is `iced`). It lets a user aggregate
-comic/manga libraries from external services (currently Kavita) and from local folders into one
+comic/manga libraries from external services (currently Kavita and OPDS catalogs) and from local folders into one
 place.
 
-The workspace has two crates:
+The workspace crates:
 - `app` (`sabita-app`) — the iced desktop application: screens, local SQLite persistence (Diesel),
   background jobs, and provider integrations.
 - `kavita-client` — a standalone, UI-agnostic HTTP client for the [Kavita](https://www.kavitareader.com/)
   API. Has no dependency on `app` and is tested against a mocked server (`wiremock`), not a live Kavita
   instance.
+- `opds-client` — a standalone, UI-agnostic client for OPDS catalogs. Parses both OPDS 2 (JSON) and
+  OPDS 1.2 (Atom XML) into one OPDS 2–shaped model. Also tested with `wiremock`.
+- `reader` (`sabita-reader`) — the standalone page-viewer binary the app launches and streams pages into.
 
 ## Commands
 
@@ -31,6 +34,7 @@ mise run cargo:run              # equivalent to `cargo run`, from app/
 cargo test --workspace
 cargo test -p sabita-app
 cargo test -p kavita-client
+cargo test -p opds-client
 cargo test <test_name>           # run a single test by name substring
 
 # Database (sqlite, DATABASE_URL defaults to app/sabita.sqlite3 via mise env)
@@ -101,6 +105,19 @@ fetched this way.
 Enum columns (`IntegrationType`, `JobType`, `JobStatus`) use `diesel_derive_enum::DbEnum`, stored as
 `Text` in sqlite — see the schema-regeneration note above when touching these.
 
+**OPDS provider (`providers::opds`).** Added via the integrations screen's "OPDS" type (catalog URL +
+optional basic-auth username/password, stored in `integrations.username`/`password`). OPDS has no
+numeric ids, so library/item/entry ids are `OpdsId`s: a feed URL, or (feed page URL, index, key) for a
+publication, base64url-encoded. `list_libraries` turns each root navigation link into a library, but
+expands a "catalog of catalogs" (e.g. Kavita's "All Libraries") into one library per entry. A library's
+items are its feed's navigation links + publications; an item's entries are the publications of the
+feed it links to. Reading goes only through the OPDS provider and `opds-client`, with no other
+provider's code involved. The file is downloaded from the publication's `…/acquisition/open-access`
+link (plain `…/acquisition` as a fallback) and fully extracted, CBZ or CBR, by `providers::opds::archive`
+into a cached pages folder. The reader is then served from that folder. Page streams (OPDS-PSE) are
+not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p sabita-app opds_live -- --ignored --nocapture`
+(a Kavita catalog is `http://<host>/api/opds/<api-key>`; Kavita only serves OPDS 1.2).
+
 ## Architecture (`kavita-client` crate)
 
 A thin `reqwest`-based wrapper over the Kavita REST API. `KavitaClient` (`src/client.rs`) holds the
@@ -117,3 +134,13 @@ Auth is a two-step exchange, not handled by this crate directly: callers call
 
 Tests mock the Kavita HTTP API with `wiremock` (no live server needed) and commonly assert both the
 request shape (method/path/query params/JSON body) and response deserialization in the same test.
+
+## Architecture (`opds-client` crate)
+
+`OpdsClient` (`src/client.rs`, endpoints in `src/client/`) fetches feeds with content negotiation that
+prefers OPDS 2. `format::parse_feed` picks a parser from the body's first byte, falling back to the
+content type, since servers mislabel feeds (Kavita sends Atom as `application/xml`). It then resolves
+every href to an absolute URL. `format/atom.rs` maps Atom entries onto the OPDS 2 model: an entry with
+an acquisition or page-stream link is a `Publication`, any other entry is a `Navigation`, and
+`pse:count` becomes `LinkProperties::page_count`. `cargo run -p opds-client --example browse --
+<catalog-url> [href]` prints what a live catalog parses to.
