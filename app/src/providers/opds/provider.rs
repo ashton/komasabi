@@ -406,15 +406,53 @@ impl OpdsProvider {
                     .feed(&url)
                     .await
                     .map_err(crate::error::log_and_stringify)?;
-                feed.cover()
+                match feed
+                    .cover()
                     .or_else(|| feed.all_publications().find_map(Publication::cover))
-                    .map(|link| link.href.clone())
+                {
+                    Some(link) => Some(link.href.clone()),
+                    None => self.nested_feed_cover(&feed, &url).await,
+                }
             }
         };
 
         let href = href.ok_or_else(|| "no cover image available".to_string())?;
         remember_cover(id, Some(&href));
         Ok(href)
+    }
+
+    /// The cover of a feed made only of links to sub-feeds (e.g. a list of
+    /// series): the first sub-feed's artwork or first publication cover, one
+    /// level down. Links back to the feed itself (view tabs) are skipped.
+    async fn nested_feed_cover(&self, feed: &Feed, url: &str) -> Option<String> {
+        let own_urls: HashSet<&str> = std::iter::once(url)
+            .chain(
+                feed.link(opds_client::models::rel::SELF)
+                    .map(|link| link.href.as_str()),
+            )
+            .collect();
+
+        let children = feed
+            .all_navigation()
+            .map(|navigation| navigation.link.href.as_str())
+            .filter(|href| !own_urls.contains(href))
+            .take(MAX_NESTED_FEEDS);
+
+        for href in children {
+            match self.client.feed(href).await {
+                Ok(child) => {
+                    if let Some(link) = child
+                        .cover()
+                        .or_else(|| child.all_publications().find_map(Publication::cover))
+                    {
+                        return Some(link.href.clone());
+                    }
+                }
+                Err(error) => tracing::debug!("skipping unreadable feed {href}: {error}"),
+            }
+        }
+
+        None
     }
 
     /// Returns the cover for `id`, from the on-disk cache when present (the
@@ -1064,5 +1102,55 @@ mod tests {
 
             panic!("no readable publication found in any library");
         });
+    }
+
+    /// A feed with no artwork and no publications of its own, only links to
+    /// sub-feeds — like Komga's "Browse" view, whose series sit in a group next
+    /// to tab links back to the feed itself — takes the first cover found one
+    /// level down.
+    #[tokio::test]
+    async fn cover_of_a_feed_of_feeds_comes_from_its_first_sub_feed_with_one() {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        serve_json(
+            &server,
+            "/browse",
+            format!(
+                r#"{{"metadata": {{"title": "Manga"}},
+                    "links": [{{"rel": "self", "href": "{base}/browse"}}],
+                    "navigation": [{{"title": "Browse", "rel": "subsection", "href": "{base}/browse"}}],
+                    "groups": [{{"metadata": {{"title": "Series"}}, "navigation": [
+                        {{"title": "Empty", "href": "{base}/series/empty"}},
+                        {{"title": "Alpha Saga", "href": "{base}/series/alpha"}}
+                    ]}}]}}"#
+            ),
+        )
+        .await;
+        serve_json(
+            &server,
+            "/series/empty",
+            r#"{"metadata": {"title": "Empty"}, "publications": []}"#.to_string(),
+        )
+        .await;
+        serve_json(
+            &server,
+            "/series/alpha",
+            format!(
+                r#"{{"metadata": {{"title": "Alpha Saga"}}, "publications": [{{
+                    "metadata": {{"title": "v01"}},
+                    "links": [],
+                    "images": [{{"href": "{base}/thumb/v01", "type": "image/jpeg"}}]
+                }}]}}"#
+            ),
+        )
+        .await;
+
+        let provider = OpdsProvider::connect(base.clone(), None, None);
+        let id = OpdsId::Feed(format!("{base}/browse")).encode();
+
+        assert_eq!(
+            provider.cover_href(&id).await,
+            Ok(format!("{base}/thumb/v01"))
+        );
     }
 }
