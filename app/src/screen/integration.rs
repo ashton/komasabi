@@ -187,7 +187,7 @@ mod view_helper {
         Background, Border, Center, Element,
         Length::Fill,
         Theme,
-        widget::{button, column, container, grid, row, svg, text},
+        widget::{button, column, container, grid, row, scrollable, svg, text},
     };
     use iced_font_awesome::fa_icon_solid;
 
@@ -198,9 +198,17 @@ mod view_helper {
 
         let rows = integrations.iter().map(integration_row);
 
-        container(column![add_integration_button(), column(rows).spacing(8)].spacing(20))
-            .padding(20)
-            .into()
+        container(
+            column![
+                add_integration_button(),
+                scrollable(column(rows).spacing(8)).height(Fill)
+            ]
+            .spacing(20),
+        )
+        .width(Fill)
+        .height(Fill)
+        .padding(20)
+        .into()
     }
 
     /// Always available above the integration list, so more integrations can be
@@ -383,6 +391,36 @@ mod tests {
         let mut ui = simulator(integrations.view());
 
         assert!(ui.find("My Kavita").is_ok());
+    }
+
+    #[test]
+    fn integration_list_scrolls_when_it_overflows_the_screen() {
+        let integrations = Integrations {
+            step: Step::List(AsyncModel::Loaded(
+                (0..30)
+                    .map(|index| integration_model(&format!("Integration {index}")))
+                    .collect(),
+            )),
+        };
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (800.0, 300.0),
+            integrations.view(),
+        );
+        assert_eq!(ui.find("Integration 29").unwrap().visible_bounds(), None);
+
+        ui.point_at(iced::Point::new(400.0, 200.0));
+        let _ = ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -50.0 },
+        })]);
+
+        assert!(
+            ui.find("Integration 29")
+                .unwrap()
+                .visible_bounds()
+                .is_some()
+        );
     }
 
     #[test]

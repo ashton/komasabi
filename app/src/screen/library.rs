@@ -223,8 +223,8 @@ mod view_helper {
         Length::Fill,
         Theme,
         widget::{
-            button, column, container, mouse_area, opaque, row, space, stack, svg, text,
-            text_input,
+            button, column, container, mouse_area, opaque, row, scrollable, space, stack, svg,
+            text, text_input,
         },
     };
     use iced_font_awesome::fa_icon_solid;
@@ -249,11 +249,17 @@ mod view_helper {
         // Fill the whole screen area: the import modal overlays this view via a
         // `stack`, whose height follows this (its first child). A `Shrink` height
         // here would confine the dimmed backdrop to just the list's rows.
-        container(column![import_button(), column(rows).spacing(8)].spacing(20))
-            .width(Fill)
-            .height(Fill)
-            .padding(20)
-            .into()
+        container(
+            column![
+                import_button(),
+                scrollable(column(rows).spacing(8)).height(Fill)
+            ]
+            .spacing(20),
+        )
+        .width(Fill)
+        .height(Fill)
+        .padding(20)
+        .into()
     }
 
     /// The single entry point for adding local content, always available above
@@ -1025,5 +1031,27 @@ mod tests {
         let messages: Vec<_> = ui.into_messages().collect();
 
         assert_eq!(messages, vec![Message::BrowseLibrary("id".to_string())]);
+    }
+
+    #[test]
+    fn library_list_scrolls_when_it_overflows_the_screen() {
+        let libraries = (0..30)
+            .map(|index| library_model(&format!("Library {index}")))
+            .collect();
+        let library = library(AsyncModel::Loaded(libraries), AsyncModel::Loaded(vec![]));
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            (800.0, 300.0),
+            library.view(),
+        );
+        assert_eq!(ui.find("Library 29").unwrap().visible_bounds(), None);
+
+        ui.point_at(iced::Point::new(400.0, 200.0));
+        let _ = ui.simulate([iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -50.0 },
+        })]);
+
+        assert!(ui.find("Library 29").unwrap().visible_bounds().is_some());
     }
 }
