@@ -5,10 +5,12 @@ use crate::repository::{integration as integration_repository, library as librar
 
 pub mod file_system;
 pub mod kavita;
+pub mod komga;
 pub mod opds;
 
 use file_system::FileSystemProvider;
 use kavita::provider::KavitaProvider;
+use komga::provider::KomgaProvider;
 use opds::provider::OpdsProvider;
 
 /// One page to fetch from a provider: an opaque, provider-defined `chapter_id`
@@ -39,10 +41,12 @@ pub trait Provider {
     ) -> Result<Vec<LibraryItem>, String>;
     async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String>;
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String>;
-    async fn volume_cover(&self, integration_id: &str, volume_id: &str)
-    -> Result<Vec<u8>, String>;
-    async fn chapter_cover(&self, integration_id: &str, chapter_id: &str)
-    -> Result<Vec<u8>, String>;
+    async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String>;
+    async fn chapter_cover(
+        &self,
+        integration_id: &str,
+        chapter_id: &str,
+    ) -> Result<Vec<u8>, String>;
     /// Resolves a volume/chapter entry into the ordered pages to read.
     async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String>;
     /// Fetches the bytes of a single page.
@@ -53,6 +57,7 @@ pub trait Provider {
 /// behind the [`Provider`] trait. One variant per supported backend.
 pub enum ResolvedProvider {
     Kavita(KavitaProvider),
+    Komga(KomgaProvider),
     FileSystem(FileSystemProvider),
     Opds(OpdsProvider),
 }
@@ -78,6 +83,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::Opds(provider) => {
                 Provider::list_items(provider, library_external_id, page, page_size).await
             }
+            ResolvedProvider::Komga(provider) => {
+                Provider::list_items(provider, library_external_id, page, page_size).await
+            }
         }
     }
 
@@ -90,6 +98,9 @@ impl Provider for ResolvedProvider {
                 Provider::list_series_entries(provider, series_id).await
             }
             ResolvedProvider::Opds(provider) => {
+                Provider::list_series_entries(provider, series_id).await
+            }
+            ResolvedProvider::Komga(provider) => {
                 Provider::list_series_entries(provider, series_id).await
             }
         }
@@ -106,6 +117,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::Opds(provider) => {
                 Provider::cover(provider, integration_id, series_id).await
             }
+            ResolvedProvider::Komga(provider) => {
+                Provider::cover(provider, integration_id, series_id).await
+            }
         }
     }
 
@@ -118,6 +132,9 @@ impl Provider for ResolvedProvider {
                 Provider::volume_cover(provider, integration_id, volume_id).await
             }
             ResolvedProvider::Opds(provider) => {
+                Provider::volume_cover(provider, integration_id, volume_id).await
+            }
+            ResolvedProvider::Komga(provider) => {
                 Provider::volume_cover(provider, integration_id, volume_id).await
             }
         }
@@ -138,6 +155,9 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::Opds(provider) => {
                 Provider::chapter_cover(provider, integration_id, chapter_id).await
             }
+            ResolvedProvider::Komga(provider) => {
+                Provider::chapter_cover(provider, integration_id, chapter_id).await
+            }
         }
     }
 
@@ -146,6 +166,7 @@ impl Provider for ResolvedProvider {
             ResolvedProvider::Kavita(provider) => Provider::reader_pages(provider, entry).await,
             ResolvedProvider::FileSystem(provider) => Provider::reader_pages(provider, entry).await,
             ResolvedProvider::Opds(provider) => Provider::reader_pages(provider, entry).await,
+            ResolvedProvider::Komga(provider) => Provider::reader_pages(provider, entry).await,
         }
     }
 
@@ -158,6 +179,9 @@ impl Provider for ResolvedProvider {
                 Provider::reader_image(provider, chapter_id, page).await
             }
             ResolvedProvider::Opds(provider) => {
+                Provider::reader_image(provider, chapter_id, page).await
+            }
+            ResolvedProvider::Komga(provider) => {
                 Provider::reader_image(provider, chapter_id, page).await
             }
         }
@@ -208,6 +232,19 @@ pub async fn provider_for_library(
 
             let provider = OpdsProvider::connect(url, integration.username, integration.password);
             Ok((ResolvedProvider::Opds(provider), integration_id))
+        }
+        IntegrationType::Komga => {
+            let url = integration
+                .url
+                .ok_or_else(|| "integration is missing a url".to_string())?;
+
+            let provider = KomgaProvider::connect(
+                url,
+                integration.api_key,
+                integration.username,
+                integration.password,
+            )?;
+            Ok((ResolvedProvider::Komga(provider), integration_id))
         }
         _ => Err("this integration type is not supported yet".to_string()),
     }

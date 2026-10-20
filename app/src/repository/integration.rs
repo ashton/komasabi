@@ -73,6 +73,28 @@ pub async fn create_with_credentials(
     .await
 }
 
+/// Creates an integration that authenticates with either an API key or
+/// basic-auth credentials (a Komga server). Blank values are stored as absent.
+pub async fn create_with_auth(
+    name: String,
+    integration_type: IntegrationType,
+    url: String,
+    api_key: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<Integration, String> {
+    insert(Integration {
+        id: Uuid::new_v4().to_string(),
+        name,
+        integration_type,
+        url: Some(url),
+        api_key: api_key.filter(|value| !value.is_empty()),
+        username: username.filter(|value| !value.is_empty()),
+        password: password.filter(|value| !value.is_empty()),
+    })
+    .await
+}
+
 async fn insert(new_integration: Integration) -> Result<Integration, String> {
     use crate::schema::integrations::dsl::integrations;
 

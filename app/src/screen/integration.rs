@@ -1,4 +1,5 @@
 pub mod kavita;
+pub mod komga;
 pub mod opds;
 
 use iced::{Element, Task, widget::container};
@@ -9,6 +10,7 @@ use crate::models::{
 };
 use crate::repository::integration as integration_repository;
 use kavita::Kavita;
+use komga::Komga;
 use opds::Opds;
 
 #[derive(Debug)]
@@ -16,6 +18,7 @@ enum Step {
     List(AsyncModel<Vec<IntegrationModel>, String>),
     ChooseType,
     Kavita(Kavita),
+    Komga(Komga),
     Opds(Opds),
 }
 
@@ -38,6 +41,7 @@ pub enum Message {
     AddIntegrationPressed,
     TypeSelected(IntegrationType),
     Kavita(kavita::Message),
+    Komga(komga::Message),
     Opds(opds::Message),
 }
 
@@ -72,6 +76,11 @@ impl Integrations {
                 Action::None
             }
 
+            Message::TypeSelected(IntegrationType::Komga) => {
+                self.step = Step::Komga(Komga::default());
+                Action::None
+            }
+
             Message::TypeSelected(IntegrationType::Opds) => {
                 self.step = Step::Opds(Opds::default());
                 Action::None
@@ -89,6 +98,19 @@ impl Integrations {
                     kavita::Action::Run(task) => Action::Run(task.map(Message::Kavita)),
                     kavita::Action::BackPressed => self.reload_list(),
                     kavita::Action::Created(integration) => self.integration_created(integration),
+                }
+            }
+
+            Message::Komga(msg) => {
+                let Step::Komga(komga) = &mut self.step else {
+                    return Action::None;
+                };
+
+                match komga.update(msg) {
+                    komga::Action::None => Action::None,
+                    komga::Action::Run(task) => Action::Run(task.map(Message::Komga)),
+                    komga::Action::BackPressed => self.reload_list(),
+                    komga::Action::Created(integration) => self.integration_created(integration),
                 }
             }
 
@@ -131,6 +153,7 @@ impl Integrations {
             Step::List(_) => container(iced::widget::row![]).into(),
             Step::ChooseType => view_helper::choose_type(),
             Step::Kavita(kavita) => kavita.view().map(Message::Kavita),
+            Step::Komga(komga) => komga.view().map(Message::Komga),
             Step::Opds(opds) => opds.view().map(Message::Opds),
         }
     }
@@ -465,6 +488,47 @@ mod tests {
 
         let action = integrations.update(Message::Opds(opds::Message::Created(Ok(
             integration_model("My Catalog"),
+        ))));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
+    }
+
+    #[test]
+    fn clicking_komga_square_sends_type_selected_message() {
+        let integrations = Integrations {
+            step: Step::ChooseType,
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui.click("Komga").expect("Komga square should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(
+            messages,
+            vec![Message::TypeSelected(IntegrationType::Komga)]
+        );
+    }
+
+    #[test]
+    fn update_type_selected_komga_shows_komga_form_step() {
+        let mut integrations = Integrations::default();
+
+        let action = integrations.update(Message::TypeSelected(IntegrationType::Komga));
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(integrations.step, Step::Komga(_)));
+    }
+
+    #[test]
+    fn update_komga_created_returns_to_list_and_reloads() {
+        let mut integrations = Integrations {
+            step: Step::Komga(Komga::default()),
+        };
+
+        let action = integrations.update(Message::Komga(komga::Message::Created(Ok(
+            integration_model("My Komga"),
         ))));
 
         assert!(matches!(action, Action::Run(_)));

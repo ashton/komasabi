@@ -16,6 +16,7 @@ iced_font_awesome = "0.4.4"
 iced_test = "0.14.0"
 interprocess = "2"
 kavita-client = { path = "../kavita-client" }
+komga-client = { path = "../komga-client" }
 opds-client = { path = "../opds-client" }
 reqwest = "0.13"
 sabita-reader = { path = "../reader" }
