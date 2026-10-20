@@ -10,3 +10,7 @@ rustflags = [
 rustflags = [
     "-C", "link-arg=/STACK:8000000"
 ]
+
+[env]
+# iced_test simulators render on the CPU (the app itself still uses wgpu).
+ICED_TEST_BACKEND = "tiny-skia"
