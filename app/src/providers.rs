@@ -7,11 +7,13 @@ pub mod file_system;
 pub mod kavita;
 pub mod komga;
 pub mod opds;
+pub mod suwayomi;
 
 use file_system::FileSystemProvider;
 use kavita::provider::KavitaProvider;
 use komga::provider::KomgaProvider;
 use opds::provider::OpdsProvider;
+use suwayomi::provider::SuwayomiProvider;
 
 /// One page to fetch from a provider: an opaque, provider-defined `chapter_id`
 /// and the page's 0-based index within that chapter. A provider flattens a
@@ -60,84 +62,46 @@ pub enum ResolvedProvider {
     Komga(KomgaProvider),
     FileSystem(FileSystemProvider),
     Opds(OpdsProvider),
+    Suwayomi(SuwayomiProvider),
+}
+
+/// Forwards a [`Provider`] method call to whichever backend `$provider` holds.
+/// Calls use fully-qualified trait-method syntax (`Provider::foo(p, …)`) rather
+/// than `p.foo(…)`, because `KavitaProvider` has inherent methods of the same
+/// names taking numeric (`u16`) ids that would otherwise shadow the string-id
+/// trait methods and fail to type-check.
+macro_rules! dispatch {
+    ($provider:expr, $method:ident($($arg:expr),*)) => {
+        match $provider {
+            ResolvedProvider::Kavita(provider) => Provider::$method(provider, $($arg),*).await,
+            ResolvedProvider::Komga(provider) => Provider::$method(provider, $($arg),*).await,
+            ResolvedProvider::FileSystem(provider) => Provider::$method(provider, $($arg),*).await,
+            ResolvedProvider::Opds(provider) => Provider::$method(provider, $($arg),*).await,
+            ResolvedProvider::Suwayomi(provider) => Provider::$method(provider, $($arg),*).await,
+        }
+    };
 }
 
 impl Provider for ResolvedProvider {
-    // Each arm uses fully-qualified trait-method syntax (`Provider::foo(p, …)`)
-    // rather than `p.foo(…)`, because `KavitaProvider` has inherent methods of
-    // the same names taking numeric (`u16`) ids that would otherwise shadow the
-    // string-id trait methods and fail to type-check.
     async fn list_items(
         &self,
         library_external_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<Vec<LibraryItem>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::list_items(provider, library_external_id, page, page_size).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::list_items(provider, library_external_id, page, page_size).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::list_items(provider, library_external_id, page, page_size).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::list_items(provider, library_external_id, page, page_size).await
-            }
-        }
+        dispatch!(self, list_items(library_external_id, page, page_size))
     }
 
     async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::list_series_entries(provider, series_id).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::list_series_entries(provider, series_id).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::list_series_entries(provider, series_id).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::list_series_entries(provider, series_id).await
-            }
-        }
+        dispatch!(self, list_series_entries(series_id))
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::cover(provider, integration_id, series_id).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::cover(provider, integration_id, series_id).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::cover(provider, integration_id, series_id).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::cover(provider, integration_id, series_id).await
-            }
-        }
+        dispatch!(self, cover(integration_id, series_id))
     }
 
     async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::volume_cover(provider, integration_id, volume_id).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::volume_cover(provider, integration_id, volume_id).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::volume_cover(provider, integration_id, volume_id).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::volume_cover(provider, integration_id, volume_id).await
-            }
-        }
+        dispatch!(self, volume_cover(integration_id, volume_id))
     }
 
     async fn chapter_cover(
@@ -145,46 +109,15 @@ impl Provider for ResolvedProvider {
         integration_id: &str,
         chapter_id: &str,
     ) -> Result<Vec<u8>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::chapter_cover(provider, integration_id, chapter_id).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::chapter_cover(provider, integration_id, chapter_id).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::chapter_cover(provider, integration_id, chapter_id).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::chapter_cover(provider, integration_id, chapter_id).await
-            }
-        }
+        dispatch!(self, chapter_cover(integration_id, chapter_id))
     }
 
     async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => Provider::reader_pages(provider, entry).await,
-            ResolvedProvider::FileSystem(provider) => Provider::reader_pages(provider, entry).await,
-            ResolvedProvider::Opds(provider) => Provider::reader_pages(provider, entry).await,
-            ResolvedProvider::Komga(provider) => Provider::reader_pages(provider, entry).await,
-        }
+        dispatch!(self, reader_pages(entry))
     }
 
     async fn reader_image(&self, chapter_id: &str, page: u16) -> Result<Vec<u8>, String> {
-        match self {
-            ResolvedProvider::Kavita(provider) => {
-                Provider::reader_image(provider, chapter_id, page).await
-            }
-            ResolvedProvider::FileSystem(provider) => {
-                Provider::reader_image(provider, chapter_id, page).await
-            }
-            ResolvedProvider::Opds(provider) => {
-                Provider::reader_image(provider, chapter_id, page).await
-            }
-            ResolvedProvider::Komga(provider) => {
-                Provider::reader_image(provider, chapter_id, page).await
-            }
-        }
+        dispatch!(self, reader_image(chapter_id, page))
     }
 }
 
@@ -246,6 +179,14 @@ pub async fn provider_for_library(
             )?;
             Ok((ResolvedProvider::Komga(provider), integration_id))
         }
-        _ => Err("this integration type is not supported yet".to_string()),
+        IntegrationType::Suwayomi => {
+            let url = integration
+                .url
+                .ok_or_else(|| "integration is missing a url".to_string())?;
+
+            let provider =
+                SuwayomiProvider::connect(url, integration.username, integration.password)?;
+            Ok((ResolvedProvider::Suwayomi(provider), integration_id))
+        }
     }
 }

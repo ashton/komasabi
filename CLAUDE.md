@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Sabita is a desktop app, built with Rust and [`iced`](https://iced.rs/) (not Slint — the repo
 originated from a Slint template, hence the stale `README.md` and the enabled `slint` plugin in
 `.claude/settings.json`, but the UI toolkit actually in use is `iced`). It lets a user aggregate
-comic/manga libraries from external services (currently Kavita, Komga and OPDS catalogs) and from local folders into one
+comic/manga libraries from external services (currently Kavita, Komga, Suwayomi and OPDS catalogs) and from local folders into one
 place.
 
 The workspace crates:
@@ -18,6 +18,8 @@ The workspace crates:
   instance.
 - `komga-client` — a standalone, UI-agnostic HTTP client for the [Komga](https://komga.org/) API,
   tested with `wiremock`.
+- `suwayomi-client` — a standalone, UI-agnostic client for a [Suwayomi](https://github.com/Suwayomi/Suwayomi-Server)
+  server's GraphQL API, tested with `wiremock`.
 - `opds-client` — a standalone, UI-agnostic client for OPDS catalogs. Parses both OPDS 2 (JSON) and
   OPDS 1.2 (Atom XML) into one OPDS 2–shaped model. Also tested with `wiremock`.
 - `reader` (`sabita-reader`) — the standalone page-viewer binary the app launches and streams pages into.
@@ -37,6 +39,7 @@ cargo test --workspace
 cargo test -p sabita-app
 cargo test -p kavita-client
 cargo test -p komga-client
+cargo test -p suwayomi-client
 cargo test -p opds-client
 cargo test <test_name>           # run a single test by name substring
 
@@ -130,6 +133,18 @@ uses the page endpoint (`/api/v1/books/{id}/pages/{n}`, 1-based), so nothing is 
 Text-only EPUBs and books Komga hasn't analyzed yet are refused. Live check:
 `KOMGA_LIVE_URL=<server> KOMGA_LIVE_API_KEY=<key> cargo test -p sabita-app komga_live -- --ignored --nocapture`.
 
+**Suwayomi provider (`providers::suwayomi`).** Added via the integrations screen's "Suwayomi" type
+(server URL plus optional basic-auth username/password; Suwayomi runs unauthenticated by default).
+Categories map to libraries, mangas to items and chapters to chapter entries. Category ids are small
+integers on every server, so a library's `external_id` is `{integration_id}:{category_id}`, which keeps
+it from colliding in the global external-id lookup. An empty default category is skipped. A category's
+mangas aren't paged by the server, so `list_items` slices the full list. A chapter entry's id is
+`{manga_id}-{chapter_id}`. Chapters have no images of their own, so a chapter card shows the manga
+cover. Reading runs the `fetchChapterPages` mutation, which makes the server fetch the page list from
+the source. The pages are then fetched from `/api/v1/manga/{manga}/chapter/{sourceOrder}/page/{n}`
+(0-based), so a `PageRef.chapter_id` is `{manga_id}-{source_order}`. Live check:
+`SUWAYOMI_LIVE_URL=<server> cargo test -p sabita-app suwayomi_live -- --ignored --nocapture`.
+
 ## Architecture (`kavita-client` crate)
 
 A thin `reqwest`-based wrapper over the Kavita REST API. `KavitaClient` (`src/client.rs`) holds the
@@ -163,3 +178,14 @@ every href to an absolute URL. `format/atom.rs` maps Atom entries onto the OPDS 
 an acquisition or page-stream link is a `Publication`, any other entry is a `Navigation`, and
 `pse:count` becomes `LinkProperties::page_count`. `cargo run -p opds-client --example browse --
 <catalog-url> [href]` prints what a live catalog parses to.
+
+## Architecture (`suwayomi-client` crate)
+
+`SuwayomiClient` (`src/client.rs`, endpoints in `src/client/`) takes an `Auth` (basic or none). Data
+comes from GraphQL (`POST /api/graphql`, its own `Error` type: HTTP or GraphQL `errors`). REST is
+deprecated upstream, so only the image paths GraphQL hands out are used: manga thumbnails and chapter
+pages. The default category (id `0`) is virtual, since it holds mangas that have no category. Filtering
+`mangas` by `categoryId: 0` returns nothing, so `category(id).mangas` is used instead.
+Pages are addressed by a chapter's `sourceOrder`, not its server-wide `id`.
+`cargo run -p suwayomi-client --example browse -- <server-url> [manga-id [chapter-id]]` prints what a
+live server serves.

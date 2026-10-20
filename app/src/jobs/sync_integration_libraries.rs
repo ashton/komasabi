@@ -3,6 +3,7 @@ use crate::models::job::{JobStatus, JobType};
 use crate::models::library::Library;
 use crate::providers::{
     kavita::provider::KavitaProvider, komga::provider::KomgaProvider, opds::provider::OpdsProvider,
+    suwayomi::provider::SuwayomiProvider,
 };
 use crate::repository::{
     integration as integration_repository, job as job_repository, library as library_repository,
@@ -101,9 +102,10 @@ async fn remote_libraries(integration_id: &str) -> Result<Vec<Library>, String> 
             .list_libraries(integration_id)
             .await
         }
-        other => Err(format!(
-            "{} integrations can't be synced yet",
-            other.label()
-        )),
+        IntegrationType::Suwayomi => {
+            SuwayomiProvider::connect(url, integration.username, integration.password)?
+                .list_libraries(integration_id)
+                .await
+        }
     }
 }

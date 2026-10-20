@@ -1,6 +1,7 @@
 pub mod kavita;
 pub mod komga;
 pub mod opds;
+pub mod suwayomi;
 
 use iced::{Element, Task, widget::container};
 
@@ -12,6 +13,7 @@ use crate::repository::integration as integration_repository;
 use kavita::Kavita;
 use komga::Komga;
 use opds::Opds;
+use suwayomi::Suwayomi;
 
 #[derive(Debug)]
 enum Step {
@@ -20,6 +22,7 @@ enum Step {
     Kavita(Kavita),
     Komga(Komga),
     Opds(Opds),
+    Suwayomi(Suwayomi),
 }
 
 #[derive(Debug)]
@@ -43,6 +46,7 @@ pub enum Message {
     Kavita(kavita::Message),
     Komga(komga::Message),
     Opds(opds::Message),
+    Suwayomi(suwayomi::Message),
 }
 
 #[derive(Debug)]
@@ -86,7 +90,10 @@ impl Integrations {
                 Action::None
             }
 
-            Message::TypeSelected(_) => Action::None,
+            Message::TypeSelected(IntegrationType::Suwayomi) => {
+                self.step = Step::Suwayomi(Suwayomi::default());
+                Action::None
+            }
 
             Message::Kavita(msg) => {
                 let Step::Kavita(kavita) = &mut self.step else {
@@ -126,6 +133,19 @@ impl Integrations {
                     opds::Action::Created(integration) => self.integration_created(integration),
                 }
             }
+
+            Message::Suwayomi(msg) => {
+                let Step::Suwayomi(suwayomi) = &mut self.step else {
+                    return Action::None;
+                };
+
+                match suwayomi.update(msg) {
+                    suwayomi::Action::None => Action::None,
+                    suwayomi::Action::Run(task) => Action::Run(task.map(Message::Suwayomi)),
+                    suwayomi::Action::BackPressed => self.reload_list(),
+                    suwayomi::Action::Created(integration) => self.integration_created(integration),
+                }
+            }
         }
     }
 
@@ -155,6 +175,7 @@ impl Integrations {
             Step::Kavita(kavita) => kavita.view().map(Message::Kavita),
             Step::Komga(komga) => komga.view().map(Message::Komga),
             Step::Opds(opds) => opds.view().map(Message::Opds),
+            Step::Suwayomi(suwayomi) => suwayomi.view().map(Message::Suwayomi),
         }
     }
 }
@@ -529,6 +550,49 @@ mod tests {
 
         let action = integrations.update(Message::Komga(komga::Message::Created(Ok(
             integration_model("My Komga"),
+        ))));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
+    }
+
+    #[test]
+    fn clicking_suwayomi_square_sends_type_selected_message() {
+        let integrations = Integrations {
+            step: Step::ChooseType,
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui
+            .click("Suwayomi")
+            .expect("Suwayomi square should be found");
+
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(
+            messages,
+            vec![Message::TypeSelected(IntegrationType::Suwayomi)]
+        );
+    }
+
+    #[test]
+    fn update_type_selected_suwayomi_shows_suwayomi_form_step() {
+        let mut integrations = Integrations::default();
+
+        let action = integrations.update(Message::TypeSelected(IntegrationType::Suwayomi));
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(integrations.step, Step::Suwayomi(_)));
+    }
+
+    #[test]
+    fn update_suwayomi_created_returns_to_list_and_reloads() {
+        let mut integrations = Integrations {
+            step: Step::Suwayomi(Suwayomi::default()),
+        };
+
+        let action = integrations.update(Message::Suwayomi(suwayomi::Message::Created(Ok(
+            integration_model("My Suwayomi"),
         ))));
 
         assert!(matches!(action, Action::Run(_)));

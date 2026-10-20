@@ -53,7 +53,8 @@ pub async fn create(
 }
 
 /// Creates an integration authenticated with basic-auth credentials rather
-/// than an API key (an OPDS catalog). Blank credentials are stored as absent.
+/// than an API key (an OPDS catalog or a Suwayomi server). Blank credentials
+/// are stored as absent.
 pub async fn create_with_credentials(
     name: String,
     integration_type: IntegrationType,
