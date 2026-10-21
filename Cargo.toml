@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["app", "kavita-client", "komga-client", "opds-client", "reader", "suwayomi-client"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

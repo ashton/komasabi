@@ -102,7 +102,10 @@ the existing language when adding sibling strings in the same view, don't transl
 
 **Persistence (`src/repository/`, `src/models/`, `src/database.rs`, `src/schema.rs`).** Diesel +
 `diesel-async`'s `SyncConnectionWrapper` over sqlite; `database::connect()` opens a fresh connection
-per call (no pooling) using `DATABASE_URL`. Repository functions all return `Result<T, String>`
+per call (no pooling) using `DATABASE_URL`, or `komasabi.sqlite3` in the platform data dir
+(`ProjectDirs::data_dir()`) when that's unset, as in a release install. Migrations are embedded in
+the binary (`embed_migrations!`, with `app/build.rs` rebuilding on changes) and run once per process
+before the first connection, so new migrations reach users without `diesel`. Repository functions all return `Result<T, String>`
 (errors stringified via `.map_err(|e| e.to_string())`) since they're consumed directly as iced
 `Task::perform` futures, where the error type flows into a `Message` variant. `models::AsyncModel<T, E>`
 is the standard wrapper screens use to represent not-loaded/loading/loaded/error state for data
