@@ -10,7 +10,7 @@ single library view.
 
 The app is built with Rust and [`iced`](https://iced.rs/) for the UI. The workspace has two crates:
 
-- `app` (`komasabi-app`) — the desktop application: screens, local SQLite persistence (via
+- `app` (`komasabi`) — the desktop application: screens, local SQLite persistence (via
   [Diesel](https://diesel.rs/)), background sync jobs, and provider integrations.
 - `kavita-client` — a standalone HTTP client for the Kavita API, with no dependency on `app`.
 

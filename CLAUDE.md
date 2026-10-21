@@ -11,7 +11,7 @@ comic/manga libraries from external services (currently Kavita, Komga, Suwayomi 
 place.
 
 The workspace crates:
-- `app` (`komasabi-app`) — the iced desktop application: screens, local SQLite persistence (Diesel),
+- `app` (`komasabi`) — the iced desktop application: screens, local SQLite persistence (Diesel),
   background jobs, and provider integrations.
 - `kavita-client` — a standalone, UI-agnostic HTTP client for the [Kavita](https://www.kavitareader.com/)
   API. Has no dependency on `app` and is tested against a mocked server (`wiremock`), not a live Kavita
@@ -36,7 +36,7 @@ mise run cargo:run              # equivalent to `cargo run`, from app/
 
 # Tests (iced screens use iced_test::simulator; kavita-client uses wiremock)
 cargo test --workspace
-cargo test -p komasabi-app
+cargo test -p komasabi
 cargo test -p kavita-client
 cargo test -p komga-client
 cargo test -p suwayomi-client
@@ -106,7 +106,7 @@ the existing language when adding sibling strings in the same view, don't transl
 in `providers::provider_for_library` and the sync job, and its tests. `IntegrationType` keeps every
 variant regardless, so a database written by a fuller build still loads; a left-out type resolves to
 `providers::not_built_in`. Local folders are always built in. Check new provider code with
-`cargo check -p komasabi-app --tests --no-default-features --features=<name>` as well as the default
+`cargo check -p komasabi --tests --no-default-features --features=<name>` as well as the default
 build.
 
 **Persistence (`src/repository/`, `src/models/`, `src/database.rs`, `src/schema.rs`).** Diesel +
@@ -133,7 +133,7 @@ feed it links to. Reading goes only through the OPDS provider and `opds-client`,
 provider's code involved. The file is downloaded from the publication's `…/acquisition/open-access`
 link (plain `…/acquisition` as a fallback) and fully extracted, CBZ or CBR, by `providers::opds::archive`
 into a cached pages folder. The reader is then served from that folder. Page streams (OPDS-PSE) are
-not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p komasabi-app opds_live -- --ignored --nocapture`
+not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p komasabi opds_live -- --ignored --nocapture`
 (a Kavita catalog is `http://<host>/api/opds/<api-key>`; Kavita only serves OPDS 1.2).
 
 **Komga provider (`providers::komga`).** Added via the integrations screen's "Komga" type (server URL
@@ -143,7 +143,7 @@ directly onto library → item → entry, using Komga's string ids as-is. Every 
 labelled with its title, since Komga doesn't say whether a book is a volume or an issue. Reading
 uses the page endpoint (`/api/v1/books/{id}/pages/{n}`, 1-based), so nothing is downloaded up front.
 Text-only EPUBs and books Komga hasn't analyzed yet are refused. Live check:
-`KOMGA_LIVE_URL=<server> KOMGA_LIVE_API_KEY=<key> cargo test -p komasabi-app komga_live -- --ignored --nocapture`.
+`KOMGA_LIVE_URL=<server> KOMGA_LIVE_API_KEY=<key> cargo test -p komasabi komga_live -- --ignored --nocapture`.
 
 **Suwayomi provider (`providers::suwayomi`).** Added via the integrations screen's "Suwayomi" type
 (server URL plus optional basic-auth username/password; Suwayomi runs unauthenticated by default).
@@ -155,7 +155,7 @@ mangas aren't paged by the server, so `list_items` slices the full list. A chapt
 cover. Reading runs the `fetchChapterPages` mutation, which makes the server fetch the page list from
 the source. The pages are then fetched from `/api/v1/manga/{manga}/chapter/{sourceOrder}/page/{n}`
 (0-based), so a `PageRef.chapter_id` is `{manga_id}-{source_order}`. Live check:
-`SUWAYOMI_LIVE_URL=<server> cargo test -p komasabi-app suwayomi_live -- --ignored --nocapture`.
+`SUWAYOMI_LIVE_URL=<server> cargo test -p komasabi suwayomi_live -- --ignored --nocapture`.
 
 ## Architecture (`kavita-client` crate)
 

@@ -1039,7 +1039,7 @@ mod tests {
     }
 
     /// End-to-end walk of a real catalog, from library discovery down to the
-    /// bytes of a page: `OPDS_LIVE_URL=<catalog url> cargo test -p komasabi-app
+    /// bytes of a page: `OPDS_LIVE_URL=<catalog url> cargo test -p komasabi
     /// opds_live -- --ignored --nocapture`.
     #[test]
     #[ignore = "needs a live OPDS catalog in OPDS_LIVE_URL"]
