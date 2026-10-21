@@ -34,6 +34,9 @@ komga-client = { workspace = true, optional = true }
 opds-client = { workspace = true, optional = true }
 reqwest = { version = "0.13", optional = true }
 komasabi-reader.workspace = true
+# Compiles SQLite into the binary: Windows has no system SQLite for diesel to
+# link against, and every platform then runs the same version.
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 suwayomi-client = { workspace = true, optional = true }
 serde_json = "1"
 rfd = { version = "0.17.2", features = ["xdg-portal"] }

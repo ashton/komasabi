@@ -1,3 +1,7 @@
+// Release builds on Windows are GUI programs, so no console window opens next
+// to the app; debug builds keep theirs for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 // A build with no integration features only reads local folders, leaving the
 // integration plumbing (sync job, repository writes, …) unused.
 #![cfg_attr(

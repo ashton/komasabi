@@ -65,6 +65,11 @@ one's path *and* version, so a release bumps both `workspace.package.version` an
 Each crate's `LICENSE` is a symlink to the root one. `cargo publish --workspace --dry-run` packages
 and builds every crate in dependency order; drop `--dry-run` to publish.
 
+Binaries come from `.github/workflows/release.yml`: pushing a `v*` tag builds `komasabi` on native
+runners (Linux x86_64, Windows x86_64, and a universal macOS binary `lipo`'d from both Mac targets) and
+attaches the archives to a GitHub Release; a manual run only builds them. SQLite is bundled
+(`libsqlite3-sys` `bundled` feature), since Windows has none to link.
+
 ### Regenerating `app/src/schema.rs`
 
 `schema.rs` is Diesel-generated but hand-patched: diesel-cli's codegen is piped through

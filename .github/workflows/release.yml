@@ -1,0 +1,106 @@
+# Builds the `komasabi` binary for Linux, Windows and macOS. Pushing a `v*` tag
+# also publishes the archives as a GitHub Release; a manual run (Actions tab →
+# Release → Run workflow) only builds them and keeps them as workflow artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            targets: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          # Both Mac architectures build on the Apple Silicon runner (Xcode
+          # targets either) and are merged into one universal binary.
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build
+        shell: bash
+        run: |
+          for target in ${MATRIX_TARGETS//,/ }; do
+            cargo build --release --locked -p komasabi --target "$target"
+          done
+        env:
+          MATRIX_TARGETS: ${{ matrix.targets }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name="komasabi-${GITHUB_REF_NAME//\//-}-${MATRIX_NAME}"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+
+          case "$MATRIX_NAME" in
+            windows-*)
+              cp target/x86_64-pc-windows-msvc/release/komasabi.exe "$name/"
+              7z a "$name.zip" "$name" > /dev/null
+              echo "archive=$name.zip" >> "$GITHUB_OUTPUT"
+              ;;
+            macos-*)
+              lipo -create -output "$name/komasabi" \
+                target/aarch64-apple-darwin/release/komasabi \
+                target/x86_64-apple-darwin/release/komasabi
+              tar czf "$name.tar.gz" "$name"
+              echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              cp target/x86_64-unknown-linux-gnu/release/komasabi "$name/"
+              tar czf "$name.tar.gz" "$name"
+              echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

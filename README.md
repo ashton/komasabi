@@ -9,7 +9,12 @@ local folders and external services — [Kavita](https://www.kavitareader.com/),
 
 ## Install
 
-With a [Rust toolchain](https://www.rust-lang.org/learn/get-started) installed:
+Prebuilt binaries for Linux, Windows and macOS (universal) are attached to each
+[GitHub release](https://github.com/ashton/komasabi/releases). They aren't code-signed yet, so
+Windows SmartScreen warns on first launch, and on macOS you open the app the first time with
+right-click → Open.
+
+Or, with a [Rust toolchain](https://www.rust-lang.org/learn/get-started) installed:
 
 ```sh
 cargo install komasabi
