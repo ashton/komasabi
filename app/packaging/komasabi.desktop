@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Komasabi
+Comment=Your comic and manga libraries in one place
+Exec=komasabi
+Icon=komasabi
+Terminal=false
+Categories=Graphics;Viewer;

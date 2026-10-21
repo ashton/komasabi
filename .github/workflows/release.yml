@@ -21,11 +21,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The oldest supported Ubuntu, since the binary needs a glibc at least
+          # as new as the one it was built against (22.04: 2.35).
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             targets: x86_64-unknown-linux-gnu
             target: x86_64-unknown-linux-gnu
-            formats: deb,appimage
+            formats: deb,appimage,pacman
           - name: windows-x86_64
             os: windows-latest
             targets: x86_64-pc-windows-msvc
@@ -53,6 +55,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-packager@0.11.8
+
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-generate-rpm@0.21.1
 
       - name: Build
         shell: bash
@@ -96,8 +103,14 @@ jobs:
         run: |
           cargo packager --release --target "$MATRIX_TARGET" --formats "$MATRIX_FORMATS" \
             --out-dir ../target/packager
+          if [ -f ../target/packager/PKGBUILD ]; then
+            packaging/patch-pkgbuild.sh ../target/packager/PKGBUILD "$GITHUB_REF_NAME"
+          fi
+          # komasabi_*.tar.gz is the pacman package's payload, which its PKGBUILD
+          # downloads from the release.
           find ../target/packager -maxdepth 1 -type f \
-            \( -name '*.deb' -o -name '*.AppImage' -o -name '*-setup.exe' -o -name '*.dmg' \) \
+            \( -name '*.deb' -o -name '*.AppImage' -o -name 'komasabi_*.tar.gz' -o -name PKGBUILD \
+               -o -name '*-setup.exe' -o -name '*.dmg' \) \
             -exec cp {} ../dist/ \;
           # A .app is a folder, so it ships zipped (the .dmg holds the same app).
           if [ -d ../target/packager/Komasabi.app ]; then
@@ -108,6 +121,14 @@ jobs:
           MATRIX_NAME: ${{ matrix.name }}
           MATRIX_TARGET: ${{ matrix.target }}
           MATRIX_FORMATS: ${{ matrix.formats }}
+
+      - name: RPM
+        if: runner.os == 'Linux'
+        run: |
+          cargo generate-rpm -p app --target "$MATRIX_TARGET"
+          cp target/"$MATRIX_TARGET"/generate-rpm/*.rpm dist/
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:

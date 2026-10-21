@@ -69,10 +69,14 @@ Binaries come from `.github/workflows/release.yml`: pushing a `v*` tag builds `k
 runners (Linux x86_64, Windows x86_64, and a universal macOS binary `lipo`'d from both Mac targets) and
 attaches the archives to a GitHub Release; a manual run only builds them. SQLite is bundled
 (`libsqlite3-sys` `bundled` feature), since Windows has none to link. Each job also builds that
-platform's installers with `cargo packager` (`.deb`/`.AppImage`, NSIS `-setup.exe`, `.app`/`.dmg`),
+platform's installers with `cargo packager` (`.deb`/`.AppImage`/pacman, NSIS `-setup.exe`, `.app`/`.dmg`),
 configured under `[package.metadata.packager]` in `app/Cargo.toml`; it packages the binary already in
 `target/<target>/release` rather than building one. `app/build.rs` embeds `assets/komasabi.ico` as
-the Windows executable's icon. Locally: `cd app && cargo build --release && cargo packager --release
+the Windows executable's icon. Linux also gets an `.rpm` from `cargo generate-rpm -p app`
+(`[package.metadata.generate-rpm]`). Every Linux package installs `app/packaging/komasabi.desktop`. The
+pacman `PKGBUILD` that cargo-packager writes would install its own source tarball at `/`, so
+`app/packaging/patch-pkgbuild.sh` fixes it and points its source at the GitHub release. The Linux job
+runs on Ubuntu 22.04 so the binary only needs glibc 2.35. Locally: `cd app && cargo build --release && cargo packager --release
 -f deb,appimage`.
 
 ### Regenerating `app/src/schema.rs`

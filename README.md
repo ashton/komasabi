@@ -18,9 +18,12 @@ Each [GitHub release](https://github.com/ashton/komasabi/releases) has installer
 
 | Platform | Installers | Binary |
 |---|---|---|
-| Linux (x86_64) | `.deb`, `.AppImage` | `komasabi-…-linux-x86_64.tar.gz` |
+| Linux (x86_64) | `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE), `PKGBUILD` (Arch), `.AppImage` (any) | `komasabi-…-linux-x86_64.tar.gz` |
 | Windows (x86_64) | `…-setup.exe` | `komasabi-…-windows-x86_64.zip` |
 | macOS (Apple Silicon and Intel) | `.dmg` | `komasabi-…-macos-universal.tar.gz` |
+
+On Arch, download the release's `PKGBUILD` into an empty folder and run `makepkg -si` there. The
+Linux builds need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, RHEL 10 and later).
 
 They aren't code-signed yet, so Windows SmartScreen warns on first launch, and on macOS you open
 the app the first time with right-click → Open.

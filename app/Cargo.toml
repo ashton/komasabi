@@ -23,6 +23,24 @@ icons = ["assets/komasabi-icon.png"]
 [package.metadata.packager.nsis]
 installer-icon = "assets/komasabi.ico"
 
+# Also the desktop entry of the AppImage and pacman package, which reuse the
+# .deb's file tree.
+[package.metadata.packager.deb]
+desktop-template = "packaging/komasabi.desktop"
+
+# The PKGBUILD is patched after packaging by packaging/patch-pkgbuild.sh.
+[package.metadata.packager.pacman]
+depends = ["gcc-libs", "glibc"]
+
+# The .rpm (Fedora, openSUSE, …), built with `cargo generate-rpm -p app` from
+# the workspace root after a release build.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/komasabi", dest = "/usr/bin/komasabi", mode = "755" },
+    { source = "packaging/komasabi.desktop", dest = "/usr/share/applications/komasabi.desktop", mode = "644" },
+    { source = "assets/komasabi-icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/komasabi.png", mode = "644" },
+]
+
 [features]
 default = ["kavita", "komga", "opds", "suwayomi"]
 kavita = ["dep:kavita-client", "dep:reqwest", "dep:url"]
