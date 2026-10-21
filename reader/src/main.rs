@@ -34,11 +34,16 @@ const PREFETCH_AHEAD: usize = 2;
 /// single flip touches (current, a couple ahead, one behind) so local
 /// back-and-forth navigation stays in cache.
 const CACHE_CAPACITY: usize = 9;
+const APP_ICON: &[u8] = include_bytes!("../assets/komasabi-icon.png");
 
 fn main() -> iced::Result {
     iced::application(Reader::new, Reader::update, Reader::view)
         .subscription(Reader::subscription)
         .title("Komasabi Reader")
+        .window(iced::window::Settings {
+            icon: iced::window::icon::from_file_data(APP_ICON, None).ok(),
+            ..Default::default()
+        })
         .run()
 }
 

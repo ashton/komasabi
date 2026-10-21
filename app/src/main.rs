@@ -326,6 +326,10 @@ fn main() -> iced::Result {
 
     iced::application(KomasabiApp::new, KomasabiApp::update, KomasabiApp::view)
         .subscription(KomasabiApp::subscription)
+        .window(iced::window::Settings {
+            icon: iced::window::icon::from_file_data(icons::APP_ICON, None).ok(),
+            ..Default::default()
+        })
         .run()
 }
 

@@ -4,6 +4,8 @@
 //! independent of the process' working directory and turns a missing or renamed
 //! asset into a build error rather than a blank widget.
 
+pub const APP_ICON: &[u8] = include_bytes!("../assets/komasabi-icon.png");
+
 pub const BOOK_OPEN: &[u8] = include_bytes!("../assets/book-open.svg");
 pub const PLUG_CONNECT: &[u8] = include_bytes!("../assets/plug-connect.svg");
 
