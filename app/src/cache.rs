@@ -12,7 +12,7 @@ use directories::ProjectDirs;
 /// The app's cache root for this platform, or `None` if one can't be resolved.
 fn cache_root() -> Option<PathBuf> {
     Some(
-        ProjectDirs::from("", "", "sabita")?
+        ProjectDirs::from("", "", "komasabi")?
             .cache_dir()
             .to_path_buf(),
     )
@@ -119,7 +119,7 @@ mod tests {
             return;
         };
 
-        let key = format!("sabita-cache-test-{}", std::process::id());
+        let key = format!("komasabi-cache-test-{}", std::process::id());
         let bytes: &[u8] = &[1, 2, 3, 4];
 
         write_cover(&key, bytes).expect("write should succeed with a cache dir");

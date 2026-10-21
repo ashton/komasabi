@@ -425,7 +425,7 @@ mod tests {
     }
 
     /// Exercises the provider against a real Komga server:
-    /// `KOMGA_LIVE_URL=<url> KOMGA_LIVE_API_KEY=<key> cargo test -p sabita-app komga_live -- --ignored --nocapture`.
+    /// `KOMGA_LIVE_URL=<url> KOMGA_LIVE_API_KEY=<key> cargo test -p komasabi-app komga_live -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore]
     async fn komga_live() {

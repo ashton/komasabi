@@ -2542,6 +2542,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "komasabi-app"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "diesel-derive-enum",
+ "directories",
+ "iced",
+ "iced_anim",
+ "iced_font_awesome",
+ "iced_test",
+ "interprocess",
+ "kavita-client",
+ "komasabi-reader",
+ "komga-client",
+ "opds-client",
+ "reqwest",
+ "rfd",
+ "serde_json",
+ "suwayomi-client",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unrar",
+ "url",
+ "uuid",
+ "wiremock",
+ "zip",
+]
+
+[[package]]
+name = "komasabi-reader"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "image",
+ "interprocess",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "komga-client"
 version = "0.1.0"
 dependencies = [
@@ -4389,50 +4433,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "sabita-app"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "diesel",
- "diesel-async",
- "diesel-derive-enum",
- "directories",
- "iced",
- "iced_anim",
- "iced_font_awesome",
- "iced_test",
- "interprocess",
- "kavita-client",
- "komga-client",
- "opds-client",
- "reqwest",
- "rfd",
- "sabita-reader",
- "serde_json",
- "suwayomi-client",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "unrar",
- "url",
- "uuid",
- "wiremock",
- "zip",
-]
-
-[[package]]
-name = "sabita-reader"
-version = "0.1.0"
-dependencies = [
- "iced",
- "image",
- "interprocess",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "same-file"

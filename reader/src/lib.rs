@@ -2,7 +2,7 @@
 //!
 //! The reader is launched as its own process and reads images from a folder; it
 //! knows nothing about where those images came from. Its tie back to a host
-//! (e.g. the Sabita app) is a duplex channel over an `interprocess` local
+//! (e.g. the Komasabi app) is a duplex channel over an `interprocess` local
 //! socket: the reader emits [`ReaderEvent`]s about what's on screen, and the
 //! host sends [`ReaderCommand`]s driving the session (metadata, page
 //! availability). The host depends on this crate solely for these two types; it

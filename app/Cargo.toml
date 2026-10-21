@@ -1,5 +1,5 @@
 [package]
-name = "sabita-app"
+name = "komasabi-app"
 version = "0.1.0"
 edition = "2024"
 
@@ -19,7 +19,7 @@ kavita-client = { path = "../kavita-client" }
 komga-client = { path = "../komga-client" }
 opds-client = { path = "../opds-client" }
 reqwest = "0.13"
-sabita-reader = { path = "../reader" }
+komasabi-reader = { path = "../reader" }
 suwayomi-client = { path = "../suwayomi-client" }
 serde_json = "1"
 rfd = { version = "0.17.2", features = ["xdg-portal"] }

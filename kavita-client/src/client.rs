@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn redact_api_key_masks_the_api_key_query_param() {
         let url = Url::parse(
-            "http://localhost:5000/api/Plugin/authenticate?apiKey=secret&pluginName=Sabita",
+            "http://localhost:5000/api/Plugin/authenticate?apiKey=secret&pluginName=Komasabi",
         )
         .unwrap();
 
@@ -124,7 +124,7 @@ mod tests {
 
         assert!(!redacted.as_str().contains("secret"));
         assert!(redacted.as_str().contains("apiKey=REDACTED"));
-        assert!(redacted.as_str().contains("pluginName=Sabita"));
+        assert!(redacted.as_str().contains("pluginName=Komasabi"));
     }
 
     #[test]

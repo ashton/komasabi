@@ -1,9 +1,9 @@
 //! Standalone comic reader: given a folder of images, display them one page at
 //! a time with navigation, zoom, rotation and fit controls. It has no knowledge
-//! of where the images came from — a host process (the Sabita app) downloads a
+//! of where the images came from — a host process (the Komasabi app) downloads a
 //! chapter's pages into a folder and launches this binary pointed at it.
 //!
-//! Usage: `sabita-reader <dir> [--page N] [--events <socket-name>]`
+//! Usage: `komasabi-reader <dir> [--page N] [--events <socket-name>]`
 //! - `<dir>`: folder of page image files named `{index:05}.img`.
 //! - `--page N`: 0-based page to open on (clamped).
 //! - `--events <socket-name>`: `interprocess` namespaced socket the host is
@@ -22,7 +22,7 @@ use iced::keyboard::{self, Key, key::Named};
 use iced::widget::{column, container, image, text};
 use iced::{ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task};
 
-use sabita_reader::{EventSender, ReaderCommand, ReaderEvent, ReaderLink};
+use komasabi_reader::{EventSender, ReaderCommand, ReaderEvent, ReaderLink};
 
 const ZOOM_STEP: f32 = 1.25;
 const MIN_ZOOM: f32 = 0.1;
@@ -38,7 +38,7 @@ const CACHE_CAPACITY: usize = 9;
 fn main() -> iced::Result {
     iced::application(Reader::new, Reader::update, Reader::view)
         .subscription(Reader::subscription)
-        .title("Sabita Reader")
+        .title("Komasabi Reader")
         .run()
 }
 
@@ -558,7 +558,7 @@ impl Config {
         }
 
         Ok(Config {
-            dir: dir.ok_or("usage: sabita-reader <dir> [--page N] [--events <name>]")?,
+            dir: dir.ok_or("usage: komasabi-reader <dir> [--page N] [--events <name>]")?,
             start_page,
             events,
         })
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn list_pages_returns_files_in_filename_order() {
-        let dir = std::env::temp_dir().join(format!("sabita-reader-list-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komasabi-reader-list-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Write out of order; the host names pages zero-padded, so lexicographic

@@ -7,10 +7,10 @@
 use std::io::{BufRead, BufReader, Write};
 
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, prelude::*};
-use sabita_reader::{ReaderCommand, ReaderEvent, ReaderLink};
+use komasabi_reader::{ReaderCommand, ReaderEvent, ReaderLink};
 
 fn bind(tag: &str) -> (String, interprocess::local_socket::Listener) {
-    let socket_name = format!("sabita-reader-test-{tag}-{}.sock", std::process::id());
+    let socket_name = format!("komasabi-reader-test-{tag}-{}.sock", std::process::id());
     let name = socket_name
         .as_str()
         .to_ns_name::<GenericNamespaced>()

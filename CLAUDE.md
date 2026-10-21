@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Sabita is a desktop app, built with Rust and [`iced`](https://iced.rs/) (not Slint — the repo
+Komasabi is a desktop app, built with Rust and [`iced`](https://iced.rs/) (not Slint — the repo
 originated from a Slint template, hence the stale `README.md` and the enabled `slint` plugin in
 `.claude/settings.json`, but the UI toolkit actually in use is `iced`). It lets a user aggregate
 comic/manga libraries from external services (currently Kavita, Komga, Suwayomi and OPDS catalogs) and from local folders into one
 place.
 
 The workspace crates:
-- `app` (`sabita-app`) — the iced desktop application: screens, local SQLite persistence (Diesel),
+- `app` (`komasabi-app`) — the iced desktop application: screens, local SQLite persistence (Diesel),
   background jobs, and provider integrations.
 - `kavita-client` — a standalone, UI-agnostic HTTP client for the [Kavita](https://www.kavitareader.com/)
   API. Has no dependency on `app` and is tested against a mocked server (`wiremock`), not a live Kavita
@@ -22,7 +22,7 @@ The workspace crates:
   server's GraphQL API, tested with `wiremock`.
 - `opds-client` — a standalone, UI-agnostic client for OPDS catalogs. Parses both OPDS 2 (JSON) and
   OPDS 1.2 (Atom XML) into one OPDS 2–shaped model. Also tested with `wiremock`.
-- `reader` (`sabita-reader`) — the standalone page-viewer binary the app launches and streams pages into.
+- `reader` (`komasabi-reader`) — the standalone page-viewer binary the app launches and streams pages into.
 
 ## Commands
 
@@ -36,21 +36,21 @@ mise run cargo:run              # equivalent to `cargo run`, from app/
 
 # Tests (iced screens use iced_test::simulator; kavita-client uses wiremock)
 cargo test --workspace
-cargo test -p sabita-app
+cargo test -p komasabi-app
 cargo test -p kavita-client
 cargo test -p komga-client
 cargo test -p suwayomi-client
 cargo test -p opds-client
 cargo test <test_name>           # run a single test by name substring
 
-# Database (sqlite, DATABASE_URL defaults to app/sabita.sqlite3 via mise env)
+# Database (sqlite, DATABASE_URL defaults to app/komasabi.sqlite3 via mise env)
 mise run migration:setup                 # create db + run all pending migrations
 mise run migration:generate <name>       # scaffold a new migration (creates up.sql/down.sql)
 mise run migration:apply                 # run pending migrations
 ```
 
 Diesel migration tasks run with `dir = "app"`, so `DATABASE_URL` (set in `mise.toml` as
-`sabita.sqlite3`) resolves relative to `app/`. If running `diesel` manually outside mise, `cd app`
+`komasabi.sqlite3`) resolves relative to `app/`. If running `diesel` manually outside mise, `cd app`
 first.
 
 ### Regenerating `app/src/schema.rs`
@@ -68,7 +68,7 @@ time it's regenerated.
 self-contained iced sub-application following the same shape:
 - a `Message` enum for its own events
 - an `Action` enum (`None` / `Run(Task<Message>)`) returned from `update`, which the top-level
-  `SabitaApp::update` (in `src/main.rs`) matches on to decide whether to run a follow-up `Task`
+  `KomasabiApp::update` (in `src/main.rs`) matches on to decide whether to run a follow-up `Task`
 - `new() -> (Self, Task<Message>)` for initial load (e.g. kicking off a repository fetch)
 - a `view_helper` submodule holding the actual iced widget tree, kept separate from `update` logic
 - `#[cfg(test)]` tests driven via `iced_test::simulator`, asserting on both rendered widgets
@@ -121,7 +121,7 @@ feed it links to. Reading goes only through the OPDS provider and `opds-client`,
 provider's code involved. The file is downloaded from the publication's `…/acquisition/open-access`
 link (plain `…/acquisition` as a fallback) and fully extracted, CBZ or CBR, by `providers::opds::archive`
 into a cached pages folder. The reader is then served from that folder. Page streams (OPDS-PSE) are
-not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p sabita-app opds_live -- --ignored --nocapture`
+not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p komasabi-app opds_live -- --ignored --nocapture`
 (a Kavita catalog is `http://<host>/api/opds/<api-key>`; Kavita only serves OPDS 1.2).
 
 **Komga provider (`providers::komga`).** Added via the integrations screen's "Komga" type (server URL
@@ -131,7 +131,7 @@ directly onto library → item → entry, using Komga's string ids as-is. Every 
 labelled with its title, since Komga doesn't say whether a book is a volume or an issue. Reading
 uses the page endpoint (`/api/v1/books/{id}/pages/{n}`, 1-based), so nothing is downloaded up front.
 Text-only EPUBs and books Komga hasn't analyzed yet are refused. Live check:
-`KOMGA_LIVE_URL=<server> KOMGA_LIVE_API_KEY=<key> cargo test -p sabita-app komga_live -- --ignored --nocapture`.
+`KOMGA_LIVE_URL=<server> KOMGA_LIVE_API_KEY=<key> cargo test -p komasabi-app komga_live -- --ignored --nocapture`.
 
 **Suwayomi provider (`providers::suwayomi`).** Added via the integrations screen's "Suwayomi" type
 (server URL plus optional basic-auth username/password; Suwayomi runs unauthenticated by default).
@@ -143,7 +143,7 @@ mangas aren't paged by the server, so `list_items` slices the full list. A chapt
 cover. Reading runs the `fetchChapterPages` mutation, which makes the server fetch the page list from
 the source. The pages are then fetched from `/api/v1/manga/{manga}/chapter/{sourceOrder}/page/{n}`
 (0-based), so a `PageRef.chapter_id` is `{manga_id}-{source_order}`. Live check:
-`SUWAYOMI_LIVE_URL=<server> cargo test -p sabita-app suwayomi_live -- --ignored --nocapture`.
+`SUWAYOMI_LIVE_URL=<server> cargo test -p komasabi-app suwayomi_live -- --ignored --nocapture`.
 
 ## Architecture (`kavita-client` crate)
 

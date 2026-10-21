@@ -2,7 +2,7 @@
 "cargo:diesel_cli" = { version = "latest", features = ["sqlite"], default-features = false }
 
 [env]
-DATABASE_URL = "sabita.sqlite3"
+DATABASE_URL = "komasabi.sqlite3"
 
 [tasks."migration:setup"]
 description = "Create the sqlite database and run pending migrations"
@@ -27,7 +27,7 @@ description = "Run the application using cargo run through mise"
 dir = "app"
 # The app spawns the reader binary from its own target directory, so build it
 # first — `cargo run` for the app alone wouldn't.
-run = ["cargo build -p sabita-reader --bin sabita-reader", "cargo run"]
+run = ["cargo build -p komasabi-reader --bin komasabi-reader", "cargo run"]
 
 [tasks."cargo:run-reader"]
 description = "Run the standalone comic reader against a folder of images"

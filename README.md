@@ -1,6 +1,6 @@
-# Sabita
+# Komasabi
 
-Sabita is a desktop app for keeping your comic and manga libraries in one place. It aggregates
+Komasabi is a desktop app for keeping your comic and manga libraries in one place. It aggregates
 local folders and external services — currently [Kavita](https://www.kavitareader.com/) — into a
 single library view.
 
@@ -8,7 +8,7 @@ single library view.
 
 The app is built with Rust and [`iced`](https://iced.rs/) for the UI. The workspace has two crates:
 
-- `app` (`sabita-app`) — the desktop application: screens, local SQLite persistence (via
+- `app` (`komasabi-app`) — the desktop application: screens, local SQLite persistence (via
   [Diesel](https://diesel.rs/)), background sync jobs, and provider integrations.
 - `kavita-client` — a standalone HTTP client for the Kavita API, with no dependency on `app`.
 

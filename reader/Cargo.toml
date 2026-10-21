@@ -1,14 +1,14 @@
 [package]
-name = "sabita-reader"
+name = "komasabi-reader"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "sabita_reader"
+name = "komasabi_reader"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sabita-reader"
+name = "komasabi-reader"
 path = "src/main.rs"
 
 [dependencies]

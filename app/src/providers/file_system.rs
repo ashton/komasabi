@@ -395,7 +395,7 @@ mod tests {
 
     /// Builds a temp directory unique to this test run, cleaned up by the caller.
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sabita-fs-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("komasabi-fs-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

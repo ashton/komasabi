@@ -24,7 +24,7 @@ use interprocess::local_socket::{
 };
 use uuid::Uuid;
 
-use sabita_reader::{ReaderCommand, ReaderEvent};
+use komasabi_reader::{ReaderCommand, ReaderEvent};
 
 use crate::cache;
 use crate::models::series_entry::SeriesEntry;
@@ -80,7 +80,7 @@ async fn cache_namespace_for_library(library_external_id: &str) -> Result<String
 /// name to hand to the reader. Bound before the reader is launched so the reader
 /// can't race the listener.
 fn bind_and_serve(spec: SessionSpec) -> Result<String, String> {
-    let socket_name = format!("sabita-reader-{}.sock", Uuid::new_v4());
+    let socket_name = format!("komasabi-reader-{}.sock", Uuid::new_v4());
     let name = socket_name
         .as_str()
         .to_ns_name::<GenericNamespaced>()
@@ -280,9 +280,9 @@ fn reader_binary() -> Result<PathBuf, String> {
         .ok_or("the running executable has no parent directory")?;
 
     let name = if cfg!(windows) {
-        "sabita-reader.exe"
+        "komasabi-reader.exe"
     } else {
-        "sabita-reader"
+        "komasabi-reader"
     };
 
     Ok(dir.join(name))
@@ -316,8 +316,8 @@ mod tests {
     fn reader_binary_sits_next_to_the_current_exe() {
         let path = reader_binary().unwrap();
         let expected = cfg!(windows)
-            .then_some("sabita-reader.exe")
-            .unwrap_or("sabita-reader");
+            .then_some("komasabi-reader.exe")
+            .unwrap_or("komasabi-reader");
         assert_eq!(path.file_name().unwrap().to_str().unwrap(), expected);
         assert_eq!(path.parent(), std::env::current_exe().unwrap().parent());
     }

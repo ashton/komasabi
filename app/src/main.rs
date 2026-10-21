@@ -43,12 +43,12 @@ enum Message {
     Integrations(integration::Message),
 }
 
-struct SabitaApp {
+struct KomasabiApp {
     screen: Screen,
     menu: Menu<Message>,
 }
 
-impl SabitaApp {
+impl KomasabiApp {
     pub fn new() -> (Self, Task<Message>) {
         (
             Self {
@@ -319,13 +319,13 @@ fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("sabita_app=debug,kavita_client=debug")
+                tracing_subscriber::EnvFilter::new("komasabi_app=debug,kavita_client=debug")
             }),
         )
         .init();
 
-    iced::application(SabitaApp::new, SabitaApp::update, SabitaApp::view)
-        .subscription(SabitaApp::subscription)
+    iced::application(KomasabiApp::new, KomasabiApp::update, KomasabiApp::view)
+        .subscription(KomasabiApp::subscription)
         .run()
 }
 
@@ -333,8 +333,8 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
 
-    fn app() -> SabitaApp {
-        let (app, _task) = SabitaApp::new();
+    fn app() -> KomasabiApp {
+        let (app, _task) = KomasabiApp::new();
         app
     }
 

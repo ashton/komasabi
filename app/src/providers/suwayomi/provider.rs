@@ -424,7 +424,7 @@ mod tests {
     }
 
     /// Exercises the provider against a real Suwayomi server:
-    /// `SUWAYOMI_LIVE_URL=<url> cargo test -p sabita-app suwayomi_live -- --ignored --nocapture`.
+    /// `SUWAYOMI_LIVE_URL=<url> cargo test -p komasabi-app suwayomi_live -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore]
     async fn suwayomi_live() {

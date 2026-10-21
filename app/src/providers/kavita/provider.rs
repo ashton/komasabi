@@ -27,7 +27,7 @@ impl KavitaProvider {
     pub async fn authenticate(url: String, api_key: String) -> Result<Self, String> {
         let unauthenticated_client = KavitaClient::new(url.clone(), reqwest::Client::new());
         let user = unauthenticated_client
-            .authenticate(&api_key, "Sabita")
+            .authenticate(&api_key, "Komasabi")
             .await
             .map_err(crate::error::log_and_stringify)?;
         let token = user
