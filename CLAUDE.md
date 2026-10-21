@@ -57,6 +57,14 @@ Diesel migration tasks run with `dir = "app"`, so `DATABASE_URL` (set in `mise.t
 `komasabi.sqlite3`) resolves relative to `app/`. If running `diesel` manually outside mise, `cd app`
 first.
 
+### Publishing
+
+Every crate publishes to crates.io, sharing `[workspace.package]` metadata (one version for all) from
+the root `Cargo.toml`. Internal dependencies go through `[workspace.dependencies]`, which pins each
+one's path *and* version, so a release bumps both `workspace.package.version` and those versions.
+Each crate's `LICENSE` is a symlink to the root one. `cargo publish --workspace --dry-run` packages
+and builds every crate in dependency order; drop `--dry-run` to publish.
+
 ### Regenerating `app/src/schema.rs`
 
 `schema.rs` is Diesel-generated but hand-patched: diesel-cli's codegen is piped through

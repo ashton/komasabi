@@ -1,7 +1,13 @@
 [package]
 name = "kavita-client"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "An async HTTP client for the Kavita comic, manga and book server API"
+keywords = ["kavita", "comics", "manga", "api", "client"]
+categories = ["api-bindings", "web-programming::http-client"]
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }

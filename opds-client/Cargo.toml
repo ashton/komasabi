@@ -1,7 +1,13 @@
 [package]
 name = "opds-client"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "An async client for OPDS catalogs that reads OPDS 2 (JSON) and OPDS 1.2 (Atom) into one model"
+keywords = ["opds", "ebooks", "comics", "catalog", "atom"]
+categories = ["api-bindings", "parser-implementations", "web-programming::http-client"]
 
 [dependencies]
 quick-xml = "0.41"
