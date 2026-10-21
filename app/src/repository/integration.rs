@@ -34,6 +34,7 @@ pub async fn find(integration_id: &str) -> Result<Integration, String> {
         .map_err(crate::error::log_and_stringify)
 }
 
+#[cfg(feature = "kavita")]
 pub async fn create(
     name: String,
     integration_type: IntegrationType,
@@ -52,6 +53,7 @@ pub async fn create(
     .await
 }
 
+#[cfg(any(feature = "opds", feature = "suwayomi"))]
 /// Creates an integration authenticated with basic-auth credentials rather
 /// than an API key (an OPDS catalog or a Suwayomi server). Blank credentials
 /// are stored as absent.
@@ -74,6 +76,7 @@ pub async fn create_with_credentials(
     .await
 }
 
+#[cfg(feature = "komga")]
 /// Creates an integration that authenticates with either an API key or
 /// basic-auth credentials (a Komga server). Blank values are stored as absent.
 pub async fn create_with_auth(

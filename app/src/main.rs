@@ -1,3 +1,15 @@
+// A build with no integration features only reads local folders, leaving the
+// integration plumbing (sync job, repository writes, …) unused.
+#![cfg_attr(
+    not(any(
+        feature = "kavita",
+        feature = "komga",
+        feature = "opds",
+        feature = "suwayomi"
+    )),
+    allow(dead_code, unused)
+)]
+
 mod adapter;
 mod cache;
 pub mod database;

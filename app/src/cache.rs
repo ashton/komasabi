@@ -39,6 +39,7 @@ pub fn pages_dir(key: &str) -> Option<PathBuf> {
 
 /// Where a whole downloaded file (e.g. a remote comic archive read page by
 /// page) is kept, keyed like covers.
+#[cfg(feature = "opds")]
 pub fn download_path(key: &str) -> Option<PathBuf> {
     Some(cache_root()?.join("downloads").join(file_name(key)))
 }

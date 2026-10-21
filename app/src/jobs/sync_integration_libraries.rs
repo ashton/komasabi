@@ -1,10 +1,14 @@
 use crate::models::integration::IntegrationType;
 use crate::models::job::{JobStatus, JobType};
 use crate::models::library::Library;
-use crate::providers::{
-    kavita::provider::KavitaProvider, komga::provider::KomgaProvider, opds::provider::OpdsProvider,
-    suwayomi::provider::SuwayomiProvider,
-};
+#[cfg(feature = "kavita")]
+use crate::providers::kavita::provider::KavitaProvider;
+#[cfg(feature = "komga")]
+use crate::providers::komga::provider::KomgaProvider;
+#[cfg(feature = "opds")]
+use crate::providers::opds::provider::OpdsProvider;
+#[cfg(feature = "suwayomi")]
+use crate::providers::suwayomi::provider::SuwayomiProvider;
 use crate::repository::{
     integration as integration_repository, job as job_repository, library as library_repository,
 };
@@ -78,6 +82,7 @@ async fn remote_libraries(integration_id: &str) -> Result<Vec<Library>, String> 
         .ok_or_else(|| "integration is missing a url".to_string())?;
 
     match integration.integration_type {
+        #[cfg(feature = "kavita")]
         IntegrationType::Kavita => {
             let api_key = integration
                 .api_key
@@ -87,11 +92,13 @@ async fn remote_libraries(integration_id: &str) -> Result<Vec<Library>, String> 
             let provider = KavitaProvider::authenticate(url, api_key).await?;
             provider.list_libraries(integration_id).await
         }
+        #[cfg(feature = "opds")]
         IntegrationType::Opds => {
             OpdsProvider::connect(url, integration.username, integration.password)
                 .list_libraries(integration_id)
                 .await
         }
+        #[cfg(feature = "komga")]
         IntegrationType::Komga => {
             KomgaProvider::connect(
                 url,
@@ -102,10 +109,13 @@ async fn remote_libraries(integration_id: &str) -> Result<Vec<Library>, String> 
             .list_libraries(integration_id)
             .await
         }
+        #[cfg(feature = "suwayomi")]
         IntegrationType::Suwayomi => {
             SuwayomiProvider::connect(url, integration.username, integration.password)?
                 .list_libraries(integration_id)
                 .await
         }
+        #[allow(unreachable_patterns)]
+        integration_type => Err(crate::providers::not_built_in(integration_type)),
     }
 }

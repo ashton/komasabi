@@ -4,15 +4,23 @@ use crate::models::series_entry::SeriesEntry;
 use crate::repository::{integration as integration_repository, library as library_repository};
 
 pub mod file_system;
+#[cfg(feature = "kavita")]
 pub mod kavita;
+#[cfg(feature = "komga")]
 pub mod komga;
+#[cfg(feature = "opds")]
 pub mod opds;
+#[cfg(feature = "suwayomi")]
 pub mod suwayomi;
 
 use file_system::FileSystemProvider;
+#[cfg(feature = "kavita")]
 use kavita::provider::KavitaProvider;
+#[cfg(feature = "komga")]
 use komga::provider::KomgaProvider;
+#[cfg(feature = "opds")]
 use opds::provider::OpdsProvider;
+#[cfg(feature = "suwayomi")]
 use suwayomi::provider::SuwayomiProvider;
 
 /// One page to fetch from a provider: an opaque, provider-defined `chapter_id`
@@ -58,10 +66,14 @@ pub trait Provider {
 /// A provider resolved for a particular library, erasing the concrete backend
 /// behind the [`Provider`] trait. One variant per supported backend.
 pub enum ResolvedProvider {
+    #[cfg(feature = "kavita")]
     Kavita(KavitaProvider),
+    #[cfg(feature = "komga")]
     Komga(KomgaProvider),
     FileSystem(FileSystemProvider),
+    #[cfg(feature = "opds")]
     Opds(OpdsProvider),
+    #[cfg(feature = "suwayomi")]
     Suwayomi(SuwayomiProvider),
 }
 
@@ -73,10 +85,14 @@ pub enum ResolvedProvider {
 macro_rules! dispatch {
     ($provider:expr, $method:ident($($arg:expr),*)) => {
         match $provider {
+            #[cfg(feature = "kavita")]
             ResolvedProvider::Kavita(provider) => Provider::$method(provider, $($arg),*).await,
+            #[cfg(feature = "komga")]
             ResolvedProvider::Komga(provider) => Provider::$method(provider, $($arg),*).await,
             ResolvedProvider::FileSystem(provider) => Provider::$method(provider, $($arg),*).await,
+            #[cfg(feature = "opds")]
             ResolvedProvider::Opds(provider) => Provider::$method(provider, $($arg),*).await,
+            #[cfg(feature = "suwayomi")]
             ResolvedProvider::Suwayomi(provider) => Provider::$method(provider, $($arg),*).await,
         }
     };
@@ -147,6 +163,7 @@ pub async fn provider_for_library(
     let integration = integration_repository::find(&integration_id).await?;
 
     match integration.integration_type {
+        #[cfg(feature = "kavita")]
         IntegrationType::Kavita => {
             let url = integration
                 .url
@@ -158,6 +175,7 @@ pub async fn provider_for_library(
             let provider = KavitaProvider::authenticate(url, api_key).await?;
             Ok((ResolvedProvider::Kavita(provider), integration_id))
         }
+        #[cfg(feature = "opds")]
         IntegrationType::Opds => {
             let url = integration
                 .url
@@ -166,6 +184,7 @@ pub async fn provider_for_library(
             let provider = OpdsProvider::connect(url, integration.username, integration.password);
             Ok((ResolvedProvider::Opds(provider), integration_id))
         }
+        #[cfg(feature = "komga")]
         IntegrationType::Komga => {
             let url = integration
                 .url
@@ -179,6 +198,7 @@ pub async fn provider_for_library(
             )?;
             Ok((ResolvedProvider::Komga(provider), integration_id))
         }
+        #[cfg(feature = "suwayomi")]
         IntegrationType::Suwayomi => {
             let url = integration
                 .url
@@ -188,5 +208,16 @@ pub async fn provider_for_library(
                 SuwayomiProvider::connect(url, integration.username, integration.password)?;
             Ok((ResolvedProvider::Suwayomi(provider), integration_id))
         }
+        #[allow(unreachable_patterns)]
+        integration_type => Err(not_built_in(integration_type)),
     }
+}
+
+/// The error for an integration whose provider was left out of this build by
+/// its cargo feature (e.g. a database shared with a build that had it).
+pub fn not_built_in(integration_type: IntegrationType) -> String {
+    format!(
+        "this build of Komasabi doesn't include {} support",
+        integration_type.label()
+    )
 }

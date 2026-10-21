@@ -100,6 +100,15 @@ the existing language when adding sibling strings in the same view, don't transl
    implementing these same adapter traits plus a `providers::Provider` impl — don't let
    Kavita-specific types leak past the adapter layer into `repository`/`screen` code.
 
+**Cargo features.** Each remote provider is a feature of the `app` crate: `kavita`, `komga`, `opds`,
+`suwayomi`, all on by default. A feature pulls in its client crate, its `providers::<name>` and
+`screen::integration::<name>` modules, its `Step`/`Message`/`ResolvedProvider` variants, its match arms
+in `providers::provider_for_library` and the sync job, and its tests. `IntegrationType` keeps every
+variant regardless, so a database written by a fuller build still loads; a left-out type resolves to
+`providers::not_built_in`. Local folders are always built in. Check new provider code with
+`cargo check -p komasabi-app --tests --no-default-features --features=<name>` as well as the default
+build.
+
 **Persistence (`src/repository/`, `src/models/`, `src/database.rs`, `src/schema.rs`).** Diesel +
 `diesel-async`'s `SyncConnectionWrapper` over sqlite; `database::connect()` opens a fresh connection
 per call (no pooling) using `DATABASE_URL`, or `komasabi.sqlite3` in the platform data dir

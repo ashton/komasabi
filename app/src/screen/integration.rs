@@ -1,6 +1,10 @@
+#[cfg(feature = "kavita")]
 pub mod kavita;
+#[cfg(feature = "komga")]
 pub mod komga;
+#[cfg(feature = "opds")]
 pub mod opds;
+#[cfg(feature = "suwayomi")]
 pub mod suwayomi;
 
 use iced::{Element, Task, widget::container};
@@ -10,18 +14,26 @@ use crate::models::{
     integration::{Integration as IntegrationModel, IntegrationType},
 };
 use crate::repository::integration as integration_repository;
+#[cfg(feature = "kavita")]
 use kavita::Kavita;
+#[cfg(feature = "komga")]
 use komga::Komga;
+#[cfg(feature = "opds")]
 use opds::Opds;
+#[cfg(feature = "suwayomi")]
 use suwayomi::Suwayomi;
 
 #[derive(Debug)]
 enum Step {
     List(AsyncModel<Vec<IntegrationModel>, String>),
     ChooseType,
+    #[cfg(feature = "kavita")]
     Kavita(Kavita),
+    #[cfg(feature = "komga")]
     Komga(Komga),
+    #[cfg(feature = "opds")]
     Opds(Opds),
+    #[cfg(feature = "suwayomi")]
     Suwayomi(Suwayomi),
 }
 
@@ -43,9 +55,13 @@ pub enum Message {
     IntegrationsLoaded(Result<Vec<IntegrationModel>, String>),
     AddIntegrationPressed,
     TypeSelected(IntegrationType),
+    #[cfg(feature = "kavita")]
     Kavita(kavita::Message),
+    #[cfg(feature = "komga")]
     Komga(komga::Message),
+    #[cfg(feature = "opds")]
     Opds(opds::Message),
+    #[cfg(feature = "suwayomi")]
     Suwayomi(suwayomi::Message),
 }
 
@@ -75,26 +91,34 @@ impl Integrations {
                 Action::None
             }
 
+            #[cfg(feature = "kavita")]
             Message::TypeSelected(IntegrationType::Kavita) => {
                 self.step = Step::Kavita(Kavita::default());
                 Action::None
             }
 
+            #[cfg(feature = "komga")]
             Message::TypeSelected(IntegrationType::Komga) => {
                 self.step = Step::Komga(Komga::default());
                 Action::None
             }
 
+            #[cfg(feature = "opds")]
             Message::TypeSelected(IntegrationType::Opds) => {
                 self.step = Step::Opds(Opds::default());
                 Action::None
             }
 
+            #[cfg(feature = "suwayomi")]
             Message::TypeSelected(IntegrationType::Suwayomi) => {
                 self.step = Step::Suwayomi(Suwayomi::default());
                 Action::None
             }
+            // Not offered by `choose_type` when its feature is off.
+            #[allow(unreachable_patterns)]
+            Message::TypeSelected(_) => Action::None,
 
+            #[cfg(feature = "kavita")]
             Message::Kavita(msg) => {
                 let Step::Kavita(kavita) = &mut self.step else {
                     return Action::None;
@@ -108,6 +132,7 @@ impl Integrations {
                 }
             }
 
+            #[cfg(feature = "komga")]
             Message::Komga(msg) => {
                 let Step::Komga(komga) = &mut self.step else {
                     return Action::None;
@@ -121,6 +146,7 @@ impl Integrations {
                 }
             }
 
+            #[cfg(feature = "opds")]
             Message::Opds(msg) => {
                 let Step::Opds(opds) = &mut self.step else {
                     return Action::None;
@@ -134,6 +160,7 @@ impl Integrations {
                 }
             }
 
+            #[cfg(feature = "suwayomi")]
             Message::Suwayomi(msg) => {
                 let Step::Suwayomi(suwayomi) = &mut self.step else {
                     return Action::None;
@@ -172,9 +199,13 @@ impl Integrations {
             Step::List(AsyncModel::Loaded(integrations)) => view_helper::list(integrations),
             Step::List(_) => container(iced::widget::row![]).into(),
             Step::ChooseType => view_helper::choose_type(),
+            #[cfg(feature = "kavita")]
             Step::Kavita(kavita) => kavita.view().map(Message::Kavita),
+            #[cfg(feature = "komga")]
             Step::Komga(komga) => komga.view().map(Message::Komga),
+            #[cfg(feature = "opds")]
             Step::Opds(opds) => opds.view().map(Message::Opds),
+            #[cfg(feature = "suwayomi")]
             Step::Suwayomi(suwayomi) => suwayomi.view().map(Message::Suwayomi),
         }
     }
@@ -304,12 +335,7 @@ mod view_helper {
 
     pub fn choose_type<'a>() -> Element<'a, Message> {
         container(column![
-            grid(vec![
-                type_square("Kavita", icons::KAVITA, IntegrationType::Kavita),
-                type_square("Komga", icons::KOMGA, IntegrationType::Komga),
-                type_square("OPDS", icons::OPDS, IntegrationType::Opds),
-                type_square("Suwayomi", icons::SUWAYOMI, IntegrationType::Suwayomi)
-            ])
+            grid(type_squares())
             .columns(2)
             .height(256.0)
             .width(256.0)
@@ -319,6 +345,22 @@ mod view_helper {
         .into()
     }
 
+    /// One square per integration type built into this binary.
+    fn type_squares<'a>() -> Vec<Element<'a, Message>> {
+        #[allow(unused_mut)]
+        let mut squares = Vec::new();
+        #[cfg(feature = "kavita")]
+        squares.push(type_square("Kavita", icons::KAVITA, IntegrationType::Kavita));
+        #[cfg(feature = "komga")]
+        squares.push(type_square("Komga", icons::KOMGA, IntegrationType::Komga));
+        #[cfg(feature = "opds")]
+        squares.push(type_square("OPDS", icons::OPDS, IntegrationType::Opds));
+        #[cfg(feature = "suwayomi")]
+        squares.push(type_square("Suwayomi", icons::SUWAYOMI, IntegrationType::Suwayomi));
+        squares
+    }
+
+    #[allow(dead_code)]
     fn type_square<'a>(
         name: &'a str,
         logo: &'static [u8],
@@ -466,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "kavita")]
     fn view_choose_type_renders_kavita_option() {
         let integrations = Integrations {
             step: Step::ChooseType,
@@ -477,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "kavita")]
     fn clicking_kavita_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
@@ -494,6 +538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "kavita")]
     fn update_type_selected_shows_kavita_form_step() {
         let mut integrations = Integrations::default();
 
@@ -504,6 +549,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opds")]
     fn clicking_opds_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
@@ -518,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opds")]
     fn update_type_selected_opds_shows_opds_form_step() {
         let mut integrations = Integrations::default();
 
@@ -528,6 +575,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opds")]
     fn update_opds_back_pressed_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Opds(Opds::default()),
@@ -540,6 +588,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opds")]
     fn update_opds_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Opds(Opds::default()),
@@ -554,6 +603,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "komga")]
     fn clicking_komga_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
@@ -571,6 +621,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "komga")]
     fn update_type_selected_komga_shows_komga_form_step() {
         let mut integrations = Integrations::default();
 
@@ -581,6 +632,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "komga")]
     fn update_komga_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Komga(Komga::default()),
@@ -595,6 +647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "suwayomi")]
     fn clicking_suwayomi_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
@@ -614,6 +667,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "suwayomi")]
     fn update_type_selected_suwayomi_shows_suwayomi_form_step() {
         let mut integrations = Integrations::default();
 
@@ -624,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "suwayomi")]
     fn update_suwayomi_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Suwayomi(Suwayomi::default()),
@@ -638,6 +693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "kavita")]
     fn update_kavita_back_pressed_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Kavita(Kavita::default()),
@@ -650,6 +706,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "kavita")]
     fn update_kavita_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Kavita(Kavita::default()),
