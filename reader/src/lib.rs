@@ -1,12 +1,13 @@
-//! Shared surface of the standalone comic reader.
+//! The standalone comic reader.
 //!
-//! The reader is launched as its own process and reads images from a folder; it
-//! knows nothing about where those images came from. Its tie back to a host
-//! (e.g. the Komasabi app) is a duplex channel over an `interprocess` local
-//! socket: the reader emits [`ReaderEvent`]s about what's on screen, and the
-//! host sends [`ReaderCommand`]s driving the session (metadata, page
-//! availability). The host depends on this crate solely for these two types; it
-//! never links the binary, it spawns it.
+//! The reader runs as its own process and reads images from a folder; it knows
+//! nothing about where those images came from. [`run`] is the whole program:
+//! the `komasabi-reader` binary calls it, and so does the Komasabi app when it
+//! re-launches itself as a reader (`komasabi read …`), which keeps the app a
+//! single installable binary. Its tie back to a host is a duplex channel over an
+//! `interprocess` local socket: the reader emits [`ReaderEvent`]s about what's
+//! on screen, and the host sends [`ReaderCommand`]s driving the session
+//! (metadata, page availability).
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc;
@@ -14,6 +15,10 @@ use std::sync::mpsc;
 use interprocess::TryClone;
 use interprocess::local_socket::{GenericNamespaced, Stream, prelude::*};
 use serde::{Deserialize, Serialize};
+
+mod viewer;
+
+pub use viewer::run;
 
 /// An event the reader emits about what the user is reading. Serialized as one
 /// JSON object per line over the socket, in the reader→host direction.

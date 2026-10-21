@@ -328,6 +328,11 @@ fn topbar<'a>() -> Container<'a, Message> {
 }
 
 fn main() -> iced::Result {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some(reader_launch::READER_SUBCOMMAND) {
+        return komasabi_reader::run(args);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {

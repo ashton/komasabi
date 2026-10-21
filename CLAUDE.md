@@ -22,7 +22,11 @@ The workspace crates:
   server's GraphQL API, tested with `wiremock`.
 - `opds-client` — a standalone, UI-agnostic client for OPDS catalogs. Parses both OPDS 2 (JSON) and
   OPDS 1.2 (Atom XML) into one OPDS 2–shaped model. Also tested with `wiremock`.
-- `reader` (`komasabi-reader`) — the standalone page-viewer binary the app launches and streams pages into.
+- `reader` (`komasabi-reader`) — the page viewer the app launches and streams pages into. Its whole
+  program is the library's `run(args)`: the app re-launches its own executable as `komasabi read <dir>
+  --events <socket>` (`reader_launch::READER_SUBCOMMAND`, handled first thing in `main`), so
+  `cargo install komasabi` is one self-contained binary. The crate's own `komasabi-reader` binary is a
+  one-line wrapper for running the reader on its own (`mise run cargo:run-reader <dir>`).
 
 ## Commands
 

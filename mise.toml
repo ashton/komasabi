@@ -25,9 +25,7 @@ run = "diesel migration run"
 [tasks."cargo:run"]
 description = "Run the application using cargo run through mise"
 dir = "app"
-# The app spawns the reader binary from its own target directory, so build it
-# first — `cargo run` for the app alone wouldn't.
-run = ["cargo build -p komasabi-reader --bin komasabi-reader", "cargo run"]
+run = "cargo run"
 
 [tasks."cargo:run-reader"]
 description = "Run the standalone comic reader against a folder of images"

@@ -1,6 +1,7 @@
 //! Opening a [`SeriesEntry`] in the standalone reader.
 //!
-//! The reader is a separate process that displays page images from a folder.
+//! The reader is a separate process that displays page images from a folder:
+//! this same executable, re-launched with the [`READER_SUBCOMMAND`].
 //! This module bridges the gap and then *streams* into it: it resolves the
 //! entry to a cache folder, launches the reader pointed at that folder straight
 //! away (so a window appears without waiting on any download), and hands the
@@ -30,6 +31,11 @@ use crate::cache;
 use crate::models::series_entry::SeriesEntry;
 use crate::providers::{PageRef, Provider, provider_for_library};
 use crate::repository::library as library_repository;
+
+/// The first argument that makes `main` run the reader (`komasabi read <dir> …`)
+/// instead of the library window. Shipping the reader inside the app binary
+/// keeps `cargo install komasabi` a single, self-contained install.
+pub const READER_SUBCOMMAND: &str = "read";
 
 /// Everything the background session worker needs to serve one reader. Moved
 /// onto its own thread, so it must be `Send + 'static`.
@@ -261,31 +267,17 @@ fn send_command(stream: &mut Stream, command: &ReaderCommand) -> std::io::Result
 /// on `socket_name`. Fire-and-forget: a slow or long-lived reader must not block
 /// the app.
 fn spawn_reader(dir: &Path, socket_name: &str) -> Result<(), String> {
-    Command::new(reader_binary()?)
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("could not locate the running executable: {error}"))?;
+
+    Command::new(exe)
+        .arg(READER_SUBCOMMAND)
         .arg(dir)
         .arg("--events")
         .arg(socket_name)
         .spawn()
         .map(|_child| ())
         .map_err(|error| format!("could not launch the reader: {error}"))
-}
-
-/// Path to the reader binary, which ships alongside the app binary in the same
-/// target directory.
-fn reader_binary() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("could not locate the running executable: {error}"))?;
-    let dir = exe
-        .parent()
-        .ok_or("the running executable has no parent directory")?;
-
-    let name = if cfg!(windows) {
-        "komasabi-reader.exe"
-    } else {
-        "komasabi-reader"
-    };
-
-    Ok(dir.join(name))
 }
 
 #[cfg(test)]
@@ -310,15 +302,5 @@ mod tests {
     fn page_file_is_zero_padded() {
         assert_eq!(page_file(0), "00000.img");
         assert_eq!(page_file(42), "00042.img");
-    }
-
-    #[test]
-    fn reader_binary_sits_next_to_the_current_exe() {
-        let path = reader_binary().unwrap();
-        let expected = cfg!(windows)
-            .then_some("komasabi-reader.exe")
-            .unwrap_or("komasabi-reader");
-        assert_eq!(path.file_name().unwrap().to_str().unwrap(), expected);
-        assert_eq!(path.parent(), std::env::current_exe().unwrap().parent());
     }
 }
