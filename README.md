@@ -7,6 +7,11 @@ local folders and external services — [Kavita](https://www.kavitareader.com/),
 [Komga](https://komga.org/), [Suwayomi](https://github.com/Suwayomi/Suwayomi-Server) and any
 [OPDS](https://opds.io/) catalog — into a single library view, with a built-in page reader.
 
+### The name
+
+Komasabi joins two Japanese words. *Koma* (コマ) is a panel, a single frame on a manga page. *Sabi*
+(錆) means rust, a nod to the language the app is written in.
+
 ## Install
 
 Each [GitHub release](https://github.com/ashton/komasabi/releases) has installers and plain binaries:
