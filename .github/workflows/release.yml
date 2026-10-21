@@ -1,6 +1,8 @@
-# Builds the `komasabi` binary for Linux, Windows and macOS. Pushing a `v*` tag
-# also publishes the archives as a GitHub Release; a manual run (Actions tab →
-# Release → Run workflow) only builds them and keeps them as workflow artifacts.
+# Builds `komasabi` for Linux, Windows and macOS, as a plain archive plus that
+# platform's installers (cargo-packager, configured under
+# [package.metadata.packager] in app/Cargo.toml). Pushing a `v*` tag also
+# publishes them as a GitHub Release; a manual run (Actions tab → Release → Run
+# workflow) only builds them and keeps them as workflow artifacts.
 name: Release
 
 on:
@@ -22,14 +24,20 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             targets: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu
+            formats: deb,appimage
           - name: windows-x86_64
             os: windows-latest
             targets: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
+            formats: nsis
           # Both Mac architectures build on the Apple Silicon runner (Xcode
           # targets either) and are merged into one universal binary.
           - name: macos-universal
             os: macos-latest
             targets: aarch64-apple-darwin,x86_64-apple-darwin
+            target: universal-apple-darwin
+            formats: app,dmg
 
     steps:
       - uses: actions/checkout@v5
@@ -42,6 +50,10 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-packager@0.11.8
+
       - name: Build
         shell: bash
         run: |
@@ -51,40 +63,56 @@ jobs:
         env:
           MATRIX_TARGETS: ${{ matrix.targets }}
 
-      - name: Package
-        id: package
+      - name: Merge the macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create -output target/universal-apple-darwin/release/komasabi \
+            target/aarch64-apple-darwin/release/komasabi \
+            target/x86_64-apple-darwin/release/komasabi
+
+      - name: Archive
         shell: bash
         run: |
           name="komasabi-${GITHUB_REF_NAME//\//-}-${MATRIX_NAME}"
-          mkdir "$name"
+          mkdir -p dist "$name"
           cp README.md LICENSE "$name/"
 
-          case "$MATRIX_NAME" in
-            windows-*)
-              cp target/x86_64-pc-windows-msvc/release/komasabi.exe "$name/"
-              7z a "$name.zip" "$name" > /dev/null
-              echo "archive=$name.zip" >> "$GITHUB_OUTPUT"
-              ;;
-            macos-*)
-              lipo -create -output "$name/komasabi" \
-                target/aarch64-apple-darwin/release/komasabi \
-                target/x86_64-apple-darwin/release/komasabi
-              tar czf "$name.tar.gz" "$name"
-              echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              cp target/x86_64-unknown-linux-gnu/release/komasabi "$name/"
-              tar czf "$name.tar.gz" "$name"
-              echo "archive=$name.tar.gz" >> "$GITHUB_OUTPUT"
-              ;;
-          esac
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$MATRIX_TARGET/release/komasabi.exe" "$name/"
+            7z a "dist/$name.zip" "$name" > /dev/null
+          else
+            cp "target/$MATRIX_TARGET/release/komasabi" "$name/"
+            tar czf "dist/$name.tar.gz" "$name"
+          fi
         env:
           MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_TARGET: ${{ matrix.target }}
+
+      # Packages the binary built above; cargo-packager doesn't build it again.
+      - name: Installers
+        shell: bash
+        working-directory: app
+        run: |
+          cargo packager --release --target "$MATRIX_TARGET" --formats "$MATRIX_FORMATS" \
+            --out-dir ../target/packager
+          find ../target/packager -maxdepth 1 -type f \
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*-setup.exe' -o -name '*.dmg' \) \
+            -exec cp {} ../dist/ \;
+          # A .app is a folder, so it ships zipped (the .dmg holds the same app).
+          if [ -d ../target/packager/Komasabi.app ]; then
+            (cd ../target/packager && ditto -c -k --keepParent Komasabi.app "../../dist/Komasabi-$MATRIX_NAME.app.zip")
+          fi
+          ls -l ../dist
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_FORMATS: ${{ matrix.formats }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ steps.package.outputs.archive }}
+          path: dist/*
           if-no-files-found: error
 
   release:

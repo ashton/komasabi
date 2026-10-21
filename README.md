@@ -9,10 +9,16 @@ local folders and external services — [Kavita](https://www.kavitareader.com/),
 
 ## Install
 
-Prebuilt binaries for Linux, Windows and macOS (universal) are attached to each
-[GitHub release](https://github.com/ashton/komasabi/releases). They aren't code-signed yet, so
-Windows SmartScreen warns on first launch, and on macOS you open the app the first time with
-right-click → Open.
+Each [GitHub release](https://github.com/ashton/komasabi/releases) has installers and plain binaries:
+
+| Platform | Installers | Binary |
+|---|---|---|
+| Linux (x86_64) | `.deb`, `.AppImage` | `komasabi-…-linux-x86_64.tar.gz` |
+| Windows (x86_64) | `…-setup.exe` | `komasabi-…-windows-x86_64.zip` |
+| macOS (Apple Silicon and Intel) | `.dmg` | `komasabi-…-macos-universal.tar.gz` |
+
+They aren't code-signed yet, so Windows SmartScreen warns on first launch, and on macOS you open
+the app the first time with right-click → Open.
 
 Or, with a [Rust toolchain](https://www.rust-lang.org/learn/get-started) installed:
 

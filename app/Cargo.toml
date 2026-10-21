@@ -10,6 +10,19 @@ readme = "../README.md"
 keywords = ["comics", "manga", "reader", "kavita", "komga"]
 categories = ["gui", "multimedia::images"]
 
+# Installers, built with `cargo packager` (see .github/workflows/release.yml).
+[package.metadata.packager]
+product-name = "Komasabi"
+identifier = "io.github.ashton.komasabi"
+publisher = "Matheus Ashton"
+copyright = "Copyright (c) 2026 Matheus Ashton"
+category = "GraphicsAndDesign"
+license-file = "../LICENSE"
+icons = ["assets/komasabi-icon.png"]
+
+[package.metadata.packager.nsis]
+installer-icon = "assets/komasabi.ico"
+
 [features]
 default = ["kavita", "komga", "opds", "suwayomi"]
 kavita = ["dep:kavita-client", "dep:reqwest", "dep:url"]
@@ -52,3 +65,6 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 iced_test = "0.14.0"
 tokio = { version = "1", features = ["macros", "rt"] }
 wiremock = "0.6.5"
+
+[build-dependencies]
+winresource = "0.1.34"

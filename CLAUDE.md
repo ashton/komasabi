@@ -68,7 +68,12 @@ and builds every crate in dependency order; drop `--dry-run` to publish.
 Binaries come from `.github/workflows/release.yml`: pushing a `v*` tag builds `komasabi` on native
 runners (Linux x86_64, Windows x86_64, and a universal macOS binary `lipo`'d from both Mac targets) and
 attaches the archives to a GitHub Release; a manual run only builds them. SQLite is bundled
-(`libsqlite3-sys` `bundled` feature), since Windows has none to link.
+(`libsqlite3-sys` `bundled` feature), since Windows has none to link. Each job also builds that
+platform's installers with `cargo packager` (`.deb`/`.AppImage`, NSIS `-setup.exe`, `.app`/`.dmg`),
+configured under `[package.metadata.packager]` in `app/Cargo.toml`; it packages the binary already in
+`target/<target>/release` rather than building one. `app/build.rs` embeds `assets/komasabi.ico` as
+the Windows executable's icon. Locally: `cd app && cargo build --release && cargo packager --release
+-f deb,appimage`.
 
 ### Regenerating `app/src/schema.rs`
 
