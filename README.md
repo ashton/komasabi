@@ -1,3 +1,5 @@
+![Komasabi — comic & manga reader](docs/komasabi-header.jpg)
+
 # Komasabi
 
 Komasabi is a desktop app for keeping your comic and manga libraries in one place. It aggregates
