@@ -48,9 +48,12 @@ jobs:
         with:
           targets: ${{ matrix.targets }}
 
+      # Keyed by runner image too: C dependencies (aws-lc-sys, unrar, sqlite)
+      # compiled against one image's libc headers don't link on another, and
+      # cargo doesn't notice the headers changed.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
+          key: ${{ matrix.name }}-${{ matrix.os }}
 
       - uses: taiki-e/install-action@v2
         with:
