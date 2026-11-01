@@ -294,6 +294,7 @@ mod view_helper {
 
     use super::Tab;
     use crate::models::{AsyncModel, series_entry::SeriesEntry};
+    use crate::touch_scroll::touch_scroll;
 
     type Covers = HashMap<String, image::Handle>;
 
@@ -336,7 +337,10 @@ mod view_helper {
                 noun,
             ));
 
-        column![top_bar(), scrollable(content).width(Fill).height(Fill)]
+        column![
+            top_bar(),
+            touch_scroll(scrollable(content).width(Fill).height(Fill))
+        ]
             .width(Fill)
             .height(Fill)
             .into()

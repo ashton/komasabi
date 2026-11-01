@@ -28,6 +28,7 @@ mod repository;
 mod runtime;
 mod schema;
 mod screen;
+mod touch_scroll;
 
 use crate::{
     menu::{Menu, MenuItem},

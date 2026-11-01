@@ -230,6 +230,7 @@ mod view_helper {
     use iced_font_awesome::fa_icon_solid;
 
     use super::ImportModal;
+    use crate::touch_scroll::touch_scroll;
     use crate::icons;
     use crate::models::integration::Integration;
     use crate::models::library::{Library, LibraryType};
@@ -252,7 +253,7 @@ mod view_helper {
         container(
             column![
                 import_button(),
-                scrollable(column(rows).spacing(8)).height(Fill)
+                touch_scroll(scrollable(column(rows).spacing(8)).height(Fill))
             ]
             .spacing(20),
         )

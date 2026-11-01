@@ -856,19 +856,21 @@ mod view_helper {
         items: &'a [Option<LibraryItem>],
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
-        scrollable(items_grid(items, covers))
-            .id(iced::advanced::widget::Id::new(super::ITEMS_SCROLLABLE_ID))
-            .width(Fill)
-            .height(Fill)
-            .on_scroll(|viewport| {
-                super::Message::Scrolled(super::ScrollMetrics {
-                    relative_offset_y: viewport.relative_offset().y,
-                    absolute_offset_y: viewport.absolute_offset().y,
-                    viewport_height: viewport.bounds().height,
-                    content_height: viewport.content_bounds().height,
-                })
-            })
-            .into()
+        crate::touch_scroll::touch_scroll(
+            scrollable(items_grid(items, covers))
+                .id(iced::advanced::widget::Id::new(super::ITEMS_SCROLLABLE_ID))
+                .width(Fill)
+                .height(Fill)
+                .on_scroll(|viewport| {
+                    super::Message::Scrolled(super::ScrollMetrics {
+                        relative_offset_y: viewport.relative_offset().y,
+                        absolute_offset_y: viewport.absolute_offset().y,
+                        viewport_height: viewport.bounds().height,
+                        content_height: viewport.content_bounds().height,
+                    })
+                }),
+        )
+        .into()
     }
 
     fn items_grid<'a>(
