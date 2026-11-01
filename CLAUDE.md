@@ -106,6 +106,10 @@ active screen's `update`. `src/menu.rs` is the generic sidebar widget; it tracks
 "active" by comparing message *discriminants*, not values — new nav messages must be unit-like
 variants (or the single discriminant will match multiple items).
 
+Wrap every `scrollable` in `touch_scroll::touch_scroll(...)`. iced only touch-scrolls when the content
+doesn't capture the finger press, and buttons (every card) do, so without the wrapper a touch screen
+can't scroll. The wrapper turns a drag into pixel wheel scrolls, with flick momentum.
+
 Some UI copy is in Portuguese (e.g. empty-state strings in `library.rs`/`integrations.rs`) — match
 the existing language when adding sibling strings in the same view, don't translate unprompted.
 

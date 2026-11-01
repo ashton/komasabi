@@ -214,6 +214,7 @@ impl Integrations {
 mod view_helper {
     use super::{IntegrationModel, IntegrationType, Message};
     use crate::icons;
+    use crate::touch_scroll::touch_scroll;
     use iced::{
         Background, Border, Center, Element,
         Length::Fill,
@@ -232,7 +233,7 @@ mod view_helper {
         container(
             column![
                 add_integration_button(),
-                scrollable(column(rows).spacing(8)).height(Fill)
+                touch_scroll(scrollable(column(rows).spacing(8)).height(Fill))
             ]
             .spacing(20),
         )
