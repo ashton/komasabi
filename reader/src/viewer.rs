@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{column, container, image, text};
+use iced::widget::{column, container, image, mouse_area, row, space, stack, text};
 use iced::{ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task};
 
 use crate::{EventSender, ReaderCommand, ReaderEvent, ReaderLink};
@@ -45,13 +45,13 @@ pub fn run(args: impl IntoIterator<Item = String>) -> iced::Result {
         Reader::update,
         Reader::view,
     )
-        .subscription(Reader::subscription)
-        .title("Komasabi Reader")
-        .window(iced::window::Settings {
-            icon: iced::window::icon::from_file_data(APP_ICON, None).ok(),
-            ..Default::default()
-        })
-        .run()
+    .subscription(Reader::subscription)
+    .title("Komasabi Reader")
+    .window(iced::window::Settings {
+        icon: iced::window::icon::from_file_data(APP_ICON, None).ok(),
+        ..Default::default()
+    })
+    .run()
 }
 
 /// How a page is scaled into the viewport.
@@ -433,7 +433,10 @@ impl Reader {
         if let Some(header) = self.header() {
             layout = layout.push(header);
         }
-        layout.push(page).push(self.status_bar()).into()
+        layout
+            .push(stack![page, touch_zones()])
+            .push(self.status_bar())
+            .into()
     }
 
     /// The session title line (`series — entry`), shown when the host has told
@@ -447,8 +450,8 @@ impl Reader {
         Some(container(text(title).size(14)).padding(8).into())
     }
 
-    /// A thin, non-interactive status line. Navigation is keyboard-only for now
-    /// (see [`key_message`]); this reflects reading position (page and progress)
+    /// A thin, non-interactive status line. Navigation is by keyboard (see
+    /// [`key_message`]) or the page's click zones (see [`touch_zones`]); this reflects reading position (page and progress)
     /// and view state (zoom, fit).
     fn status_bar(&self) -> Element<'_, Message> {
         let position = if self.pages.is_empty() {
@@ -514,6 +517,25 @@ fn command_stream(socket_name: &String) -> impl Stream<Item = Message> + use<> {
             }
         },
     )
+}
+
+/// Click/tap zones laid over the page: the left third turns back a page, the
+/// right third forward. The middle third is left free.
+fn touch_zones<'a>() -> Element<'a, Message> {
+    let zone = |message| {
+        mouse_area(space().width(Fill).height(Fill))
+            .on_press(message)
+            .interaction(iced::mouse::Interaction::Pointer)
+    };
+
+    row![
+        zone(Message::Prev),
+        space().width(Fill).height(Fill),
+        zone(Message::Next)
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
 }
 
 /// Maps an ignored keyboard event to a reader message, if it's a key we handle.
@@ -745,6 +767,31 @@ mod tests {
 
         let _ = reader.update(Message::Last);
         assert_eq!(reader.current, 2);
+    }
+
+    /// Clicks the reader's view at `x` (window 900x600) and returns the
+    /// messages it emitted.
+    fn click_at(reader: &Reader, x: f32) -> Vec<String> {
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(900.0, 600.0),
+            reader.view(),
+        );
+        ui.point_at(iced::Point::new(x, 300.0));
+        let _ = ui.simulate(iced_test::simulator::click());
+        ui.into_messages()
+            .map(|message| format!("{message:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn clicking_the_outer_thirds_turns_the_page() {
+        let mut reader = reader_with(3);
+        reader.current = 1;
+
+        assert_eq!(click_at(&reader, 100.0), ["Prev"]);
+        assert_eq!(click_at(&reader, 800.0), ["Next"]);
+        assert!(click_at(&reader, 450.0).is_empty());
     }
 
     #[test]
