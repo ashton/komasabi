@@ -130,6 +130,16 @@ the existing language when adding sibling strings in the same view, don't transl
    implementing these same adapter traits plus a `providers::Provider` impl — don't let
    Kavita-specific types leak past the adapter layer into `repository`/`screen` code.
 
+**Reading history.** While the reader is open, every `ReaderEvent::ShowingPage` it reports is
+forwarded by `reader_launch` to `reading_progress::report_progress`, which runs alongside the page
+downloads on the session's runtime. That module is backend-agnostic: it turns each page into a
+`providers::ReadingProgress` (the `PageRef` plus its chapter's page count) and calls
+`Provider::update_reading_progress`. The trait's default does nothing. A backend that keeps reading
+history overrides it, so far only Kavita (`POST /api/Reader/progress`, with the chapter's
+volume/series/library ids looked up once per chapter via `/api/Reader/chapter-info`; the last page
+is saved as the page count, which marks the chapter read). A backlog of page flips is collapsed to
+the last page of each chapter run, and failures are only logged.
+
 **Cargo features.** Each remote provider is a feature of the `app` crate: `kavita`, `komga`, `opds`,
 `suwayomi`, all on by default. A feature pulls in its client crate, its `providers::<name>` and
 `screen::integration::<name>` modules, its `Step`/`Message`/`ResolvedProvider` variants, its match arms

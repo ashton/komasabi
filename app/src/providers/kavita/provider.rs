@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use kavita_client::client::KavitaClient;
+use kavita_client::models::reader::{ChapterInfo, Progress};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::{
@@ -9,7 +13,7 @@ use crate::{
         series_entry::{EntryKind, SeriesEntry},
     },
     providers::{
-        PageRef, Provider,
+        PageRef, Provider, ReadingProgress,
         kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, series_entries},
     },
 };
@@ -19,6 +23,10 @@ pub struct KavitaProvider {
     /// The Kavita API key, retained because the `/api/Reader/image` endpoint
     /// authorizes on it as a query parameter rather than the bearer header.
     api_key: String,
+    /// Each chapter's volume/series/library ids, looked up once per chapter
+    /// (`/api/Reader/chapter-info`) the first time its progress is saved, since
+    /// Kavita's progress endpoint wants all of them on every page.
+    chapter_info: Mutex<HashMap<u16, ChapterInfo>>,
 }
 
 impl KavitaProvider {
@@ -47,6 +55,7 @@ impl KavitaProvider {
         Ok(Self {
             client: KavitaClient::new(url, http_client),
             api_key,
+            chapter_info: Mutex::new(HashMap::new()),
         })
     }
 
@@ -161,6 +170,61 @@ impl KavitaProvider {
             .map_err(crate::error::log_and_stringify)
     }
 
+    /// Saves the user's progress in a chapter to Kavita. Kavita counts a chapter
+    /// as read once its saved page count reaches the chapter's total, so the
+    /// last page is saved as `chapter_pages` rather than its 0-based index,
+    /// the same way Kavita's own reader does it.
+    pub async fn save_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
+        let chapter_id = parse_kavita_id(&progress.page.chapter_id)?;
+        let info = self.chapter_info(chapter_id).await?;
+
+        let page_num = if progress.finishes_chapter() {
+            progress.chapter_pages
+        } else {
+            progress.page.page
+        };
+
+        self.client
+            .save_progress(&Progress {
+                volume_id: info.volume_id,
+                chapter_id,
+                page_num,
+                series_id: info.series_id,
+                library_id: info.library_id,
+            })
+            .await
+            .map_err(crate::error::log_and_stringify)
+    }
+
+    /// A chapter's [`ChapterInfo`], from the per-provider cache or else
+    /// from Kavita (and then cached).
+    async fn chapter_info(&self, chapter_id: u16) -> Result<ChapterInfo, String> {
+        if let Some(info) = self.cached_chapter_info(chapter_id) {
+            return Ok(info);
+        }
+
+        let info = self
+            .client
+            .chapter_info(chapter_id)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        self.chapter_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(chapter_id, info.clone());
+
+        Ok(info)
+    }
+
+    fn cached_chapter_info(&self, chapter_id: u16) -> Option<ChapterInfo> {
+        self.chapter_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&chapter_id)
+            .cloned()
+    }
+
     /// Returns the cover image bytes for a volume, reading from the on-disk
     /// cache first and only hitting Kavita on a miss (writing the result back).
     /// `integration_id` namespaces the cache key; the `vol-` segment keeps
@@ -258,7 +322,8 @@ impl Provider for KavitaProvider {
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
-        self.cover(integration_id, parse_kavita_id(series_id)?).await
+        self.cover(integration_id, parse_kavita_id(series_id)?)
+            .await
     }
 
     async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String> {
@@ -282,6 +347,10 @@ impl Provider for KavitaProvider {
     async fn reader_image(&self, chapter_id: &str, page: u16) -> Result<Vec<u8>, String> {
         self.reader_image(parse_kavita_id(chapter_id)?, page).await
     }
+
+    async fn update_reading_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
+        self.save_progress(progress).await
+    }
 }
 
 /// Parses a backend-agnostic string id back into the numeric id Kavita's API
@@ -289,4 +358,110 @@ impl Provider for KavitaProvider {
 fn parse_kavita_id(id: &str) -> Result<u16, String> {
     id.parse::<u16>()
         .map_err(|_| format!("id {id} is not a valid Kavita id"))
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{body_json, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn provider_for(server: &MockServer) -> KavitaProvider {
+        KavitaProvider {
+            client: KavitaClient::new(server.uri(), reqwest::Client::new()),
+            api_key: "key".to_string(),
+            chapter_info: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn progress(chapter_id: &str, page: u16, chapter_pages: u16) -> ReadingProgress {
+        ReadingProgress {
+            page: PageRef {
+                chapter_id: chapter_id.to_string(),
+                page,
+            },
+            chapter_pages,
+        }
+    }
+
+    async fn mount_chapter_info(server: &MockServer, chapter_id: &str) {
+        Mock::given(method("GET"))
+            .and(path("/api/Reader/chapter-info"))
+            .and(query_param("chapterId", chapter_id))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "volumeId": 7, "seriesId": 9, "libraryId": 2, "pages": 3
+            })))
+            // Looked up once, however many of the chapter's pages are saved.
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn saved_page(page_num: u16) -> Mock {
+        Mock::given(method("POST"))
+            .and(path("/api/Reader/progress"))
+            .and(body_json(serde_json::json!({
+                "volumeId": 7, "chapterId": 42, "pageNum": page_num,
+                "seriesId": 9, "libraryId": 2
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(true))
+            .expect(1)
+    }
+
+    #[tokio::test]
+    async fn update_reading_progress_saves_each_page_with_the_chapters_ancestry() {
+        let server = MockServer::start().await;
+        mount_chapter_info(&server, "42").await;
+        saved_page(0).mount(&server).await;
+        saved_page(1).mount(&server).await;
+
+        let provider = provider_for(&server);
+        Provider::update_reading_progress(&provider, &progress("42", 0, 3))
+            .await
+            .unwrap();
+        Provider::update_reading_progress(&provider, &progress("42", 1, 3))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_reading_progress_on_the_last_page_marks_the_chapter_read() {
+        let server = MockServer::start().await;
+        mount_chapter_info(&server, "42").await;
+        // Page index 2 of 3 is saved as 3 pages read, which Kavita counts as
+        // the whole chapter.
+        saved_page(3).mount(&server).await;
+
+        let provider = provider_for(&server);
+        Provider::update_reading_progress(&provider, &progress("42", 2, 3))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_reading_progress_surfaces_a_rejected_save() {
+        let server = MockServer::start().await;
+        mount_chapter_info(&server, "42").await;
+        Mock::given(method("POST"))
+            .and(path("/api/Reader/progress"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(&server);
+        let result = Provider::update_reading_progress(&provider, &progress("42", 0, 3)).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_reading_progress_rejects_a_non_kavita_chapter_id() {
+        let server = MockServer::start().await;
+
+        let provider = provider_for(&server);
+        let result = Provider::update_reading_progress(&provider, &progress("abc", 0, 3)).await;
+
+        assert!(result.is_err());
+    }
 }

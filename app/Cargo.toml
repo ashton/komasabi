@@ -71,7 +71,7 @@ libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 suwayomi-client = { workspace = true, optional = true }
 serde_json = "1"
 rfd = { version = "0.17.2", features = ["xdg-portal"] }
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 tracing = "0.1"
 unrar = { version = "0.5", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

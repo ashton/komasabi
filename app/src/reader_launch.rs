@@ -10,7 +10,8 @@
 //! ([`ReaderCommand::OpenSession`]) and a [`ReaderCommand::PageReady`] as each
 //! page lands on disk — while downloading pages in the order the reader actually
 //! needs them, reprioritising around the page it reports it's showing
-//! ([`ReaderEvent::ShowingPage`]).
+//! ([`ReaderEvent::ShowingPage`]). Every page the reader shows is also passed
+//! on to [`reading_progress`], which saves it to the provider's reading history.
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
@@ -23,6 +24,7 @@ use interprocess::TryClone;
 use interprocess::local_socket::{
     GenericNamespaced, Listener, ListenerOptions, Stream, prelude::*,
 };
+use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
 
 use komasabi_reader::{ReaderCommand, ReaderEvent};
@@ -30,6 +32,7 @@ use komasabi_reader::{ReaderCommand, ReaderEvent};
 use crate::cache;
 use crate::models::series_entry::SeriesEntry;
 use crate::providers::{PageRef, Provider, provider_for_library};
+use crate::reading_progress;
 use crate::repository::library as library_repository;
 
 /// The first argument that makes `main` run the reader (`komasabi read <dir> …`)
@@ -125,7 +128,8 @@ fn serve_session(listener: Listener, spec: SessionSpec) {
 
 /// Authenticates the provider, resolves the entry's pages, accepts the reader,
 /// opens the session, and downloads pages into the folder in reader-driven
-/// priority order.
+/// priority order. Meanwhile, the pages the reader shows are reported to the
+/// provider's reading history, until the reader closes.
 async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String> {
     let (provider, _integration_id) = provider_for_library(&spec.library_external_id).await?;
     let plan = provider.reader_pages(&spec.entry).await?;
@@ -153,12 +157,16 @@ async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String
         .try_clone()
         .map_err(|error| format!("could not split the reader socket: {error}"))?;
     let current = Arc::new(AtomicUsize::new(0));
+    let (shown_pages, shown_pages_rx) = mpsc::unbounded_channel();
     std::thread::spawn({
         let current = Arc::clone(&current);
-        move || observe_position(read_half, current)
+        move || observe_position(read_half, current, shown_pages)
     });
 
-    download_session(&provider, &plan, &spec.dir, &mut stream, &current).await;
+    tokio::join!(
+        download_session(&provider, &plan, &spec.dir, &mut stream, &current),
+        reading_progress::report_progress(&provider, &plan, shown_pages_rx),
+    );
     Ok(())
 }
 
@@ -216,9 +224,14 @@ fn next_page(pending: &BTreeSet<usize>, current: usize) -> Option<usize> {
 }
 
 /// Reads [`ReaderEvent`]s from the reader, updating `current` as it reports the
-/// page it's showing. Runs until the reader disconnects. The single seam where
-/// future "mark chapter as read" work hooks in.
-fn observe_position(read_half: Stream, current: Arc<AtomicUsize>) {
+/// page it's showing and passing each such page on to `shown_pages` (for
+/// [`reading_progress::report_progress`]). Runs until the reader disconnects,
+/// which drops `shown_pages` and so ends the progress reporting too.
+fn observe_position(
+    read_half: Stream,
+    current: Arc<AtomicUsize>,
+    shown_pages: UnboundedSender<usize>,
+) {
     for line in BufReader::new(read_half).lines() {
         match line {
             Ok(line) if line.trim().is_empty() => {}
@@ -227,6 +240,9 @@ fn observe_position(read_half: Stream, current: Arc<AtomicUsize>) {
                     tracing::debug!("reader socket ← {event:?}");
                     if let ReaderEvent::ShowingPage { page } = event {
                         current.store(page, Ordering::Relaxed);
+                        // Only fails once the session is over, when there's
+                        // nothing left to report to.
+                        let _ = shown_pages.send(page);
                     }
                 }
                 Err(error) => tracing::debug!("unparsable reader event {line:?}: {error}"),

@@ -24,6 +24,7 @@ mod menu;
 mod models;
 mod providers;
 mod reader_launch;
+mod reading_progress;
 mod repository;
 mod runtime;
 mod schema;

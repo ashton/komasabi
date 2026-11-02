@@ -35,6 +35,25 @@ pub struct PageRef {
     pub page: u16,
 }
 
+/// A page the user has just read, as reported to a provider's
+/// [`Provider::update_reading_progress`]. `page` is one of the [`PageRef`]s the
+/// provider produced in [`Provider::reader_pages`], and `chapter_pages` is how
+/// many pages that chapter has (the reader may be showing a volume made of
+/// several chapters, and each chapter's progress is tracked on its own).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadingProgress {
+    pub page: PageRef,
+    pub chapter_pages: u16,
+}
+
+impl ReadingProgress {
+    /// Whether this is the chapter's last page, i.e. reading it finishes the
+    /// chapter.
+    pub fn finishes_chapter(&self) -> bool {
+        self.page.page + 1 >= self.chapter_pages
+    }
+}
+
 /// The backend-agnostic operations the app performs against a library's source.
 /// Kavita is the first implementation; others plug in by adding a
 /// [`ResolvedProvider`] variant. Uses native `async fn`, so it is not
@@ -61,6 +80,14 @@ pub trait Provider {
     async fn reader_pages(&self, entry: &SeriesEntry) -> Result<Vec<PageRef>, String>;
     /// Fetches the bytes of a single page.
     async fn reader_image(&self, chapter_id: &str, page: u16) -> Result<Vec<u8>, String>;
+    /// Records that the user read `progress.page`, so the backend's reading
+    /// history follows what's read in Komasabi. Called on every page the reader
+    /// shows (see [`crate::reading_progress`]). Backends that keep reading
+    /// history override this. The default does nothing, for those that don't
+    /// (e.g. local folders and OPDS catalogs).
+    async fn update_reading_progress(&self, _progress: &ReadingProgress) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A provider resolved for a particular library, erasing the concrete backend
@@ -134,6 +161,10 @@ impl Provider for ResolvedProvider {
 
     async fn reader_image(&self, chapter_id: &str, page: u16) -> Result<Vec<u8>, String> {
         dispatch!(self, reader_image(chapter_id, page))
+    }
+
+    async fn update_reading_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
+        dispatch!(self, update_reading_progress(progress))
     }
 }
 
