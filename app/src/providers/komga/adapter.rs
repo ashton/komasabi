@@ -8,7 +8,7 @@ use crate::{
     models::{
         library::{Library, LibraryType},
         library_item::LibraryItem,
-        series_entry::{EntryKind, SeriesEntry},
+        series_entry::{EntryKind, ReadState, SeriesEntry},
     },
 };
 
@@ -46,6 +46,15 @@ pub fn book_entry(book: KomgaBook) -> SeriesEntry {
         .map(str::to_string)
         .unwrap_or_else(|| format!("#{}", book.metadata.number.trim()));
 
+    let read_state = match &book.read_progress {
+        Some(progress) if progress.completed => ReadState::Read,
+        Some(progress) => ReadState::from_pages_read(
+            progress.page,
+            (book.media.pages_count > 0).then_some(book.media.pages_count),
+        ),
+        None => ReadState::Unread,
+    };
+
     SeriesEntry {
         external_id: book.id,
         kind: EntryKind::Chapter,
@@ -53,6 +62,7 @@ pub fn book_entry(book: KomgaBook) -> SeriesEntry {
         pages: u16::try_from(book.media.pages_count)
             .ok()
             .filter(|pages| *pages > 0),
+        read_state,
     }
 }
 
@@ -164,5 +174,28 @@ mod tests {
     #[test]
     fn book_entry_maps_zero_pages_to_none() {
         assert_eq!(book_entry(book("t", "n", "1", 0)).pages, None);
+    }
+
+    #[test]
+    fn book_entry_maps_the_read_progress() {
+        use komga_client::models::book::ReadProgress;
+
+        let with_progress = |page, completed| KomgaBook {
+            read_progress: Some(ReadProgress { page, completed }),
+            ..book("t", "n", "1", 20)
+        };
+
+        assert_eq!(
+            book_entry(book("t", "n", "1", 20)).read_state,
+            ReadState::Unread
+        );
+        assert_eq!(
+            book_entry(with_progress(5, false)).read_state,
+            ReadState::InProgress(Some(0.25))
+        );
+        assert_eq!(
+            book_entry(with_progress(20, true)).read_state,
+            ReadState::Read
+        );
     }
 }

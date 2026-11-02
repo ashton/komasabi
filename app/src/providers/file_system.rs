@@ -47,7 +47,11 @@ impl FileSystemProvider {
     /// (run on a blocking thread via the caller's runtime) and writing the
     /// result back. Mirrors the Kavita provider's cover caching so both backends
     /// behave identically from the screens' point of view.
-    fn cached_cover(&self, key: String, produce: impl FnOnce() -> Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+    fn cached_cover(
+        &self,
+        key: String,
+        produce: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, String> {
         if let Some(bytes) = crate::cache::read_cover(&key) {
             return Ok(bytes);
         }
@@ -95,13 +99,27 @@ impl Provider for FileSystemProvider {
                 kind: EntryKind::Volume,
                 label: display_name(&path),
                 pages: None,
+                read_state: Default::default(),
             })
             .collect())
     }
 
+    /// The entry after `current` in the series folder, by file name, which is the
+    /// reading order.
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_after(entries, current))
+    }
+
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
         let path = decode_id(series_id)?;
-        self.cached_cover(format!("{integration_id}-{series_id}"), || first_image_under(&path))
+        self.cached_cover(format!("{integration_id}-{series_id}"), || {
+            first_image_under(&path)
+        })
     }
 
     async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String> {
@@ -167,8 +185,10 @@ fn decode_id(id: &str) -> Result<PathBuf, String> {
 
     let mut bytes = Vec::with_capacity(id.len() / 2);
     for pair in id.as_bytes().chunks(2) {
-        let hex = std::str::from_utf8(pair).map_err(|_| format!("malformed filesystem id: {id}"))?;
-        let byte = u8::from_str_radix(hex, 16).map_err(|_| format!("malformed filesystem id: {id}"))?;
+        let hex =
+            std::str::from_utf8(pair).map_err(|_| format!("malformed filesystem id: {id}"))?;
+        let byte =
+            u8::from_str_radix(hex, 16).map_err(|_| format!("malformed filesystem id: {id}"))?;
         bytes.push(byte);
     }
 
@@ -328,7 +348,11 @@ fn zip_image_names(path: &Path) -> Option<Vec<String>> {
 /// Keeps only the requested page of `items`, matching the Kavita provider's
 /// pagination contract (1-based page number). An out-of-range page yields an
 /// empty slice, which the browse screen reads as "no more items".
-fn paginate(items: Vec<LibraryItem>, page: Option<u32>, page_size: Option<u32>) -> Vec<LibraryItem> {
+fn paginate(
+    items: Vec<LibraryItem>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Vec<LibraryItem> {
     let (Some(page), Some(page_size)) = (page, page_size) else {
         return items;
     };
@@ -337,7 +361,11 @@ fn paginate(items: Vec<LibraryItem>, page: Option<u32>, page_size: Option<u32>) 
     }
 
     let start = ((page - 1) * page_size) as usize;
-    items.into_iter().skip(start).take(page_size as usize).collect()
+    items
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .collect()
 }
 
 #[cfg(test)]
@@ -362,7 +390,10 @@ mod tests {
     #[test]
     fn display_name_uses_the_file_stem_for_files() {
         // A non-existent path is treated as a file (not a dir), so the stem wins.
-        assert_eq!(display_name(Path::new("/x/One Piece Vol 1.cbz")), "One Piece Vol 1");
+        assert_eq!(
+            display_name(Path::new("/x/One Piece Vol 1.cbz")),
+            "One Piece Vol 1"
+        );
     }
 
     #[test]

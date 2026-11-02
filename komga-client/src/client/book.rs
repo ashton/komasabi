@@ -7,6 +7,19 @@ impl KomgaClient {
             .await
     }
 
+    /// The book that follows `book_id` in its series (by Komga's own
+    /// `numberSort` ordering), or `None` when it's the series' last book.
+    pub async fn next_book(&self, book_id: &str) -> Result<Option<Book>, reqwest::Error> {
+        match self
+            .execute_json(self.get(&format!("/api/v1/books/{book_id}/next")))
+            .await
+        {
+            Ok(book) => Ok(Some(book)),
+            Err(error) if error.status() == Some(reqwest::StatusCode::NOT_FOUND) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn book_thumbnail(&self, book_id: &str) -> Result<Vec<u8>, reqwest::Error> {
         self.execute_bytes(self.get(&format!("/api/v1/books/{book_id}/thumbnail")))
             .await
@@ -57,6 +70,45 @@ mod tests {
         assert_eq!(book.media.status, "READY");
         assert_eq!(book.media.pages_count, 3);
         assert_eq!(book.metadata.number, "1");
+    }
+
+    #[tokio::test]
+    async fn next_book_returns_the_following_book() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B1/next"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"id": "B2", "seriesId": "S1", "libraryId": "L1", "name": "Alpha Saga v02",
+                    "number": 2, "sizeBytes": 1024,
+                    "media": {"status": "READY", "mediaType": "application/zip",
+                              "pagesCount": 3, "mediaProfile": "DIVINA",
+                              "epubDivinaCompatible": false},
+                    "metadata": {"title": "Alpha Saga v02", "number": "2", "numberSort": 2.0},
+                    "deleted": false}"#,
+                "application/json",
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let next = client_for(&mock_server).next_book("B1").await.unwrap();
+
+        assert_eq!(next.map(|book| book.id).as_deref(), Some("B2"));
+    }
+
+    #[tokio::test]
+    async fn next_book_is_none_after_the_last_book() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B9/next"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let next = client_for(&mock_server).next_book("B9").await.unwrap();
+
+        assert!(next.is_none());
     }
 
     #[tokio::test]

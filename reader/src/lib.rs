@@ -10,6 +10,7 @@
 //! (metadata, page availability).
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
 
 use interprocess::TryClone;
@@ -32,6 +33,10 @@ pub enum ReaderEvent {
     /// The user is now viewing this page (0-based), emitted on every page change.
     /// The host uses it to prioritise which pages it downloads next.
     ShowingPage { page: usize },
+    /// The user accepted the host's offer of the next entry (see
+    /// [`ReaderCommand::NextEntry`]) and wants to keep reading. The host answers
+    /// with a fresh [`ReaderCommand::OpenSession`] for it.
+    OpenNext,
 }
 
 /// A command the host sends to the reader, one JSON object per line over the
@@ -43,14 +48,26 @@ pub enum ReaderCommand {
     /// The reading session's fixed metadata, sent once right after the host
     /// accepts the connection. `pages` is the total page count, which sizes the
     /// session before any page bytes exist on disk.
+    ///
+    /// A later `OpenSession` replaces the current session (the user moved on to
+    /// the next entry). Its `dir` is the folder the new session's pages land
+    /// in, replacing the one the reader was launched on; the reader starts it
+    /// from its first page.
     OpenSession {
         series: String,
         entry: String,
         pages: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<PathBuf>,
     },
     /// Page `index`'s bytes have been written to the reader's folder and can now
     /// be loaded.
     PageReady { index: usize },
+    /// What follows the session's entry, looked up once the user reaches its
+    /// last page: the next entry's label, or `None` when there's nothing after
+    /// it. The reader offers to open it (answered with
+    /// [`ReaderEvent::OpenNext`]).
+    NextEntry { label: Option<String> },
 }
 
 /// A handle the reader uses to emit [`ReaderEvent`]s. When connected, events are
@@ -221,6 +238,23 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 5".to_string(),
             pages: 190,
+            dir: None,
+        };
+        let json = serde_json::to_string(&command).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<ReaderCommand>(&json).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn open_session_command_carries_a_new_folder() {
+        let command = ReaderCommand::OpenSession {
+            series: "One Piece".to_string(),
+            entry: "Volume 6".to_string(),
+            pages: 180,
+            dir: Some(PathBuf::from("/tmp/volume-6")),
         };
         let json = serde_json::to_string(&command).unwrap();
 
@@ -240,6 +274,24 @@ mod tests {
             serde_json::from_str::<ReaderCommand>(&json).unwrap(),
             command
         );
+    }
+
+    #[test]
+    fn next_entry_and_open_next_round_trip_through_json() {
+        let command = ReaderCommand::NextEntry {
+            label: Some("Volume 6".to_string()),
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert_eq!(json, r#"{"command":"next_entry","label":"Volume 6"}"#);
+        assert_eq!(
+            serde_json::from_str::<ReaderCommand>(&json).unwrap(),
+            command
+        );
+
+        let event = ReaderEvent::OpenNext;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"event":"open_next"}"#);
+        assert_eq!(serde_json::from_str::<ReaderEvent>(&json).unwrap(), event);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::{
     models::{
         library::{Library, LibraryType},
         library_item::LibraryItem,
-        series_entry::{EntryKind, SeriesEntry},
+        series_entry::{EntryKind, ReadState, SeriesEntry},
     },
 };
 
@@ -83,6 +83,23 @@ pub fn chapter_entry(chapter: SuwayomiChapter) -> SeriesEntry {
         name.to_string()
     };
 
+    // `lastPageRead` is a 0-based index, so it's one behind the pages read.
+    let read_state = if chapter.is_read {
+        ReadState::Read
+    } else if chapter.last_page_read > 0 {
+        let pages_read = u32::try_from(chapter.last_page_read + 1).unwrap_or(0);
+        let pages = u32::try_from(chapter.page_count)
+            .ok()
+            .filter(|pages| *pages > 0);
+        match ReadState::from_pages_read(pages_read, pages) {
+            // Not flagged read, so the last page hasn't been finished.
+            ReadState::Read => ReadState::InProgress(Some(0.99)),
+            state => state,
+        }
+    } else {
+        ReadState::Unread
+    };
+
     SeriesEntry {
         external_id: chapter_external_id(chapter.manga_id, chapter.id),
         kind: EntryKind::Chapter,
@@ -90,6 +107,7 @@ pub fn chapter_entry(chapter: SuwayomiChapter) -> SeriesEntry {
         pages: u16::try_from(chapter.page_count)
             .ok()
             .filter(|pages| *pages > 0),
+        read_state,
     }
 }
 
@@ -200,5 +218,26 @@ mod tests {
     fn chapter_entry_maps_unfetched_page_counts_to_none() {
         assert_eq!(chapter_entry(chapter("Ch. 1", 1.0, -1)).pages, None);
         assert_eq!(chapter_entry(chapter("Ch. 1", 1.0, 0)).pages, None);
+    }
+
+    #[test]
+    fn chapter_entry_maps_the_read_state() {
+        let unread = chapter("Ch. 1", 1.0, 20);
+        let started = SuwayomiChapter {
+            last_page_read: 4,
+            ..chapter("Ch. 1", 1.0, 20)
+        };
+        let read = SuwayomiChapter {
+            is_read: true,
+            ..chapter("Ch. 1", 1.0, 20)
+        };
+
+        assert_eq!(chapter_entry(unread).read_state, ReadState::Unread);
+        // `lastPageRead` is 0-based: page index 4 means 5 of 20 pages read.
+        assert_eq!(
+            chapter_entry(started).read_state,
+            ReadState::InProgress(Some(0.25))
+        );
+        assert_eq!(chapter_entry(read).read_state, ReadState::Read);
     }
 }

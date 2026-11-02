@@ -625,6 +625,18 @@ impl Provider for OpdsProvider {
         Ok(entries)
     }
 
+    /// The entry after `current` in the item's feed, in the catalog's own
+    /// publication order, which is the
+    /// reading order.
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_after(entries, current))
+    }
+
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
         self.cached_cover(format!("{integration_id}-{series_id}"), series_id)
             .await

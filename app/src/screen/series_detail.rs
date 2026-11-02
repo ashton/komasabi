@@ -20,6 +20,9 @@ pub enum Tab {
 
 #[derive(Debug)]
 pub struct SeriesDetail {
+    /// The series' provider-side id, which the reader session needs to look up
+    /// the entry after the one being read.
+    series_external_id: String,
     series_name: String,
     series_pages: Option<u16>,
     /// The external id of the library the series belongs to, used to resolve
@@ -90,6 +93,7 @@ impl SeriesDetail {
 
         (
             Self {
+                series_external_id,
                 series_name,
                 series_pages,
                 library_external_id,
@@ -156,6 +160,7 @@ impl SeriesDetail {
                 Action::Run(Task::perform(
                     crate::runtime::on_tokio(crate::reader_launch::prepare_and_launch(
                         self.library_external_id.clone(),
+                        self.series_external_id.clone(),
                         self.series_name.clone(),
                         entry,
                     )),
@@ -289,11 +294,16 @@ mod view_helper {
         Background, Border, Center, ContentFit, Element, Font,
         Length::{Fill, Fixed},
         Theme,
-        widget::{button, column, container, grid, image, row, scrollable, text},
+        widget::{
+            button, column, container, grid, image, progress_bar, row, scrollable, stack, text,
+        },
     };
 
     use super::Tab;
-    use crate::models::{AsyncModel, series_entry::SeriesEntry};
+    use crate::models::{
+        AsyncModel,
+        series_entry::{ReadState, SeriesEntry},
+    };
     use crate::touch_scroll::touch_scroll;
 
     type Covers = HashMap<String, image::Handle>;
@@ -341,9 +351,9 @@ mod view_helper {
             top_bar(),
             touch_scroll(scrollable(content).width(Fill).height(Fill))
         ]
-            .width(Fill)
-            .height(Fill)
-            .into()
+        .width(Fill)
+        .height(Fill)
+        .into()
     }
 
     /// A one-line status banner (reader preparing / last launch error).
@@ -466,7 +476,7 @@ mod view_helper {
     }
 
     fn header_cover<'a>(handle: Option<&image::Handle>) -> Element<'a, super::Message> {
-        container(cover_image(handle))
+        container(cover_image(handle, 1.0))
             .width(Fixed(HEADER_COVER_WIDTH))
             .height(Fixed(HEADER_COVER_WIDTH * 3.0 / 2.0))
             .clip(true)
@@ -555,19 +565,22 @@ mod view_helper {
         entry: &'a SeriesEntry,
         cover: Option<&image::Handle>,
     ) -> Element<'a, super::Message> {
-        let content = column![
-            container(cover_image(cover))
-                .width(Fill)
-                .height(Fill)
-                .clip(true)
-                .style(cover_box_style),
-            text(&entry.label).size(13),
-            pages_label(entry.pages),
-        ]
-        .width(Fill)
-        .height(Fill)
-        .spacing(4)
-        .align_x(Center);
+        let cover = container(cover_image(cover, cover_opacity(entry.read_state)))
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .style(cover_box_style);
+
+        let cover: Element<'a, super::Message> = match progress_value(entry.read_state) {
+            Some(value) => stack![cover, read_progress_bar(value)].into(),
+            None => cover.into(),
+        };
+
+        let content = column![cover, text(&entry.label).size(13), pages_label(entry.pages),]
+            .width(Fill)
+            .height(Fill)
+            .spacing(4)
+            .align_x(Center);
 
         button(content)
             .on_press(super::Message::EntrySelected(entry.clone()))
@@ -578,14 +591,68 @@ mod view_helper {
             .into()
     }
 
+    /// How opaque an entry's cover is drawn: a read entry's is faded, so what's
+    /// left to read stands out.
+    pub(super) fn cover_opacity(state: ReadState) -> f32 {
+        match state {
+            ReadState::Read => 0.4,
+            ReadState::Unread | ReadState::InProgress(_) => 1.0,
+        }
+    }
+
+    /// How full an entry's progress bar is, or `None` for an unread entry,
+    /// which gets no bar. A started entry always shows a sliver, so it never
+    /// looks unread, even when its page count is unknown.
+    pub(super) fn progress_value(state: ReadState) -> Option<f32> {
+        const MIN_VISIBLE: f32 = 0.05;
+
+        match state {
+            ReadState::Unread => None,
+            ReadState::InProgress(fraction) => {
+                Some(fraction.unwrap_or(0.0).clamp(MIN_VISIBLE, 1.0))
+            }
+            ReadState::Read => Some(1.0),
+        }
+    }
+
+    /// A thin bar laid over the bottom edge of a cover.
+    fn read_progress_bar<'a>(value: f32) -> Element<'a, super::Message> {
+        let bar = progress_bar(0.0..=1.0, value)
+            .length(Fill)
+            .girth(Fixed(4.0))
+            .style(|theme: &Theme| {
+                let palette = theme.extended_palette();
+
+                progress_bar::Style {
+                    background: Background::Color(iced::Color::BLACK.scale_alpha(0.45)),
+                    bar: Background::Color(palette.primary.base.color),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Border::default()
+                    },
+                }
+            });
+
+        container(bar)
+            .padding(8)
+            .width(Fill)
+            .height(Fill)
+            .align_bottom(Fill)
+            .into()
+    }
+
     /// Renders a cover if its handle has loaded, otherwise nothing (the styled
     /// box around it stands in as the placeholder).
-    fn cover_image<'a>(handle: Option<&image::Handle>) -> Element<'a, super::Message> {
+    fn cover_image<'a>(
+        handle: Option<&image::Handle>,
+        opacity: f32,
+    ) -> Element<'a, super::Message> {
         match handle {
             Some(handle) => image(handle.clone())
                 .width(Fill)
                 .height(Fill)
                 .content_fit(ContentFit::Cover)
+                .opacity(opacity)
                 .into(),
             None => row![].into(),
         }
@@ -676,6 +743,7 @@ mod tests {
             kind: EntryKind::Volume,
             label: label.to_string(),
             pages,
+            read_state: Default::default(),
         }
     }
 
@@ -685,11 +753,13 @@ mod tests {
             kind: EntryKind::Chapter,
             label: label.to_string(),
             pages,
+            read_state: Default::default(),
         }
     }
 
     fn series_detail(entries: AsyncModel<Vec<SeriesEntry>, String>) -> SeriesDetail {
         SeriesDetail {
+            series_external_id: "series-1".to_string(),
             series_name: "Beneath the Trees".to_string(),
             series_pages: Some(183),
             library_external_id: "lib-1".to_string(),
@@ -965,5 +1035,43 @@ mod tests {
 
         assert!(ui.find("Title").is_ok());
         assert!(ui.find("Pages").is_ok());
+    }
+
+    #[test]
+    fn read_covers_are_faded_and_started_ones_get_a_progress_bar() {
+        use crate::models::series_entry::ReadState;
+        use view_helper::{cover_opacity, progress_value};
+
+        assert_eq!(cover_opacity(ReadState::Unread), 1.0);
+        assert_eq!(cover_opacity(ReadState::InProgress(Some(0.5))), 1.0);
+        assert!(cover_opacity(ReadState::Read) < 1.0);
+
+        assert_eq!(progress_value(ReadState::Unread), None);
+        assert_eq!(progress_value(ReadState::InProgress(Some(0.5))), Some(0.5));
+        assert_eq!(progress_value(ReadState::Read), Some(1.0));
+        // A started entry always shows something, even without a page count.
+        assert!(progress_value(ReadState::InProgress(None)).unwrap() > 0.0);
+        assert!(progress_value(ReadState::InProgress(Some(0.0))).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn view_renders_cards_in_every_read_state() {
+        use crate::models::series_entry::ReadState;
+
+        let with_state = |id, label, read_state| SeriesEntry {
+            read_state,
+            ..chapter_entry(id, label, Some(20))
+        };
+        let detail = series_detail(AsyncModel::Loaded(vec![
+            with_state("1", "#1", ReadState::Read),
+            with_state("2", "#2", ReadState::InProgress(Some(0.5))),
+            with_state("3", "#3", ReadState::Unread),
+        ]));
+
+        let mut ui = simulator(detail.view());
+
+        for label in ["#1", "#2", "#3"] {
+            assert!(ui.find(label).is_ok(), "{label} card should render");
+        }
     }
 }

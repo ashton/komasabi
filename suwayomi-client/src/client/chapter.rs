@@ -21,7 +21,7 @@ struct FetchChapterPagesData {
 }
 
 const CHAPTER_FIELDS: &str =
-    "id mangaId name chapterNumber sourceOrder pageCount isRead isDownloaded";
+    "id mangaId name chapterNumber sourceOrder pageCount isRead lastPageRead isDownloaded";
 
 impl SuwayomiClient {
     /// Lists a manga's chapters in reading order (first chapter first).

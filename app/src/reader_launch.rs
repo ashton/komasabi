@@ -12,19 +12,26 @@
 //! needs them, reprioritising around the page it reports it's showing
 //! ([`ReaderEvent::ShowingPage`]). Every page the reader shows is also passed
 //! on to [`reading_progress`], which saves it to the provider's reading history.
+//!
+//! When the reader reaches the entry's last page, the worker asks the provider
+//! for the entry after it ([`Provider::next_entry`]) and tells the reader
+//! ([`ReaderCommand::NextEntry`]). If the user takes it up
+//! ([`ReaderEvent::OpenNext`]), the same reader window moves on to that entry:
+//! the worker opens a new session in it, with its own page folder, and streams
+//! its pages the same way.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use interprocess::TryClone;
 use interprocess::local_socket::{
     GenericNamespaced, Listener, ListenerOptions, Stream, prelude::*,
 };
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 use komasabi_reader::{ReaderCommand, ReaderEvent};
@@ -44,6 +51,8 @@ pub const READER_SUBCOMMAND: &str = "read";
 /// onto its own thread, so it must be `Send + 'static`.
 struct SessionSpec {
     library_external_id: String,
+    /// The series' provider-side id, to look up the entry after the one read.
+    series_id: String,
     series: String,
     entry: SeriesEntry,
     dir: PathBuf,
@@ -54,24 +63,32 @@ struct SessionSpec {
 /// as the reader is launched — downloading happens in the worker, not here.
 pub async fn prepare_and_launch(
     library_external_id: String,
+    series_external_id: String,
     series_name: String,
     entry: SeriesEntry,
 ) -> Result<(), String> {
     let namespace = cache_namespace_for_library(&library_external_id).await?;
-
-    let dir = cache::pages_dir(&format!("{namespace}-{}", entry.cover_key()))
-        .ok_or("no cache directory available for reader pages")?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    let dir = entry_dir(&namespace, &entry)?;
 
     let socket_name = bind_and_serve(SessionSpec {
         library_external_id,
+        series_id: series_external_id,
         series: series_name,
         entry,
         dir: dir.clone(),
     })?;
 
     spawn_reader(&dir, &socket_name)
+}
+
+/// Creates (if need be) and returns the cache folder `entry`'s pages are
+/// downloaded into, under the library's cache `namespace`.
+fn entry_dir(namespace: &str, entry: &SeriesEntry) -> Result<PathBuf, String> {
+    let dir = cache::pages_dir(&format!("{namespace}-{}", entry.cover_key()))
+        .ok_or("no cache directory available for reader pages")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    Ok(dir)
 }
 
 /// The cache namespace for a library's reader pages, resolved without
@@ -127,47 +144,197 @@ fn serve_session(listener: Listener, spec: SessionSpec) {
 }
 
 /// Authenticates the provider, resolves the entry's pages, accepts the reader,
-/// opens the session, and downloads pages into the folder in reader-driven
-/// priority order. Meanwhile, the pages the reader shows are reported to the
-/// provider's reading history, until the reader closes.
+/// and serves it the entry (see [`serve_entry`]). When the user moves on to the
+/// next entry, the same reader is handed a new session for it, until the reader
+/// closes.
 async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String> {
-    let (provider, _integration_id) = provider_for_library(&spec.library_external_id).await?;
-    let plan = provider.reader_pages(&spec.entry).await?;
+    let (provider, namespace) = provider_for_library(&spec.library_external_id).await?;
+    let mut entry = spec.entry;
+    let mut dir = spec.dir;
+    let mut plan = provider.reader_pages(&entry).await?;
     if plan.is_empty() {
         return Err("this entry has no pages to read".to_string());
     }
 
-    let mut stream = listener
+    let stream = listener
         .accept()
         .map_err(|error| format!("reader never connected: {error}"))?;
-
-    send_command(
-        &mut stream,
-        &ReaderCommand::OpenSession {
-            series: spec.series.clone(),
-            entry: spec.entry.label.clone(),
-            pages: plan.len(),
-        },
-    )
-    .map_err(|error| format!("could not open the reader session: {error}"))?;
-
-    // The reader reports the page it's showing; track it so downloads can follow
-    // the reader instead of blindly marching from page zero.
     let read_half = stream
         .try_clone()
         .map_err(|error| format!("could not split the reader socket: {error}"))?;
-    let current = Arc::new(AtomicUsize::new(0));
-    let (shown_pages, shown_pages_rx) = mpsc::unbounded_channel();
-    std::thread::spawn({
-        let current = Arc::clone(&current);
-        move || observe_position(read_half, current, shown_pages)
-    });
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    std::thread::spawn(move || forward_events(read_half, events_tx));
+    let stream = RefCell::new(stream);
 
-    tokio::join!(
-        download_session(&provider, &plan, &spec.dir, &mut stream, &current),
-        reading_progress::report_progress(&provider, &plan, shown_pages_rx),
+    // The folder to announce with the next `OpenSession`: `None` for the first
+    // entry, whose folder the reader was launched on, then each next entry's.
+    let mut open_session = Some(None);
+    loop {
+        if let Some(new_dir) = open_session.take() {
+            send_command(
+                &stream,
+                &ReaderCommand::OpenSession {
+                    series: spec.series.clone(),
+                    entry: entry.label.clone(),
+                    pages: plan.len(),
+                    dir: new_dir,
+                },
+            )
+            .map_err(|error| format!("could not open the reader session: {error}"))?;
+        }
+
+        let session = EntrySession {
+            series_id: &spec.series_id,
+            entry: &entry,
+            plan: &plan,
+            dir: &dir,
+            stream: &stream,
+        };
+        let Some(next) = serve_entry(&provider, session, &mut events).await else {
+            return Ok(());
+        };
+
+        match prepare_entry(&provider, &namespace, &next).await {
+            Ok((next_dir, next_plan)) => {
+                open_session = Some(Some(next_dir.clone()));
+                entry = next;
+                dir = next_dir;
+                plan = next_plan;
+            }
+            Err(error) => {
+                // Stay on the current entry, and offer the next one again so
+                // the user can retry.
+                tracing::warn!("could not open {}: {error}", next.label);
+                send_command(
+                    &stream,
+                    &ReaderCommand::NextEntry {
+                        label: Some(next.label),
+                    },
+                )
+                .map_err(|error| format!("reader went away: {error}"))?;
+            }
+        }
+    }
+}
+
+/// The page folder and pages of `entry`, ready for a new reader session.
+async fn prepare_entry(
+    provider: &impl Provider,
+    namespace: &str,
+    entry: &SeriesEntry,
+) -> Result<(PathBuf, Vec<PageRef>), String> {
+    let dir = entry_dir(namespace, entry)?;
+    let plan = provider.reader_pages(entry).await?;
+    if plan.is_empty() {
+        return Err("this entry has no pages to read".to_string());
+    }
+    Ok((dir, plan))
+}
+
+/// The entry a reader session is showing, and where its pages go.
+struct EntrySession<'a> {
+    series_id: &'a str,
+    entry: &'a SeriesEntry,
+    plan: &'a [PageRef],
+    dir: &'a Path,
+    stream: &'a RefCell<Stream>,
+}
+
+/// Serves one entry to the reader, already told about it with `OpenSession`:
+/// downloads its pages in reader-driven priority order, reports the pages the
+/// reader shows to the provider's reading history, and, once the reader reaches
+/// the last page, looks up the entry after it and offers it to the reader.
+///
+/// Returns that next entry if the user asked to read it, or `None` once the
+/// reader has closed.
+async fn serve_entry(
+    provider: &impl Provider,
+    session: EntrySession<'_>,
+    events: &mut UnboundedReceiver<ReaderEvent>,
+) -> Option<SeriesEntry> {
+    let current = AtomicUsize::new(0);
+    let (shown_pages, shown_pages_rx) = mpsc::unbounded_channel();
+
+    let dispatch = async {
+        // Moved in, so it's dropped (ending the progress reporting) as soon as
+        // this entry's session is over.
+        let shown_pages = shown_pages;
+        // What follows the entry, once looked up: `Some(None)` when nothing does.
+        let mut next: Option<Option<SeriesEntry>> = None;
+
+        while let Some(event) = events.recv().await {
+            match event {
+                ReaderEvent::ShowingPage { page } => {
+                    current.store(page, Ordering::Relaxed);
+                    let _ = shown_pages.send(page);
+
+                    if page + 1 >= session.plan.len() && next.is_none() {
+                        next = look_up_next(provider, &session).await;
+                    }
+                }
+                ReaderEvent::OpenNext => {
+                    if let Some(Some(entry)) = &next {
+                        return Some(entry.clone());
+                    }
+                }
+                ReaderEvent::ReadAllFiles { .. } => {}
+            }
+        }
+        None
+    };
+
+    let downloads = async {
+        download_session(
+            provider,
+            session.plan,
+            session.dir,
+            session.stream,
+            &current,
+        )
+        .await;
+        // Done downloading; the session still runs until the reader moves on
+        // or closes.
+        std::future::pending::<()>().await
+    };
+
+    let ((), next) = tokio::join!(
+        reading_progress::report_progress(provider, session.plan, shown_pages_rx),
+        async {
+            tokio::select! {
+                next = dispatch => next,
+                () = downloads => None,
+            }
+        },
     );
-    Ok(())
+    next
+}
+
+/// Asks the provider what follows the session's entry and tells the reader.
+/// Returns the answer to remember, or `None` if the lookup failed, so it's
+/// tried again the next time the reader lands on the last page.
+async fn look_up_next(
+    provider: &impl Provider,
+    session: &EntrySession<'_>,
+) -> Option<Option<SeriesEntry>> {
+    let next = match provider.next_entry(session.series_id, session.entry).await {
+        Ok(next) => Some(next),
+        Err(error) => {
+            tracing::warn!(
+                "could not look up what follows {}: {error}",
+                session.entry.label
+            );
+            None
+        }
+    };
+
+    let label = next
+        .as_ref()
+        .and_then(|next| next.as_ref())
+        .map(|entry| entry.label.clone());
+    if let Err(error) = send_command(session.stream, &ReaderCommand::NextEntry { label }) {
+        tracing::debug!("could not offer the next entry: {error}");
+    }
+    next
 }
 
 /// Downloads every page into `dir`, newest-reader-position first, announcing each
@@ -178,7 +345,7 @@ async fn download_session(
     provider: &impl Provider,
     plan: &[PageRef],
     dir: &Path,
-    stream: &mut Stream,
+    stream: &RefCell<Stream>,
     current: &AtomicUsize,
 ) {
     let mut pending: BTreeSet<usize> = (0..plan.len()).collect();
@@ -223,26 +390,18 @@ fn next_page(pending: &BTreeSet<usize>, current: usize) -> Option<usize> {
         .copied()
 }
 
-/// Reads [`ReaderEvent`]s from the reader, updating `current` as it reports the
-/// page it's showing and passing each such page on to `shown_pages` (for
-/// [`reading_progress::report_progress`]). Runs until the reader disconnects,
-/// which drops `shown_pages` and so ends the progress reporting too.
-fn observe_position(
-    read_half: Stream,
-    current: Arc<AtomicUsize>,
-    shown_pages: UnboundedSender<usize>,
-) {
+/// Reads [`ReaderEvent`]s from the reader and passes each on to `events`, for
+/// the session worker. Runs until the reader disconnects, which drops `events`
+/// and so tells the worker the reader is gone.
+fn forward_events(read_half: Stream, events: UnboundedSender<ReaderEvent>) {
     for line in BufReader::new(read_half).lines() {
         match line {
             Ok(line) if line.trim().is_empty() => {}
             Ok(line) => match serde_json::from_str::<ReaderEvent>(&line) {
                 Ok(event) => {
                     tracing::debug!("reader socket ← {event:?}");
-                    if let ReaderEvent::ShowingPage { page } = event {
-                        current.store(page, Ordering::Relaxed);
-                        // Only fails once the session is over, when there's
-                        // nothing left to report to.
-                        let _ = shown_pages.send(page);
+                    if events.send(event).is_err() {
+                        break;
                     }
                 }
                 Err(error) => tracing::debug!("unparsable reader event {line:?}: {error}"),
@@ -270,10 +429,13 @@ fn page_file(index: usize) -> String {
     format!("{index:05}.img")
 }
 
-/// Writes one command to the reader as a line of JSON.
-fn send_command(stream: &mut Stream, command: &ReaderCommand) -> std::io::Result<()> {
+/// Writes one command to the reader as a line of JSON. The stream is shared by
+/// the session's concurrent tasks (downloads, next-entry offers); each write is
+/// synchronous, so one command's line is never split by another's.
+fn send_command(stream: &RefCell<Stream>, command: &ReaderCommand) -> std::io::Result<()> {
     tracing::debug!("reader socket → {command:?}");
     let line = serde_json::to_string(command).map_err(std::io::Error::other)?;
+    let mut stream = stream.borrow_mut();
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
@@ -299,6 +461,175 @@ fn spawn_reader(dir: &Path, socket_name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::library_item::LibraryItem;
+    use crate::models::series_entry::EntryKind;
+
+    /// A provider serving one-byte pages, with `next` after any entry.
+    struct FakeProvider {
+        next: Option<SeriesEntry>,
+    }
+
+    impl Provider for FakeProvider {
+        async fn list_items(
+            &self,
+            _: &str,
+            _: Option<u32>,
+            _: Option<u32>,
+        ) -> Result<Vec<LibraryItem>, String> {
+            unimplemented!()
+        }
+        async fn list_series_entries(&self, _: &str) -> Result<Vec<SeriesEntry>, String> {
+            unimplemented!()
+        }
+        async fn cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            unimplemented!()
+        }
+        async fn volume_cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            unimplemented!()
+        }
+        async fn chapter_cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+            unimplemented!()
+        }
+        async fn reader_pages(&self, _: &SeriesEntry) -> Result<Vec<PageRef>, String> {
+            unimplemented!()
+        }
+        async fn reader_image(&self, _: &str, _: u16) -> Result<Vec<u8>, String> {
+            Ok(vec![0])
+        }
+        async fn next_entry(
+            &self,
+            _: &str,
+            _: &SeriesEntry,
+        ) -> Result<Option<SeriesEntry>, String> {
+            Ok(self.next.clone())
+        }
+    }
+
+    fn volume(id: &str) -> SeriesEntry {
+        SeriesEntry {
+            external_id: id.to_string(),
+            kind: EntryKind::Volume,
+            label: format!("Volume {id}"),
+            pages: None,
+            read_state: Default::default(),
+        }
+    }
+
+    /// A connected host/reader socket pair: the host's end, and a receiver of
+    /// the commands arriving at the reader's end.
+    fn socket_pair() -> (Stream, std::sync::mpsc::Receiver<ReaderCommand>) {
+        let name = format!("komasabi-launch-test-{}.sock", Uuid::new_v4());
+        let listener = ListenerOptions::new()
+            .name(name.as_str().to_ns_name::<GenericNamespaced>().unwrap())
+            .create_sync()
+            .unwrap();
+        let reader_end =
+            Stream::connect(name.as_str().to_ns_name::<GenericNamespaced>().unwrap()).unwrap();
+        let host_end = listener.accept().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(reader_end).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(serde_json::from_str(&line).unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        (host_end, rx)
+    }
+
+    /// Runs [`serve_entry`] for a two-page volume over `events`, all queued
+    /// before it starts, and returns its outcome plus the commands sent.
+    async fn serve(
+        provider: FakeProvider,
+        events: Vec<ReaderEvent>,
+        close: bool,
+    ) -> (Option<SeriesEntry>, Vec<ReaderCommand>) {
+        let dir = std::env::temp_dir().join(format!("komasabi-launch-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (host_end, commands) = socket_pair();
+        let stream = RefCell::new(host_end);
+        let plan: Vec<PageRef> = (0..2)
+            .map(|page| PageRef {
+                chapter_id: "c".to_string(),
+                page,
+            })
+            .collect();
+
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        for event in events {
+            events_tx.send(event).unwrap();
+        }
+        if close {
+            drop(events_tx);
+        }
+
+        let entry = volume("1");
+        let session = EntrySession {
+            series_id: "series",
+            entry: &entry,
+            plan: &plan,
+            dir: &dir,
+            stream: &stream,
+        };
+        let outcome = serve_entry(&provider, session, &mut events_rx).await;
+
+        drop(stream);
+        let _ = std::fs::remove_dir_all(&dir);
+        (outcome, commands.iter().collect())
+    }
+
+    #[tokio::test]
+    async fn the_last_page_offers_the_next_entry_and_opens_it_on_request() {
+        let provider = FakeProvider {
+            next: Some(volume("2")),
+        };
+        let events = vec![
+            ReaderEvent::ShowingPage { page: 0 },
+            ReaderEvent::ShowingPage { page: 1 },
+            ReaderEvent::OpenNext,
+        ];
+
+        let (outcome, commands) = serve(provider, events, false).await;
+
+        assert_eq!(outcome, Some(volume("2")));
+        assert!(commands.contains(&ReaderCommand::NextEntry {
+            label: Some("Volume 2".to_string())
+        }));
+    }
+
+    #[tokio::test]
+    async fn the_last_entry_is_offered_nothing_and_ends_with_the_reader() {
+        let provider = FakeProvider { next: None };
+        let events = vec![
+            ReaderEvent::ShowingPage { page: 1 },
+            // Nothing was offered, so there's nothing to open.
+            ReaderEvent::OpenNext,
+        ];
+
+        let (outcome, commands) = serve(provider, events, true).await;
+
+        assert_eq!(outcome, None);
+        assert!(commands.contains(&ReaderCommand::NextEntry { label: None }));
+    }
+
+    #[tokio::test]
+    async fn the_next_entry_is_only_looked_up_on_the_last_page() {
+        let provider = FakeProvider {
+            next: Some(volume("2")),
+        };
+        let events = vec![ReaderEvent::ShowingPage { page: 0 }, ReaderEvent::OpenNext];
+
+        let (outcome, commands) = serve(provider, events, true).await;
+
+        assert_eq!(outcome, None);
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, ReaderCommand::NextEntry { .. }))
+        );
+    }
 
     #[test]
     fn next_page_prefers_forward_then_mops_up_behind() {

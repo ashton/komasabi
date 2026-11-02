@@ -14,6 +14,8 @@ pub struct Chapter {
     /// `-1` until the chapter's pages have been fetched from its source.
     pub page_count: i32,
     pub is_read: bool,
+    /// The 0-based index of the last page the user viewed, `0` when unread.
+    pub last_page_read: i32,
     pub is_downloaded: bool,
 }
 

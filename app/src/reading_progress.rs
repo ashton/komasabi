@@ -144,6 +144,13 @@ mod tests {
         async fn reader_image(&self, _: &str, _: u16) -> Result<Vec<u8>, String> {
             unimplemented!()
         }
+        async fn next_entry(
+            &self,
+            _: &str,
+            _: &SeriesEntry,
+        ) -> Result<Option<SeriesEntry>, String> {
+            unimplemented!()
+        }
 
         async fn update_reading_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
             let key = (progress.page.chapter_id.clone(), progress.page.page);

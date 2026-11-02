@@ -160,6 +160,28 @@ impl Provider for KomgaProvider {
             .collect())
     }
 
+    /// Komga's own next book in the series (`/books/{id}/next`, ordered by
+    /// each book's sort number). Books flagged deleted are skipped.
+    async fn next_entry(
+        &self,
+        _series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let mut book_id = current.external_id.clone();
+        loop {
+            let next = self
+                .client
+                .next_book(&book_id)
+                .await
+                .map_err(crate::error::log_and_stringify)?;
+            match next {
+                Some(book) if book.deleted => book_id = book.id,
+                Some(book) => return Ok(Some(book_entry(book))),
+                None => return Ok(None),
+            }
+        }
+    }
+
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
         self.cached_cover(
             format!("{integration_id}-{series_id}"),
@@ -239,6 +261,7 @@ mod tests {
             kind: EntryKind::Chapter,
             label: "v01".to_string(),
             pages: None,
+            read_state: Default::default(),
         }
     }
 
@@ -249,6 +272,56 @@ mod tests {
                           "mediaProfile": "{profile}", "epubDivinaCompatible": false}},
                 "metadata": {{"title": "v01", "number": "1", "numberSort": 1.0}}}}"#
         )
+    }
+
+    fn next_book_json(id: &str, deleted: bool) -> String {
+        format!(
+            r#"{{"id": "{id}", "seriesId": "S1", "name": "{id}", "number": 1, "deleted": {deleted},
+                "media": {{"status": "READY", "pagesCount": 3,
+                          "mediaProfile": "DIVINA", "epubDivinaCompatible": false}},
+                "metadata": {{"title": "Book {id}", "number": "1", "numberSort": 1.0}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn next_entry_follows_komgas_next_book_skipping_deleted_ones() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B1/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(next_book_json("B2", true), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B2/next"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(next_book_json("B3", false), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B3/next"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(&server);
+
+        let next = Provider::next_entry(&provider, "S1", &entry("B1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.external_id, "B3");
+        assert_eq!(next.label, "Book B3");
+
+        let last = Provider::next_entry(&provider, "S1", &entry("B3"))
+            .await
+            .unwrap();
+        assert_eq!(last, None);
     }
 
     #[test]

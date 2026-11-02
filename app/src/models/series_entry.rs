@@ -19,6 +19,34 @@ pub struct SeriesEntry {
     /// Pre-resolved display label (e.g. "Volume 1", "#3", "Special").
     pub label: String,
     pub pages: Option<u16>,
+    /// How far the user has read this entry, per the backend's reading
+    /// history. Backends that keep none leave every entry [`ReadState::Unread`].
+    pub read_state: ReadState,
+}
+
+/// Where the user is in a series entry, shown on its card: a read entry's cover
+/// is dimmed, and an in-progress one gets a progress bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ReadState {
+    #[default]
+    Unread,
+    /// Partly read; the fraction (`0.0..1.0`) of its pages read so far, or
+    /// `None` when the entry's page count isn't known.
+    InProgress(Option<f32>),
+    Read,
+}
+
+impl ReadState {
+    /// Derives the state from how many of an entry's `pages` have been read.
+    /// Reading every page (or more, if the count is stale) counts as read.
+    pub fn from_pages_read(pages_read: u32, pages: Option<u32>) -> Self {
+        match pages {
+            _ if pages_read == 0 => Self::Unread,
+            Some(pages) if pages_read >= pages => Self::Read,
+            Some(pages) => Self::InProgress(Some(pages_read as f32 / pages as f32)),
+            None => Self::InProgress(None),
+        }
+    }
 }
 
 impl SeriesEntry {
@@ -38,4 +66,25 @@ pub fn cover_key(kind: EntryKind, external_id: &str) -> String {
         EntryKind::Chapter => "ch",
     };
     format!("{tag}:{external_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadState;
+
+    #[test]
+    fn read_state_from_pages_read() {
+        assert_eq!(ReadState::from_pages_read(0, Some(20)), ReadState::Unread);
+        assert_eq!(ReadState::from_pages_read(0, None), ReadState::Unread);
+        assert_eq!(
+            ReadState::from_pages_read(5, Some(20)),
+            ReadState::InProgress(Some(0.25))
+        );
+        assert_eq!(
+            ReadState::from_pages_read(5, None),
+            ReadState::InProgress(None)
+        );
+        assert_eq!(ReadState::from_pages_read(20, Some(20)), ReadState::Read);
+        assert_eq!(ReadState::from_pages_read(25, Some(20)), ReadState::Read);
+    }
 }

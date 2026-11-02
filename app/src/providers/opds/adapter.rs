@@ -173,6 +173,7 @@ pub fn publication_entry(feed: &str, index: usize, publication: &Publication) ->
         kind: EntryKind::Chapter,
         label: publication.metadata.title.clone(),
         pages: publication.page_count().and_then(to_pages),
+        read_state: Default::default(),
     }
 }
 

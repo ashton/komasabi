@@ -16,6 +16,17 @@ pub struct Book {
     pub media: Media,
     pub metadata: BookMetadata,
     pub deleted: bool,
+    /// The user's reading progress, absent while the book is unread.
+    pub read_progress: Option<ReadProgress>,
+}
+
+#[derive(Deserialize, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReadProgress {
+    /// The 1-based number of the last page read.
+    pub page: u32,
+    /// Whether the book has been read to the end.
+    pub completed: bool,
 }
 
 #[derive(Deserialize, Debug, Default, PartialEq)]

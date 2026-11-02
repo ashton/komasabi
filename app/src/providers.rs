@@ -88,6 +88,26 @@ pub trait Provider {
     async fn update_reading_progress(&self, _progress: &ReadingProgress) -> Result<(), String> {
         Ok(())
     }
+    /// The entry to read after `current` in the series `series_id`, offered to
+    /// the user when the reader reaches `current`'s last page. `None` when
+    /// `current` is the last one the backend has. Each backend decides what
+    /// "next" means: its own next-book lookup where it has one, otherwise the
+    /// entry after `current` in its reading order (see [`entry_after`]).
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String>;
+}
+
+/// The entry that follows `current` in `entries`, a series' entries in reading
+/// order (as [`Provider::list_series_entries`] lists them). `None` when
+/// `current` is the last one, or isn't among them at all.
+pub fn entry_after(entries: Vec<SeriesEntry>, current: &SeriesEntry) -> Option<SeriesEntry> {
+    let position = entries
+        .iter()
+        .position(|entry| entry.kind == current.kind && entry.external_id == current.external_id)?;
+    entries.into_iter().nth(position + 1)
 }
 
 /// A provider resolved for a particular library, erasing the concrete backend
@@ -165,6 +185,14 @@ impl Provider for ResolvedProvider {
 
     async fn update_reading_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
         dispatch!(self, update_reading_progress(progress))
+    }
+
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        dispatch!(self, next_entry(series_id, current))
     }
 }
 
@@ -251,4 +279,44 @@ pub fn not_built_in(integration_type: IntegrationType) -> String {
         "this build of Komasabi doesn't include {} support",
         integration_type.label()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::series_entry::EntryKind;
+
+    fn entry(kind: EntryKind, id: &str) -> SeriesEntry {
+        SeriesEntry {
+            external_id: id.to_string(),
+            kind,
+            label: format!("{kind:?} {id}"),
+            pages: None,
+            read_state: Default::default(),
+        }
+    }
+
+    #[test]
+    fn entry_after_is_the_following_entry_of_the_same_kind_and_id() {
+        let entries = vec![
+            entry(EntryKind::Volume, "1"),
+            entry(EntryKind::Chapter, "1"),
+            entry(EntryKind::Chapter, "2"),
+        ];
+
+        // A volume and a chapter can share an id; the kind tells them apart.
+        assert_eq!(
+            entry_after(entries.clone(), &entry(EntryKind::Volume, "1")),
+            Some(entry(EntryKind::Chapter, "1"))
+        );
+        assert_eq!(
+            entry_after(entries.clone(), &entry(EntryKind::Chapter, "1")),
+            Some(entry(EntryKind::Chapter, "2"))
+        );
+        assert_eq!(
+            entry_after(entries.clone(), &entry(EntryKind::Chapter, "2")),
+            None
+        );
+        assert_eq!(entry_after(entries, &entry(EntryKind::Chapter, "9")), None);
+    }
 }

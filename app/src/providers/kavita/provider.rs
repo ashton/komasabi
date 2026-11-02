@@ -321,6 +321,18 @@ impl Provider for KavitaProvider {
         self.list_series_entries(parse_kavita_id(series_id)?).await
     }
 
+    /// The entry after `current` in the series' volume/chapter cards, as
+    /// Kavita lists them (its volumes in order, then each volume's chapters), which is the
+    /// reading order.
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_after(entries, current))
+    }
+
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
         self.cover(integration_id, parse_kavita_id(series_id)?)
             .await

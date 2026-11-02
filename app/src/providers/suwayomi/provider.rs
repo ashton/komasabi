@@ -124,6 +124,35 @@ impl Provider for SuwayomiProvider {
         Ok(chapters.into_iter().map(chapter_entry).collect())
     }
 
+    /// The manga's chapter with the next source order after `current`'s, the
+    /// order the source publishes chapters in.
+    async fn next_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let (_, chapter_id) = parse_chapter_external_id(&current.external_id)?;
+        let chapters = self
+            .client
+            .list_chapters(parse_manga_id(series_id)?)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        let Some(current_order) = chapters
+            .iter()
+            .find(|chapter| chapter.id == chapter_id)
+            .map(|chapter| chapter.source_order)
+        else {
+            return Ok(None);
+        };
+
+        Ok(chapters
+            .into_iter()
+            .filter(|chapter| chapter.source_order > current_order)
+            .min_by_key(|chapter| chapter.source_order)
+            .map(chapter_entry))
+    }
+
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
         let key = format!("{integration_id}-{series_id}");
 
@@ -223,6 +252,49 @@ mod tests {
             r#"{{"category": {{"mangas": {{"nodes": [{}]}}}}}}"#,
             nodes.join(",")
         )
+    }
+
+    #[tokio::test]
+    async fn next_entry_is_the_chapter_with_the_next_source_order() {
+        let server = MockServer::start().await;
+
+        // Listed out of source order, to show the order is by `sourceOrder`.
+        Mock::given(method("POST"))
+            .and(path("/api/graphql"))
+            .respond_with(graphql(
+                r#"{"chapters": {"nodes": [
+                    {"id": 47, "mangaId": 25, "name": "Ch. 3", "chapterNumber": 3.0,
+                     "sourceOrder": 3, "pageCount": -1},
+                    {"id": 45, "mangaId": 25, "name": "Ch. 1", "chapterNumber": 1.0,
+                     "sourceOrder": 1, "pageCount": -1},
+                    {"id": 46, "mangaId": 25, "name": "Ch. 2", "chapterNumber": 2.0,
+                     "sourceOrder": 2, "pageCount": -1}
+                ]}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(&server);
+        let chapter = |id: &str| SeriesEntry {
+            external_id: id.to_string(),
+            kind: EntryKind::Chapter,
+            label: String::new(),
+            pages: None,
+            read_state: Default::default(),
+        };
+
+        let next = Provider::next_entry(&provider, "25", &chapter("25-45"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.map(|entry| entry.external_id).as_deref(),
+            Some("25-46")
+        );
+
+        let last = Provider::next_entry(&provider, "25", &chapter("25-47"))
+            .await
+            .unwrap();
+        assert_eq!(last, None);
     }
 
     #[test]
@@ -348,6 +420,7 @@ mod tests {
                 kind: EntryKind::Chapter,
                 label: "Ch. 1".to_string(),
                 pages: None,
+                read_state: Default::default(),
             }]
         );
     }
@@ -377,6 +450,7 @@ mod tests {
             kind: EntryKind::Chapter,
             label: "Ch. 1".to_string(),
             pages: None,
+            read_state: Default::default(),
         };
 
         let pages = Provider::reader_pages(&provider_for(&server), &entry)

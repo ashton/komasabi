@@ -11,7 +11,7 @@ use crate::{
     models::{
         library::{Library, LibraryType},
         library_item::LibraryItem,
-        series_entry::{EntryKind, SeriesEntry},
+        series_entry::{EntryKind, ReadState, SeriesEntry},
     },
 };
 
@@ -91,6 +91,7 @@ fn volume_entry(volume: KavitaVolume) -> SeriesEntry {
         kind: EntryKind::Volume,
         label,
         pages: (volume.pages > 0).then_some(volume.pages),
+        read_state: kavita_read_state(volume.pages_read, volume.pages),
     }
 }
 
@@ -100,7 +101,13 @@ fn chapter_entry(chapter: KavitaChapter) -> SeriesEntry {
         kind: EntryKind::Chapter,
         label: chapter_label(&chapter),
         pages: (chapter.pages > 0).then_some(chapter.pages),
+        read_state: kavita_read_state(chapter.pages_read, chapter.pages),
     }
+}
+
+/// Kavita reports how many of a volume's or chapter's pages have been read.
+fn kavita_read_state(pages_read: u16, pages: u16) -> ReadState {
+    ReadState::from_pages_read(pages_read.into(), (pages > 0).then_some(pages.into()))
 }
 
 /// Builds a chapter card's label. A genuinely distinct title wins; Kavita fills
@@ -430,5 +437,38 @@ mod tests {
         let entries = series_entries(vec![loose_leaf_volume(vec![chapter(1, "1", 1.0, 0)])]);
 
         assert_eq!(entries[0].pages, None);
+    }
+
+    #[test]
+    fn series_entries_carry_each_cards_read_state() {
+        let mut read = numbered_volume(1, "1", 1.0, 20);
+        read.pages_read = 20;
+        let mut started = numbered_volume(2, "2", 2.0, 20);
+        started.pages_read = 5;
+        let unread = numbered_volume(3, "3", 3.0, 20);
+
+        let states: Vec<_> = series_entries(vec![read, started, unread])
+            .into_iter()
+            .map(|entry| entry.read_state)
+            .collect();
+
+        assert_eq!(
+            states,
+            [
+                ReadState::Read,
+                ReadState::InProgress(Some(0.25)),
+                ReadState::Unread
+            ]
+        );
+    }
+
+    #[test]
+    fn series_entries_carry_a_chapter_cards_read_state() {
+        let mut started = chapter(1, "1", 1.0, 10);
+        started.pages_read = 4;
+
+        let entries = series_entries(vec![loose_leaf_volume(vec![started])]);
+
+        assert_eq!(entries[0].read_state, ReadState::InProgress(Some(0.4)));
     }
 }

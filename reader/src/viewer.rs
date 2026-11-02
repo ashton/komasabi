@@ -19,8 +19,14 @@ use std::sync::Arc;
 
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::{self, Key, key::Named};
-use iced::widget::{column, container, image, mouse_area, row, space, stack, text};
-use iced::{ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task};
+use iced::animation::{Animation, Easing};
+use iced::time::{Duration, Instant};
+use iced::widget::{
+    button, column, container, float, image, mouse_area, opaque, row, space, stack, text,
+};
+use iced::{
+    Color, ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task, Vector,
+};
 
 use crate::{EventSender, ReaderCommand, ReaderEvent, ReaderLink};
 
@@ -34,6 +40,11 @@ const PREFETCH_AHEAD: usize = 2;
 /// single flip touches (current, a couple ahead, one behind) so local
 /// back-and-forth navigation stays in cache.
 const CACHE_CAPACITY: usize = 9;
+/// How long the top and bottom bars stay on screen after a tap on the middle
+/// of the page, before sliding away again.
+const CHROME_VISIBLE_FOR: Duration = Duration::from_secs(5);
+/// How long the bars take to slide in or out.
+const CHROME_SLIDE: Duration = Duration::from_millis(250);
 const APP_ICON: &[u8] = include_bytes!("../assets/komasabi-icon.png");
 
 /// Runs the reader window until it's closed. `args` are the reader's own
@@ -128,6 +139,35 @@ struct Reader {
     /// Set when startup failed (bad args, unreadable/empty folder); shown
     /// instead of a page.
     error: Option<String>,
+    /// Counts the sessions this window has shown (one per `OpenSession`), so a
+    /// page load that finishes after the user moved on to the next entry is
+    /// recognised as stale and dropped.
+    session: u64,
+    /// What the host said follows this session's entry (hosted mode).
+    next: NextEntry,
+    /// Whether the top and bottom bars ("chrome") are shown, animated so they
+    /// slide in and out. Hidden until the user taps the middle of the page.
+    chrome: Animation<bool>,
+    /// Counts the times the chrome was shown, so the timer that hides it again
+    /// is ignored once a later tap has restarted (or cancelled) it.
+    chrome_shown: u64,
+    /// The time the view is drawn at, advanced every frame while the chrome
+    /// slides.
+    now: Instant,
+}
+
+/// What follows the entry being read, as far as the reader knows. The host
+/// looks it up when the user reaches the last page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NextEntry {
+    /// Not known (yet): the host hasn't answered, or there's no host at all.
+    Unknown,
+    /// The host has the entry with this label ready to open next.
+    Available(String),
+    /// The user asked to open the next entry; waiting for its session.
+    Opening(String),
+    /// The host found nothing after this entry.
+    None,
 }
 
 #[derive(Debug, Clone)]
@@ -141,12 +181,22 @@ enum Message {
     ZoomReset,
     Rotate,
     CycleFit,
-    /// A background load for page `index` finished; `None` if it couldn't be
-    /// read or decoded.
+    /// A background load for page `index` of session number `session`
+    /// finished; `None` if it couldn't be read or decoded.
     PageLoaded {
+        session: u64,
         index: usize,
         handle: Option<image::Handle>,
     },
+    /// The user accepted the offer to read the next entry.
+    ReadNext,
+    /// The middle of the page was clicked or tapped: show the bars, or hide
+    /// them if they're showing.
+    ToggleChrome,
+    /// The timer started when the bars were shown for the `n`th time ran out.
+    HideChrome(u64),
+    /// A frame is being drawn while the bars slide.
+    Frame(Instant),
     /// The command subscription connected; carries the handle for emitting
     /// events back to the host.
     Connected(EventHandle),
@@ -213,6 +263,13 @@ impl Reader {
             events: EventHandle::disabled(),
             events_socket,
             error: None,
+            session: 0,
+            next: NextEntry::Unknown,
+            chrome: Animation::new(false)
+                .duration(CHROME_SLIDE)
+                .easing(Easing::EaseOutCubic),
+            chrome_shown: 0,
+            now: Instant::now(),
         }
     }
 
@@ -278,11 +335,43 @@ impl Reader {
                 self.fit = self.fit.next();
                 Task::none()
             }
-            Message::PageLoaded { index, handle } => {
+            Message::PageLoaded {
+                session,
+                index,
+                handle,
+            } => {
+                if session != self.session {
+                    // A page of the entry the user has since moved on from.
+                    return Task::none();
+                }
                 self.inflight.remove(&index);
                 if let Some(handle) = handle {
                     self.cache.insert(index, handle);
                 }
+                Task::none()
+            }
+            Message::ToggleChrome => {
+                self.now = Instant::now();
+                if self.chrome.value() {
+                    self.chrome.go_mut(false, self.now);
+                    // Cancels the pending hide timer.
+                    self.chrome_shown += 1;
+                    Task::none()
+                } else {
+                    self.chrome.go_mut(true, self.now);
+                    self.chrome_shown += 1;
+                    hide_chrome_after(CHROME_VISIBLE_FOR, self.chrome_shown)
+                }
+            }
+            Message::HideChrome(shown) => {
+                if shown == self.chrome_shown && self.chrome.value() {
+                    self.now = Instant::now();
+                    self.chrome.go_mut(false, self.now);
+                }
+                Task::none()
+            }
+            Message::Frame(now) => {
+                self.now = now;
                 Task::none()
             }
             Message::Connected(events) => {
@@ -290,6 +379,13 @@ impl Reader {
                 Task::none()
             }
             Message::Command(command) => self.handle_command(command),
+            Message::ReadNext => {
+                if let NextEntry::Available(label) = &self.next {
+                    self.next = NextEntry::Opening(label.clone());
+                    self.events.send(ReaderEvent::OpenNext);
+                }
+                Task::none()
+            }
         }
     }
 
@@ -302,7 +398,19 @@ impl Reader {
                 series,
                 entry,
                 pages,
+                dir,
             } => {
+                if let Some(dir) = dir {
+                    // The next entry: a new folder, read from its first page,
+                    // with nothing of the previous entry's carried over.
+                    self.dir = dir;
+                    self.start_page = 0;
+                    self.ready.clear();
+                    self.cache = PageCache::new(CACHE_CAPACITY);
+                    self.inflight.clear();
+                }
+                self.session += 1;
+                self.next = NextEntry::Unknown;
                 self.series = Some(series);
                 self.entry = Some(entry);
                 self.pages = (0..pages).map(|i| self.page_path(i)).collect();
@@ -324,7 +432,20 @@ impl Reader {
                 }
                 Task::none()
             }
+            ReaderCommand::NextEntry { label } => {
+                self.next = match label {
+                    Some(label) => NextEntry::Available(label),
+                    None => NextEntry::None,
+                };
+                Task::none()
+            }
         }
+    }
+
+    /// Whether the reader is on the session's last page, where the next entry is
+    /// offered.
+    fn on_last_page(&self) -> bool {
+        !self.pages.is_empty() && self.current + 1 == self.pages.len()
     }
 
     /// The on-disk path for page `index`, under the session folder.
@@ -336,7 +457,9 @@ impl Reader {
     /// a `ShowingPage` event and kicks off the background loads for the new page
     /// and its neighbours; the handle itself arrives later via `PageLoaded`.
     fn go_to(&mut self, page: usize) -> Task<Message> {
-        if self.pages.is_empty() {
+        // While the next entry is opening, a page turn would be reported to the
+        // host as a page of the entry it's about to start.
+        if self.pages.is_empty() || matches!(self.next, NextEntry::Opening(_)) {
             return Task::none();
         }
 
@@ -393,7 +516,11 @@ impl Reader {
         }
 
         self.inflight.insert(index);
-        Some(load_page_task(index, self.pages[index].clone()))
+        Some(load_page_task(
+            self.session,
+            index,
+            self.pages[index].clone(),
+        ))
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -429,23 +556,98 @@ impl Reader {
             message_screen("could not load this page")
         };
 
-        let mut layout = column![].width(Fill).height(Fill);
-        if let Some(header) = self.header() {
-            layout = layout.push(header);
+        let mut layers = stack![page, touch_zones()].width(Fill).height(Fill);
+        if let Some(chrome) = self.chrome() {
+            layers = layers.push(chrome);
         }
-        layout
-            .push(stack![page, touch_zones()])
-            .push(self.status_bar())
-            .into()
+        layers.into()
     }
 
-    /// The session title line (`series — entry`), shown when the host has told
-    /// us what we're reading. Absent in standalone mode.
+    /// Whether the bars are on screen, fully or partly (mid-slide).
+    fn chrome_visible(&self) -> bool {
+        self.chrome.value() || self.chrome.is_animating(self.now)
+    }
+
+    /// The top bar (title) and bottom bars (end-of-entry offer, status) laid
+    /// over the page, each slid off its edge of the window by how far the
+    /// chrome is from fully shown. `None` while they're fully hidden, so
+    /// nothing covers the page.
+    fn chrome(&self) -> Option<Element<'_, Message>> {
+        if !self.chrome_visible() {
+            return None;
+        }
+
+        // 0 = fully hidden, 1 = fully shown.
+        let shown: f32 = self.chrome.interpolate(0.0, 1.0, self.now);
+        let hidden = 1.0 - shown;
+
+        let mut top = column![].width(Fill);
+        if let Some(header) = self.header() {
+            top = top.push(header);
+        }
+
+        let mut bottom = column![].width(Fill);
+        if let Some(end_bar) = self.end_bar() {
+            bottom = bottom.push(end_bar);
+        }
+        bottom = bottom.push(self.status_bar());
+
+        // `opaque` keeps a tap on a bar from reaching the page-turn zones
+        // underneath it.
+        let top = float(opaque(chrome_bar(top)))
+            .translate(move |bounds, _| Vector::new(0.0, -bounds.height * hidden));
+        let bottom = float(opaque(chrome_bar(bottom)))
+            .translate(move |bounds, _| Vector::new(0.0, bounds.height * hidden));
+
+        Some(
+            column![top, space().height(Fill), bottom]
+                .width(Fill)
+                .height(Fill)
+                .into(),
+        )
+    }
+
+    /// On the last page of a hosted session, a bar about what comes next: a
+    /// button to read the next entry when the host has one, or a note that this
+    /// was the last one. Absent elsewhere, and in standalone mode (no host to
+    /// ask).
+    fn end_bar(&self) -> Option<Element<'_, Message>> {
+        if self.events_socket.is_none() || !self.on_last_page() {
+            return None;
+        }
+
+        let end = match &self.entry {
+            Some(entry) => format!("End of {entry}"),
+            None => "The end".to_string(),
+        };
+
+        let offer: Element<'_, Message> = match &self.next {
+            NextEntry::Unknown => text("Looking for what's next…").size(13).into(),
+            NextEntry::Available(label) => button(text(format!("Read next: {label}  →")).size(14))
+                .on_press(Message::ReadNext)
+                .into(),
+            NextEntry::Opening(label) => text(format!("Opening {label}…")).size(13).into(),
+            NextEntry::None => text("That's the last one available").size(13).into(),
+        };
+
+        Some(
+            container(
+                row![text(end).size(14), space().width(Fill), offer]
+                    .spacing(12)
+                    .align_y(iced::Center),
+            )
+            .padding([6, 8])
+            .into(),
+        )
+    }
+
+    /// The title line: `series — entry` once the host has told us what we're
+    /// reading, or the folder's name in standalone mode.
     fn header(&self) -> Option<Element<'_, Message>> {
         let title = match (&self.series, &self.entry) {
             (Some(series), Some(entry)) => format!("{series}  —  {entry}"),
             (Some(part), None) | (None, Some(part)) => part.clone(),
-            (None, None) => return None,
+            (None, None) => self.dir.file_name()?.to_string_lossy().into_owned(),
         };
         Some(container(text(title).size(14)).padding(8).into())
     }
@@ -472,6 +674,12 @@ impl Reader {
 
     fn subscription(&self) -> Subscription<Message> {
         let keyboard = keyboard::listen().filter_map(key_message);
+        // Redraw every frame only while the bars are sliding.
+        let keyboard = if self.chrome.is_animating(self.now) {
+            Subscription::batch([keyboard, iced::window::frames().map(Message::Frame)])
+        } else {
+            keyboard
+        };
 
         match &self.events_socket {
             // Hosted: also run the duplex command channel, keyed by the socket
@@ -520,7 +728,7 @@ fn command_stream(socket_name: &String) -> impl Stream<Item = Message> + use<> {
 }
 
 /// Click/tap zones laid over the page: the left third turns back a page, the
-/// right third forward. The middle third is left free.
+/// right third forward, and the middle third shows (or hides) the bars.
 fn touch_zones<'a>() -> Element<'a, Message> {
     let zone = |message| {
         mouse_area(space().width(Fill).height(Fill))
@@ -530,12 +738,42 @@ fn touch_zones<'a>() -> Element<'a, Message> {
 
     row![
         zone(Message::Prev),
-        space().width(Fill).height(Fill),
+        mouse_area(space().width(Fill).height(Fill)).on_press(Message::ToggleChrome),
         zone(Message::Next)
     ]
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+/// The look shared by the top and bottom bars: a translucent dark band across
+/// the window with light text, so the page still shows through faintly.
+fn chrome_bar<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .width(Fill)
+        .style(|_| container::Style {
+            background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.8).into()),
+            text_color: Some(Color::WHITE),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A task that reports [`Message::HideChrome`] for the `shown`th showing of the
+/// bars once `after` has passed. Sleeps on its own thread, so it needs no async
+/// timer from the executor.
+fn hide_chrome_after(after: Duration, shown: u64) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (tx, rx) = iced::futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                let _ = tx.send(());
+            });
+            let _ = rx.await;
+        },
+        move |()| Message::HideChrome(shown),
+    )
 }
 
 /// Maps an ignored keyboard event to a reader message, if it's a key we handle.
@@ -549,12 +787,14 @@ fn key_message(event: keyboard::Event) -> Option<Message> {
         Key::Named(Named::ArrowLeft | Named::Backspace | Named::PageUp) => Some(Message::Prev),
         Key::Named(Named::Home) => Some(Message::First),
         Key::Named(Named::End) => Some(Message::Last),
+        Key::Named(Named::Enter) => Some(Message::ReadNext),
         Key::Character(c) => match c.as_str() {
             "+" | "=" => Some(Message::ZoomIn),
             "-" | "_" => Some(Message::ZoomOut),
             "0" => Some(Message::ZoomReset),
             "r" | "R" => Some(Message::Rotate),
             "f" | "F" => Some(Message::CycleFit),
+            "m" | "M" => Some(Message::ToggleChrome),
             _ => None,
         },
         _ => None,
@@ -613,7 +853,7 @@ fn message_screen(message: &str) -> Element<'_, Message> {
 /// reporting the result as [`Message::PageLoaded`]. The read and decode run only
 /// when the task is polled, and never on the UI thread, so a page flip doesn't
 /// block on disk I/O or image decoding.
-fn load_page_task(index: usize, path: PathBuf) -> Task<Message> {
+fn load_page_task(session: u64, index: usize, path: PathBuf) -> Task<Message> {
     Task::perform(
         async move {
             let (tx, rx) = iced::futures::channel::oneshot::channel();
@@ -622,7 +862,11 @@ fn load_page_task(index: usize, path: PathBuf) -> Task<Message> {
             });
             rx.await.ok().flatten()
         },
-        move |handle| Message::PageLoaded { index, handle },
+        move |handle| Message::PageLoaded {
+            session,
+            index,
+            handle,
+        },
     )
 }
 
@@ -791,7 +1035,81 @@ mod tests {
 
         assert_eq!(click_at(&reader, 100.0), ["Prev"]);
         assert_eq!(click_at(&reader, 800.0), ["Next"]);
-        assert!(click_at(&reader, 450.0).is_empty());
+        assert_eq!(click_at(&reader, 450.0), ["ToggleChrome"]);
+    }
+
+    /// Taps the middle of the page and lets the bars finish sliding in.
+    fn show_chrome(reader: &mut Reader) {
+        let _ = reader.update(Message::ToggleChrome);
+        let _ = reader.update(Message::Frame(Instant::now() + CHROME_SLIDE * 2));
+    }
+
+    #[test]
+    fn the_bars_stay_hidden_until_the_middle_is_tapped() {
+        let mut reader = hosted_on_last_page(3);
+        assert!(!shows(&reader, "One Piece  —  Volume 5"));
+        assert!(!shows(&reader, "3 / 3 (100%)  ·  100%  ·  Fit"));
+
+        show_chrome(&mut reader);
+
+        assert!(shows(&reader, "One Piece  —  Volume 5"));
+        assert!(shows(&reader, "3 / 3 (100%)  ·  100%  ·  Fit"));
+    }
+
+    #[test]
+    fn the_bars_slide_in_from_their_edges() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::ToggleChrome);
+
+        assert!(reader.chrome_visible(), "on screen while sliding in");
+        assert!(reader.chrome.is_animating(reader.now));
+        let shown: f32 = reader.chrome.interpolate(0.0, 1.0, reader.now);
+        assert_eq!(shown, 0.0, "starts fully off screen");
+    }
+
+    #[test]
+    fn the_bars_hide_again_when_their_timer_runs_out() {
+        let mut reader = hosted_on_last_page(3);
+        show_chrome(&mut reader);
+        let shown = reader.chrome_shown;
+
+        let _ = reader.update(Message::HideChrome(shown));
+        let _ = reader.update(Message::Frame(Instant::now() + CHROME_SLIDE * 2));
+
+        assert!(!reader.chrome_visible());
+        assert!(!shows(&reader, "One Piece  —  Volume 5"));
+    }
+
+    #[test]
+    fn tapping_the_middle_again_hides_the_bars_and_cancels_the_timer() {
+        let mut reader = reader_with(3);
+        show_chrome(&mut reader);
+        let first = reader.chrome_shown;
+
+        let _ = reader.update(Message::ToggleChrome);
+        assert!(!reader.chrome.value());
+
+        // Shown again; the first showing's timer must not cut this one short.
+        show_chrome(&mut reader);
+        let _ = reader.update(Message::HideChrome(first));
+        assert!(reader.chrome.value());
+    }
+
+    #[test]
+    fn a_tap_on_a_bar_does_not_turn_the_page() {
+        let mut reader = reader_with(3);
+        reader.current = 1;
+        show_chrome(&mut reader);
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(900.0, 600.0),
+            reader.view(),
+        );
+        // The status bar along the bottom edge, over the "next page" zone.
+        ui.point_at(iced::Point::new(800.0, 595.0));
+        let _ = ui.simulate(iced_test::simulator::click());
+        assert_eq!(ui.into_messages().count(), 0);
     }
 
     #[test]
@@ -901,6 +1219,7 @@ mod tests {
         reader.inflight.insert(1);
 
         let _ = reader.update(Message::PageLoaded {
+            session: reader.session,
             index: 1,
             handle: Some(fake_handle()),
         });
@@ -915,6 +1234,7 @@ mod tests {
         reader.inflight.insert(1);
 
         let _ = reader.update(Message::PageLoaded {
+            session: reader.session,
             index: 1,
             handle: None,
         });
@@ -943,6 +1263,7 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 5".to_string(),
             pages: 5,
+            dir: None,
         }));
 
         assert_eq!(reader.pages.len(), 5);
@@ -952,6 +1273,112 @@ mod tests {
         assert!(!reader.awaiting_session);
     }
 
+    /// A hosted reader with an open `pages`-page session, sitting on its last
+    /// page.
+    fn hosted_on_last_page(pages: usize) -> Reader {
+        let mut reader = hosted_reader();
+        let _ = reader.update(Message::Command(ReaderCommand::OpenSession {
+            series: "One Piece".to_string(),
+            entry: "Volume 5".to_string(),
+            pages,
+            dir: None,
+        }));
+        let _ = reader.update(Message::Last);
+        reader
+    }
+
+    /// Renders `reader` and reports whether `label` is on screen.
+    fn shows(reader: &Reader, label: &str) -> bool {
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(900.0, 600.0),
+            reader.view(),
+        );
+        ui.find(label).is_ok()
+    }
+
+    #[test]
+    fn the_last_page_offers_the_next_entry_once_the_host_has_one() {
+        let mut reader = hosted_on_last_page(3);
+        show_chrome(&mut reader);
+        assert!(shows(&reader, "Looking for what's next…"));
+
+        let _ = reader.update(Message::Command(ReaderCommand::NextEntry {
+            label: Some("Volume 6".to_string()),
+        }));
+        assert!(shows(&reader, "Read next: Volume 6  →"));
+
+        let _ = reader.update(Message::First);
+        assert!(
+            !shows(&reader, "Read next: Volume 6  →"),
+            "only offered on the last page"
+        );
+    }
+
+    #[test]
+    fn the_last_page_says_when_nothing_follows() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::Command(ReaderCommand::NextEntry { label: None }));
+        show_chrome(&mut reader);
+
+        assert!(shows(&reader, "That's the last one available"));
+    }
+
+    #[test]
+    fn standalone_reader_offers_nothing_on_the_last_page() {
+        let mut reader = reader_with(2);
+        let _ = reader.update(Message::Last);
+
+        assert!(reader.end_bar().is_none());
+    }
+
+    #[test]
+    fn read_next_only_acts_on_an_available_entry() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::ReadNext);
+        assert_eq!(reader.next, NextEntry::Unknown, "nothing offered yet");
+
+        let _ = reader.update(Message::Command(ReaderCommand::NextEntry {
+            label: Some("Volume 6".to_string()),
+        }));
+        let _ = reader.update(Message::ReadNext);
+        assert_eq!(reader.next, NextEntry::Opening("Volume 6".to_string()));
+
+        let _ = reader.update(Message::Prev);
+        assert_eq!(reader.current, 2, "no page turns while the next one opens");
+    }
+
+    #[test]
+    fn a_new_session_switches_folder_and_starts_over() {
+        let mut reader = hosted_on_last_page(3);
+        reader.ready.insert(2);
+        reader.cache.insert(2, fake_handle());
+        let old_session = reader.session;
+
+        let _ = reader.update(Message::Command(ReaderCommand::OpenSession {
+            series: "One Piece".to_string(),
+            entry: "Volume 6".to_string(),
+            pages: 4,
+            dir: Some(PathBuf::from("next-volume")),
+        }));
+
+        assert_eq!(reader.dir, PathBuf::from("next-volume"));
+        assert_eq!(reader.pages[0], PathBuf::from("next-volume/00000.img"));
+        assert_eq!(reader.current, 0);
+        assert_eq!(reader.entry.as_deref(), Some("Volume 6"));
+        assert!(reader.ready.is_empty());
+        assert!(!reader.cache.contains(2));
+        assert_eq!(reader.next, NextEntry::Unknown);
+
+        // A load of the previous entry's page that lands now is dropped.
+        let _ = reader.update(Message::PageLoaded {
+            session: old_session,
+            index: 1,
+            handle: Some(fake_handle()),
+        });
+        assert!(!reader.cache.contains(1));
+    }
+
     #[test]
     fn page_ready_marks_the_page_and_makes_it_loadable() {
         let mut reader = hosted_reader();
@@ -959,6 +1386,7 @@ mod tests {
             series: "S".to_string(),
             entry: "E".to_string(),
             pages: 5,
+            dir: None,
         }));
         // Nothing is on disk yet, so the opening page can't load.
         assert!(reader.ready.is_empty());
