@@ -3,7 +3,7 @@ resolver = "3"
 members = ["app", "kavita-client", "komga-client", "opds-client", "reader", "suwayomi-client"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 authors = ["Matheus Ashton <matheusashton@gmail.com>"]
@@ -12,11 +12,11 @@ repository = "https://github.com/ashton/komasabi"
 # The crates publish together, so each internal dependency carries the version
 # crates.io resolves it to alongside the path used in the workspace.
 [workspace.dependencies]
-kavita-client = { path = "kavita-client", version = "0.1.0" }
-komasabi-reader = { path = "reader", version = "0.1.0" }
-komga-client = { path = "komga-client", version = "0.1.0" }
-opds-client = { path = "opds-client", version = "0.1.0" }
-suwayomi-client = { path = "suwayomi-client", version = "0.1.0" }
+kavita-client = { path = "kavita-client", version = "0.1.3" }
+komasabi-reader = { path = "reader", version = "0.1.3" }
+komga-client = { path = "komga-client", version = "0.1.3" }
+opds-client = { path = "opds-client", version = "0.1.3" }
+suwayomi-client = { path = "suwayomi-client", version = "0.1.3" }
 
 [profile.release]
 lto = "thin"
