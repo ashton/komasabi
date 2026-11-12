@@ -37,7 +37,8 @@ pub enum Action {
     None,
     Run(Task<Message>),
     BackPressed,
-    Created(IntegrationModel),
+    /// The source was saved.
+    Created,
 }
 
 impl Kavita {
@@ -71,7 +72,7 @@ impl Kavita {
                 Message::Created,
             )),
 
-            Message::Created(Ok(integration)) => Action::Created(integration),
+            Message::Created(Ok(_)) => Action::Created,
             Message::Created(Err(_)) => Action::None,
 
             Message::TestConnectionPressed => {
@@ -229,6 +230,7 @@ mod tests {
             api_key: Some("api-key".to_string()),
             username: None,
             password: None,
+            folder: None,
         }
     }
 
@@ -282,7 +284,7 @@ mod tests {
 
         let action = kavita.update(Message::Created(Ok(integration_model("My Kavita"))));
 
-        assert!(matches!(action, Action::Created(_)));
+        assert!(matches!(action, Action::Created));
     }
 
     #[test]

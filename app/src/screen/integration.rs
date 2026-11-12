@@ -1,7 +1,12 @@
+//! The sources screen (integrations, in code): lists every source the user has
+//! added (servers and local folders) and walks through adding one. Opening a
+//! source leads to its collections (see [`super::collections`]).
+
 #[cfg(feature = "kavita")]
 pub mod kavita;
 #[cfg(feature = "komga")]
 pub mod komga;
+pub mod local_folder;
 #[cfg(feature = "opds")]
 pub mod opds;
 #[cfg(feature = "suwayomi")]
@@ -18,6 +23,7 @@ use crate::repository::integration as integration_repository;
 use kavita::Kavita;
 #[cfg(feature = "komga")]
 use komga::Komga;
+use local_folder::LocalFolder;
 #[cfg(feature = "opds")]
 use opds::Opds;
 #[cfg(feature = "suwayomi")]
@@ -27,6 +33,7 @@ use suwayomi::Suwayomi;
 enum Step {
     List(AsyncModel<Vec<IntegrationModel>, String>),
     ChooseType,
+    LocalFolder(LocalFolder),
     #[cfg(feature = "kavita")]
     Kavita(Kavita),
     #[cfg(feature = "komga")]
@@ -55,6 +62,9 @@ pub enum Message {
     IntegrationsLoaded(Result<Vec<IntegrationModel>, String>),
     AddIntegrationPressed,
     TypeSelected(IntegrationType),
+    /// A source in the list was clicked; carries its id.
+    SourceSelected(String),
+    LocalFolder(local_folder::Message),
     #[cfg(feature = "kavita")]
     Kavita(kavita::Message),
     #[cfg(feature = "komga")]
@@ -69,6 +79,8 @@ pub enum Message {
 pub enum Action {
     None,
     Run(Task<Message>),
+    /// Open the source's collections; carries its id.
+    OpenSource(String),
 }
 
 impl Integrations {
@@ -88,6 +100,13 @@ impl Integrations {
 
             Message::AddIntegrationPressed => {
                 self.step = Step::ChooseType;
+                Action::None
+            }
+
+            Message::SourceSelected(integration_id) => Action::OpenSource(integration_id),
+
+            Message::TypeSelected(IntegrationType::LocalFolder) => {
+                self.step = Step::LocalFolder(LocalFolder::default());
                 Action::None
             }
 
@@ -118,6 +137,19 @@ impl Integrations {
             #[allow(unreachable_patterns)]
             Message::TypeSelected(_) => Action::None,
 
+            Message::LocalFolder(msg) => {
+                let Step::LocalFolder(form) = &mut self.step else {
+                    return Action::None;
+                };
+
+                match form.update(msg) {
+                    local_folder::Action::None => Action::None,
+                    local_folder::Action::Run(task) => Action::Run(task.map(Message::LocalFolder)),
+                    local_folder::Action::BackPressed => self.reload_list(),
+                    local_folder::Action::Created => self.reload_list(),
+                }
+            }
+
             #[cfg(feature = "kavita")]
             Message::Kavita(msg) => {
                 let Step::Kavita(kavita) = &mut self.step else {
@@ -128,7 +160,7 @@ impl Integrations {
                     kavita::Action::None => Action::None,
                     kavita::Action::Run(task) => Action::Run(task.map(Message::Kavita)),
                     kavita::Action::BackPressed => self.reload_list(),
-                    kavita::Action::Created(integration) => self.integration_created(integration),
+                    kavita::Action::Created => self.reload_list(),
                 }
             }
 
@@ -142,7 +174,7 @@ impl Integrations {
                     komga::Action::None => Action::None,
                     komga::Action::Run(task) => Action::Run(task.map(Message::Komga)),
                     komga::Action::BackPressed => self.reload_list(),
-                    komga::Action::Created(integration) => self.integration_created(integration),
+                    komga::Action::Created => self.reload_list(),
                 }
             }
 
@@ -156,7 +188,7 @@ impl Integrations {
                     opds::Action::None => Action::None,
                     opds::Action::Run(task) => Action::Run(task.map(Message::Opds)),
                     opds::Action::BackPressed => self.reload_list(),
-                    opds::Action::Created(integration) => self.integration_created(integration),
+                    opds::Action::Created => self.reload_list(),
                 }
             }
 
@@ -170,22 +202,15 @@ impl Integrations {
                     suwayomi::Action::None => Action::None,
                     suwayomi::Action::Run(task) => Action::Run(task.map(Message::Suwayomi)),
                     suwayomi::Action::BackPressed => self.reload_list(),
-                    suwayomi::Action::Created(integration) => self.integration_created(integration),
+                    suwayomi::Action::Created => self.reload_list(),
                 }
             }
         }
     }
 
-    /// Returns to the list once an integration is saved, kicking off the
-    /// background job that imports its libraries.
-    fn integration_created(&mut self, integration: IntegrationModel) -> Action {
-        self.step = Step::List(AsyncModel::Loading);
-        Action::Run(Task::future(async move {
-            crate::jobs::sync_integration_libraries::spawn(integration.id);
-            Message::IntegrationsLoaded(integration_repository::all().await)
-        }))
-    }
-
+    /// Returns to the (reloaded) list, after a form is left or a source saved.
+    /// Saving a source stores just the source itself: its collections are
+    /// listed live from it whenever it's opened.
     fn reload_list(&mut self) -> Action {
         self.step = Step::List(AsyncModel::Loading);
         Action::Run(Task::perform(
@@ -199,6 +224,7 @@ impl Integrations {
             Step::List(AsyncModel::Loaded(integrations)) => view_helper::list(integrations),
             Step::List(_) => container(iced::widget::row![]).into(),
             Step::ChooseType => view_helper::choose_type(),
+            Step::LocalFolder(form) => form.view().map(Message::LocalFolder),
             #[cfg(feature = "kavita")]
             Step::Kavita(kavita) => kavita.view().map(Message::Kavita),
             #[cfg(feature = "komga")]
@@ -219,7 +245,7 @@ mod view_helper {
         Background, Border, Center, Element,
         Length::Fill,
         Theme,
-        widget::{button, column, container, grid, row, scrollable, svg, text},
+        widget::{button, column, container, grid, row, scrollable, space, svg, text},
     };
     use iced_font_awesome::fa_icon_solid;
 
@@ -243,23 +269,21 @@ mod view_helper {
         .into()
     }
 
-    /// Always available above the integration list, so more integrations can be
-    /// added once the first exists.
+    /// Always available above the source list, so more sources can be added
+    /// once the first exists.
     fn add_integration_button<'a>() -> Element<'a, Message> {
         button(
-            row![
-                fa_icon_solid("plus").size(14.0_f32),
-                text("Add Integration")
-            ]
-            .spacing(6)
-            .align_y(Center),
+            row![fa_icon_solid("plus").size(14.0_f32), text("Add Source")]
+                .spacing(6)
+                .align_y(Center),
         )
         .on_press(Message::AddIntegrationPressed)
         .into()
     }
 
+    /// A source, clickable to open its collections.
     fn integration_row<'a>(integration: &'a IntegrationModel) -> Element<'a, Message> {
-        container(
+        button(
             row![
                 icon_badge(integration_icon(integration.integration_type)),
                 column![
@@ -269,21 +293,33 @@ mod view_helper {
                         .style(text::secondary),
                 ]
                 .spacing(4),
+                space::horizontal(),
+                fa_icon_solid("chevron-right").size(12.0_f32),
             ]
             .spacing(12)
             .align_y(Center)
-            .padding(12),
+            .padding(6),
         )
         .width(Fill)
-        .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(
-                theme.extended_palette().background.weak.color,
-            )),
-            border: Border {
-                radius: 8.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
+        .on_press(Message::SourceSelected(integration.id.clone()))
+        .style(|theme: &Theme, status| {
+            let palette = theme.extended_palette();
+            let background = match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    palette.background.strong.color
+                }
+                _ => palette.background.weak.color,
+            };
+
+            button::Style {
+                background: Some(Background::Color(background)),
+                text_color: palette.background.base.text,
+                border: Border {
+                    radius: 8.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            }
         })
         .into()
     }
@@ -309,6 +345,7 @@ mod view_helper {
         match integration_type {
             IntegrationType::Kavita => icons::KAVITA,
             IntegrationType::Komga => icons::KOMGA,
+            IntegrationType::LocalFolder => icons::FOLDER,
             IntegrationType::Opds => icons::OPDS,
             IntegrationType::Suwayomi => icons::SUWAYOMI,
         }
@@ -322,10 +359,8 @@ mod view_helper {
                 .style(|theme: &Theme, _status| svg::Style {
                     color: Some(theme.extended_palette().background.neutral.color),
                 }),
-            text(
-                "Você não tem nenhuma integração cadastrada, adicione uma integração com algum serviço"
-            ),
-            button("Add Integration").on_press(Message::AddIntegrationPressed)
+            text("Você não tem nenhuma fonte cadastrada, adicione uma pasta local ou um servidor"),
+            button("Add Source").on_press(Message::AddIntegrationPressed)
         ]
         .spacing(20)
         .max_width(420)
@@ -337,31 +372,42 @@ mod view_helper {
     pub fn choose_type<'a>() -> Element<'a, Message> {
         container(column![
             grid(type_squares())
-            .columns(2)
-            .height(256.0)
-            .width(256.0)
-            .spacing(25),
+                .columns(3)
+                .height(256.0)
+                .width(384.0)
+                .spacing(25),
         ])
         .center(Fill)
         .into()
     }
 
-    /// One square per integration type built into this binary.
+    /// One square per source type built into this binary. Local folders always
+    /// are.
     fn type_squares<'a>() -> Vec<Element<'a, Message>> {
-        #[allow(unused_mut)]
-        let mut squares = Vec::new();
+        let mut squares = vec![type_square(
+            "Local folder",
+            icons::FOLDER,
+            IntegrationType::LocalFolder,
+        )];
         #[cfg(feature = "kavita")]
-        squares.push(type_square("Kavita", icons::KAVITA, IntegrationType::Kavita));
+        squares.push(type_square(
+            "Kavita",
+            icons::KAVITA,
+            IntegrationType::Kavita,
+        ));
         #[cfg(feature = "komga")]
         squares.push(type_square("Komga", icons::KOMGA, IntegrationType::Komga));
         #[cfg(feature = "opds")]
         squares.push(type_square("OPDS", icons::OPDS, IntegrationType::Opds));
         #[cfg(feature = "suwayomi")]
-        squares.push(type_square("Suwayomi", icons::SUWAYOMI, IntegrationType::Suwayomi));
+        squares.push(type_square(
+            "Suwayomi",
+            icons::SUWAYOMI,
+            IntegrationType::Suwayomi,
+        ));
         squares
     }
 
-    #[allow(dead_code)]
     fn type_square<'a>(
         name: &'a str,
         logo: &'static [u8],
@@ -400,6 +446,7 @@ mod tests {
             api_key: Some("api-key".to_string()),
             username: None,
             password: None,
+            folder: None,
         }
     }
 
@@ -411,7 +458,7 @@ mod tests {
 
         let mut ui = simulator(integrations.view());
 
-        assert!(ui.find("Add Integration").is_err());
+        assert!(ui.find("Add Source").is_err());
     }
 
     #[test]
@@ -422,7 +469,7 @@ mod tests {
 
         let mut ui = simulator(integrations.view());
 
-        assert!(ui.find("Add Integration").is_ok());
+        assert!(ui.find("Add Source").is_ok());
     }
 
     #[test]
@@ -474,8 +521,8 @@ mod tests {
 
         let mut ui = simulator(integrations.view());
         let _ = ui
-            .click("Add Integration")
-            .expect("Add Integration button should be found");
+            .click("Add Source")
+            .expect("Add Source button should be found");
 
         let messages: Vec<_> = ui.into_messages().collect();
 
@@ -490,12 +537,77 @@ mod tests {
 
         let mut ui = simulator(integrations.view());
         let _ = ui
-            .click("Add Integration")
-            .expect("Add Integration button should be found");
+            .click("Add Source")
+            .expect("Add Source button should be found");
 
         let messages: Vec<_> = ui.into_messages().collect();
 
         assert_eq!(messages, vec![Message::AddIntegrationPressed]);
+    }
+
+    #[test]
+    fn clicking_a_source_sends_source_selected() {
+        let integrations = Integrations {
+            step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui.click("My Kavita").expect("source row should be found");
+
+        assert_eq!(
+            ui.into_messages().collect::<Vec<_>>(),
+            vec![Message::SourceSelected("id".to_string())]
+        );
+    }
+
+    #[test]
+    fn selecting_a_source_opens_it() {
+        let mut integrations = Integrations::default();
+
+        let action = integrations.update(Message::SourceSelected("id".to_string()));
+
+        assert!(matches!(action, Action::OpenSource(id) if id == "id"));
+    }
+
+    #[test]
+    fn view_choose_type_always_offers_local_folders() {
+        let integrations = Integrations {
+            step: Step::ChooseType,
+        };
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui
+            .click("Local folder")
+            .expect("Local folder square should be found");
+
+        assert_eq!(
+            ui.into_messages().collect::<Vec<_>>(),
+            vec![Message::TypeSelected(IntegrationType::LocalFolder)]
+        );
+    }
+
+    #[test]
+    fn update_type_selected_local_folder_shows_its_form() {
+        let mut integrations = Integrations::default();
+
+        let action = integrations.update(Message::TypeSelected(IntegrationType::LocalFolder));
+
+        assert!(matches!(action, Action::None));
+        assert!(matches!(integrations.step, Step::LocalFolder(_)));
+    }
+
+    #[test]
+    fn update_local_folder_created_returns_to_the_list_and_reloads() {
+        let mut integrations = Integrations {
+            step: Step::LocalFolder(LocalFolder::default()),
+        };
+
+        let action = integrations.update(Message::LocalFolder(local_folder::Message::Created(Ok(
+            integration_model("Comics"),
+        ))));
+
+        assert!(matches!(action, Action::Run(_)));
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
     }
 
     #[test]

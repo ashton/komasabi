@@ -17,18 +17,20 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use iced::animation::{Animation, Easing};
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::keyboard::{self, Key, key::Named};
-use iced::animation::{Animation, Easing};
 use iced::time::{Duration, Instant};
 use iced::widget::{
     button, column, container, float, image, mouse_area, opaque, row, space, stack, text,
 };
 use iced::{
-    Color, ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task, Vector,
+    Border, Color, ContentFit, Element, Length::Fill, Radians, Rotation, Subscription, Task, Vector,
 };
 
-use crate::{EventSender, ReaderCommand, ReaderEvent, ReaderLink};
+use crate::{
+    AdjacentEntry, Direction, EntryKind, EventSender, ReaderCommand, ReaderEvent, ReaderLink,
+};
 
 const ZOOM_STEP: f32 = 1.25;
 const MIN_ZOOM: f32 = 0.1;
@@ -45,6 +47,10 @@ const CACHE_CAPACITY: usize = 9;
 const CHROME_VISIBLE_FOR: Duration = Duration::from_secs(5);
 /// How long the bars take to slide in or out.
 const CHROME_SLIDE: Duration = Duration::from_millis(250);
+/// Size of the adjacent entry's cover in the end-of-entry popup (2:3, like a
+/// comic cover).
+const POPUP_COVER_WIDTH: f32 = 150.0;
+const POPUP_COVER_HEIGHT: f32 = 225.0;
 const APP_ICON: &[u8] = include_bytes!("../assets/komasabi-icon.png");
 
 /// Runs the reader window until it's closed. `args` are the reader's own
@@ -124,6 +130,9 @@ struct Reader {
     /// Session title parts, shown in the header once known (hosted mode).
     series: Option<String>,
     entry: Option<String>,
+    /// Whether the session's entry is a volume or a chapter, when the host
+    /// says, to word the end-of-entry popup.
+    kind: Option<EntryKind>,
     /// Hosted mode, before `OpenSession` has arrived — there's nothing to show
     /// yet, but it isn't an empty folder either.
     awaiting_session: bool,
@@ -143,8 +152,16 @@ struct Reader {
     /// page load that finishes after the user moved on to the next entry is
     /// recognised as stale and dropped.
     session: u64,
-    /// What the host said follows this session's entry (hosted mode).
-    next: NextEntry,
+    /// What the host said comes after this session's entry (hosted mode).
+    next: Adjacent,
+    /// What the host said comes before this session's entry (hosted mode).
+    previous: Adjacent,
+    /// The popup shown when the user tried to turn past the last page
+    /// (`Next`) or the first (`Previous`), offering the entry that way.
+    popup: Option<Direction>,
+    /// Set once the user asked to open the entry that way, until the host
+    /// opens its session (or offers it again, when it couldn't).
+    opening: Option<Direction>,
     /// Whether the top and bottom bars ("chrome") are shown, animated so they
     /// slide in and out. Hidden until the user taps the middle of the page.
     chrome: Animation<bool>,
@@ -156,18 +173,34 @@ struct Reader {
     now: Instant,
 }
 
-/// What follows the entry being read, as far as the reader knows. The host
-/// looks it up when the user reaches the last page.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NextEntry {
+/// The entry on one side of the one being read, as far as the reader knows.
+/// The host looks it up when the user reaches that end of the entry.
+#[derive(Debug, Clone, PartialEq)]
+enum Adjacent {
     /// Not known (yet): the host hasn't answered, or there's no host at all.
     Unknown,
-    /// The host has the entry with this label ready to open next.
-    Available(String),
-    /// The user asked to open the next entry; waiting for its session.
-    Opening(String),
-    /// The host found nothing after this entry.
+    /// The host has this entry ready to open.
+    Available(Offer),
+    /// The host found nothing on that side.
     None,
+}
+
+/// An adjacent entry the reader can offer, with its cover ready to draw.
+#[derive(Debug, Clone, PartialEq)]
+struct Offer {
+    label: String,
+    kind: EntryKind,
+    cover: Option<image::Handle>,
+}
+
+impl From<AdjacentEntry> for Offer {
+    fn from(entry: AdjacentEntry) -> Self {
+        Self {
+            label: entry.label,
+            kind: entry.kind,
+            cover: entry.cover.map(image::Handle::from_path),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -188,8 +221,10 @@ enum Message {
         index: usize,
         handle: Option<image::Handle>,
     },
-    /// The user accepted the offer to read the next entry.
-    ReadNext,
+    /// The user accepted the popup's offer, to read the entry it shows.
+    OpenAdjacent,
+    /// The user closed the popup, staying on the entry being read.
+    DismissPopup,
     /// The middle of the page was clicked or tapped: show the bars, or hide
     /// them if they're showing.
     ToggleChrome,
@@ -256,6 +291,7 @@ impl Reader {
             inflight: HashSet::new(),
             series: None,
             entry: None,
+            kind: None,
             awaiting_session: false,
             zoom: 1.0,
             rotation_quarters: 0,
@@ -264,7 +300,10 @@ impl Reader {
             events_socket,
             error: None,
             session: 0,
-            next: NextEntry::Unknown,
+            next: Adjacent::Unknown,
+            previous: Adjacent::Unknown,
+            popup: None,
+            opening: None,
             chrome: Animation::new(false)
                 .duration(CHROME_SLIDE)
                 .easing(Easing::EaseOutCubic),
@@ -311,10 +350,16 @@ impl Reader {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Next => self.go_to(self.current + 1),
-            Message::Prev => self.go_to(self.current.saturating_sub(1)),
-            Message::First => self.go_to(0),
-            Message::Last => self.go_to(self.pages.len().saturating_sub(1)),
+            Message::Next => self.turn(Direction::Next),
+            Message::Prev => self.turn(Direction::Previous),
+            Message::First => {
+                self.popup = None;
+                self.go_to(0)
+            }
+            Message::Last => {
+                self.popup = None;
+                self.go_to(self.pages.len().saturating_sub(1))
+            }
             Message::ZoomIn => {
                 self.zoom = (self.zoom * ZOOM_STEP).min(MAX_ZOOM);
                 Task::none()
@@ -379,10 +424,15 @@ impl Reader {
                 Task::none()
             }
             Message::Command(command) => self.handle_command(command),
-            Message::ReadNext => {
-                if let NextEntry::Available(label) = &self.next {
-                    self.next = NextEntry::Opening(label.clone());
-                    self.events.send(ReaderEvent::OpenNext);
+            Message::OpenAdjacent => {
+                if let Some(direction) = self.popup {
+                    self.open_adjacent(direction);
+                }
+                Task::none()
+            }
+            Message::DismissPopup => {
+                if self.opening.is_none() {
+                    self.popup = None;
                 }
                 Task::none()
             }
@@ -398,21 +448,28 @@ impl Reader {
                 series,
                 entry,
                 pages,
+                kind,
                 dir,
+                start_page,
             } => {
                 if let Some(dir) = dir {
-                    // The next entry: a new folder, read from its first page,
-                    // with nothing of the previous entry's carried over.
+                    // An adjacent entry: a new folder, read from the page the
+                    // host asks for, with nothing of the previous entry's
+                    // carried over.
                     self.dir = dir;
-                    self.start_page = 0;
+                    self.start_page = start_page;
                     self.ready.clear();
                     self.cache = PageCache::new(CACHE_CAPACITY);
                     self.inflight.clear();
                 }
                 self.session += 1;
-                self.next = NextEntry::Unknown;
+                self.next = Adjacent::Unknown;
+                self.previous = Adjacent::Unknown;
+                self.popup = None;
+                self.opening = None;
                 self.series = Some(series);
                 self.entry = Some(entry);
+                self.kind = kind;
                 self.pages = (0..pages).map(|i| self.page_path(i)).collect();
                 self.current = self.start_page.min(pages.saturating_sub(1));
                 self.awaiting_session = false;
@@ -432,20 +489,83 @@ impl Reader {
                 }
                 Task::none()
             }
-            ReaderCommand::NextEntry { label } => {
-                self.next = match label {
-                    Some(label) => NextEntry::Available(label),
-                    None => NextEntry::None,
+            ReaderCommand::Adjacent { direction, entry } => {
+                *self.adjacent_mut(direction) = match entry {
+                    Some(entry) => Adjacent::Available(entry.into()),
+                    None => Adjacent::None,
                 };
+                // An answer while opening means the host couldn't open it and
+                // is offering it again.
+                if self.opening == Some(direction) {
+                    self.opening = None;
+                }
                 Task::none()
             }
         }
     }
 
-    /// Whether the reader is on the session's last page, where the next entry is
-    /// offered.
-    fn on_last_page(&self) -> bool {
-        !self.pages.is_empty() && self.current + 1 == self.pages.len()
+    fn adjacent(&self, direction: Direction) -> &Adjacent {
+        match direction {
+            Direction::Next => &self.next,
+            Direction::Previous => &self.previous,
+        }
+    }
+
+    fn adjacent_mut(&mut self, direction: Direction) -> &mut Adjacent {
+        match direction {
+            Direction::Next => &mut self.next,
+            Direction::Previous => &mut self.previous,
+        }
+    }
+
+    /// Whether the reader is on the page at the `direction` end of the session:
+    /// its last page going forward, its first going back.
+    fn at_end(&self, direction: Direction) -> bool {
+        !self.pages.is_empty()
+            && match direction {
+                Direction::Next => self.current + 1 == self.pages.len(),
+                Direction::Previous => self.current == 0,
+            }
+    }
+
+    /// A page turn in `direction`. Within the entry it just turns the page. At
+    /// that end of a hosted session it pops up what lies beyond instead, and a
+    /// second turn the same way opens it. A turn the other way while the popup
+    /// is up only closes it.
+    fn turn(&mut self, direction: Direction) -> Task<Message> {
+        if self.opening.is_some() {
+            return Task::none();
+        }
+        match self.popup {
+            Some(shown) if shown == direction => {
+                self.open_adjacent(direction);
+                return Task::none();
+            }
+            Some(_) => {
+                self.popup = None;
+                return Task::none();
+            }
+            None => {}
+        }
+
+        if self.events_socket.is_some() && self.at_end(direction) {
+            self.popup = Some(direction);
+            return Task::none();
+        }
+
+        match direction {
+            Direction::Next => self.go_to(self.current + 1),
+            Direction::Previous => self.go_to(self.current.saturating_sub(1)),
+        }
+    }
+
+    /// Asks the host to open the entry on the `direction` side, if it offered
+    /// one.
+    fn open_adjacent(&mut self, direction: Direction) {
+        if self.opening.is_none() && matches!(self.adjacent(direction), Adjacent::Available(_)) {
+            self.opening = Some(direction);
+            self.events.send(ReaderEvent::OpenAdjacent { direction });
+        }
     }
 
     /// The on-disk path for page `index`, under the session folder.
@@ -457,9 +577,9 @@ impl Reader {
     /// a `ShowingPage` event and kicks off the background loads for the new page
     /// and its neighbours; the handle itself arrives later via `PageLoaded`.
     fn go_to(&mut self, page: usize) -> Task<Message> {
-        // While the next entry is opening, a page turn would be reported to the
-        // host as a page of the entry it's about to start.
-        if self.pages.is_empty() || matches!(self.next, NextEntry::Opening(_)) {
+        // While an adjacent entry is opening, a page turn would be reported to
+        // the host as a page of the entry it's about to start.
+        if self.pages.is_empty() || self.opening.is_some() {
             return Task::none();
         }
 
@@ -560,6 +680,9 @@ impl Reader {
         if let Some(chrome) = self.chrome() {
             layers = layers.push(chrome);
         }
+        if let Some(popup) = self.popup() {
+            layers = layers.push(popup);
+        }
         layers.into()
     }
 
@@ -568,7 +691,7 @@ impl Reader {
         self.chrome.value() || self.chrome.is_animating(self.now)
     }
 
-    /// The top bar (title) and bottom bars (end-of-entry offer, status) laid
+    /// The top bar (title) and bottom bar (status) laid
     /// over the page, each slid off its edge of the window by how far the
     /// chrome is from fully shown. `None` while they're fully hidden, so
     /// nothing covers the page.
@@ -586,11 +709,7 @@ impl Reader {
             top = top.push(header);
         }
 
-        let mut bottom = column![].width(Fill);
-        if let Some(end_bar) = self.end_bar() {
-            bottom = bottom.push(end_bar);
-        }
-        bottom = bottom.push(self.status_bar());
+        let bottom = column![self.status_bar()].width(Fill);
 
         // `opaque` keeps a tap on a bar from reaching the page-turn zones
         // underneath it.
@@ -607,38 +726,73 @@ impl Reader {
         )
     }
 
-    /// On the last page of a hosted session, a bar about what comes next: a
-    /// button to read the next entry when the host has one, or a note that this
-    /// was the last one. Absent elsewhere, and in standalone mode (no host to
-    /// ask).
-    fn end_bar(&self) -> Option<Element<'_, Message>> {
-        if self.events_socket.is_none() || !self.on_last_page() {
-            return None;
+    /// The popup shown when the user tried to turn past an end of the entry:
+    /// over a dimmed backdrop, a centred note that the entry ended (or starts
+    /// here, going back) and the entry beyond it, as a cover to click; or that
+    /// there is none. A click on the backdrop closes it. `None` while closed.
+    fn popup(&self) -> Option<Element<'_, Message>> {
+        let direction = self.popup?;
+        let noun = self.kind.map_or("entry", EntryKind::noun);
+
+        let mut card = column![].spacing(14).align_x(iced::Center);
+        match self.adjacent(direction) {
+            Adjacent::Unknown => {
+                card = card
+                    .push(text(end_message(direction, noun)).size(20))
+                    .push(text("Looking for what's next…").size(14));
+            }
+            Adjacent::None => {
+                let missing = match direction {
+                    Direction::Next => format!("This {noun} ended, there is no next {noun}."),
+                    Direction::Previous => {
+                        format!("This is the first {noun}, there is no previous {noun}.")
+                    }
+                };
+                card = card.push(text(missing).size(20));
+            }
+            Adjacent::Available(offer) => {
+                let heading = match direction {
+                    Direction::Next => format!("This {noun} ended, next one:"),
+                    Direction::Previous => format!("This {noun} starts here, previous one:"),
+                };
+                let opening = self.opening == Some(direction);
+                let cover = button(offer_cover(offer))
+                    .padding(0)
+                    .style(|_, _| button::Style::default())
+                    .on_press_maybe((!opening).then_some(Message::OpenAdjacent));
+                let caption = if opening {
+                    format!("Opening {}…", offer.label)
+                } else {
+                    offer.label.clone()
+                };
+                card = card
+                    .push(text(heading).size(20))
+                    .push(cover)
+                    .push(text(caption).size(16));
+            }
         }
 
-        let end = match &self.entry {
-            Some(entry) => format!("End of {entry}"),
-            None => "The end".to_string(),
-        };
+        let card = container(card)
+            .padding(24)
+            .max_width(480)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgba(0.08, 0.08, 0.08, 0.9).into()),
+                text_color: Some(Color::WHITE),
+                border: Border::default().rounded(12),
+                ..container::Style::default()
+            });
 
-        let offer: Element<'_, Message> = match &self.next {
-            NextEntry::Unknown => text("Looking for what's next…").size(13).into(),
-            NextEntry::Available(label) => button(text(format!("Read next: {label}  →")).size(14))
-                .on_press(Message::ReadNext)
-                .into(),
-            NextEntry::Opening(label) => text(format!("Opening {label}…")).size(13).into(),
-            NextEntry::None => text("That's the last one available").size(13).into(),
-        };
-
-        Some(
-            container(
-                row![text(end).size(14), space().width(Fill), offer]
-                    .spacing(12)
-                    .align_y(iced::Center),
-            )
-            .padding([6, 8])
-            .into(),
-        )
+        // `opaque` keeps a click on the card from reaching the backdrop (and
+        // closing the popup), and one on the backdrop from turning the page.
+        let backdrop =
+            container(opaque(card))
+                .center(Fill)
+                .padding(16)
+                .style(|_| container::Style {
+                    background: Some(Color::from_rgba(0.0, 0.0, 0.0, 0.6).into()),
+                    ..container::Style::default()
+                });
+        Some(opaque(mouse_area(backdrop).on_press(Message::DismissPopup)))
     }
 
     /// The title line: `series — entry` once the host has told us what we're
@@ -759,6 +913,45 @@ fn chrome_bar<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Messa
         .into()
 }
 
+/// The popup's note while what lies beyond the `direction` end of the entry
+/// isn't known yet.
+fn end_message(direction: Direction, noun: &str) -> String {
+    match direction {
+        Direction::Next => format!("This {noun} ended"),
+        Direction::Previous => format!("This {noun} starts here"),
+    }
+}
+
+/// An offered entry's cover at thumbnail size, or a plain box with its kind
+/// when the host had no cover for it.
+fn offer_cover(offer: &Offer) -> Element<'_, Message> {
+    fn frame<'a>(content: Element<'a, Message>) -> container::Container<'a, Message> {
+        container(content)
+            .width(POPUP_COVER_WIDTH)
+            .height(POPUP_COVER_HEIGHT)
+            .center_x(POPUP_COVER_WIDTH)
+            .center_y(POPUP_COVER_HEIGHT)
+            .clip(true)
+    }
+    match &offer.cover {
+        Some(cover) => frame(
+            image(cover.clone())
+                .width(Fill)
+                .height(Fill)
+                .content_fit(ContentFit::Cover)
+                .into(),
+        )
+        .into(),
+        None => frame(text(offer.kind.noun()).size(14).into())
+            .style(|_| container::Style {
+                background: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.1).into()),
+                border: Border::default().rounded(6),
+                ..container::Style::default()
+            })
+            .into(),
+    }
+}
+
 /// A task that reports [`Message::HideChrome`] for the `shown`th showing of the
 /// bars once `after` has passed. Sleeps on its own thread, so it needs no async
 /// timer from the executor.
@@ -787,7 +980,8 @@ fn key_message(event: keyboard::Event) -> Option<Message> {
         Key::Named(Named::ArrowLeft | Named::Backspace | Named::PageUp) => Some(Message::Prev),
         Key::Named(Named::Home) => Some(Message::First),
         Key::Named(Named::End) => Some(Message::Last),
-        Key::Named(Named::Enter) => Some(Message::ReadNext),
+        Key::Named(Named::Enter) => Some(Message::OpenAdjacent),
+        Key::Named(Named::Escape) => Some(Message::DismissPopup),
         Key::Character(c) => match c.as_str() {
             "+" | "=" => Some(Message::ZoomIn),
             "-" | "_" => Some(Message::ZoomOut),
@@ -1263,7 +1457,9 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 5".to_string(),
             pages: 5,
+            kind: None,
             dir: None,
+            start_page: 0,
         }));
 
         assert_eq!(reader.pages.len(), 5);
@@ -1273,15 +1469,17 @@ mod tests {
         assert!(!reader.awaiting_session);
     }
 
-    /// A hosted reader with an open `pages`-page session, sitting on its last
-    /// page.
+    /// A hosted reader with an open `pages`-page session of a volume, sitting
+    /// on its last page.
     fn hosted_on_last_page(pages: usize) -> Reader {
         let mut reader = hosted_reader();
         let _ = reader.update(Message::Command(ReaderCommand::OpenSession {
             series: "One Piece".to_string(),
             entry: "Volume 5".to_string(),
             pages,
+            kind: Some(EntryKind::Volume),
             dir: None,
+            start_page: 0,
         }));
         let _ = reader.update(Message::Last);
         reader
@@ -1297,55 +1495,161 @@ mod tests {
         ui.find(label).is_ok()
     }
 
+    fn offer(direction: Direction, label: &str) -> Message {
+        Message::Command(ReaderCommand::Adjacent {
+            direction,
+            entry: Some(AdjacentEntry {
+                label: label.to_string(),
+                kind: EntryKind::Volume,
+                cover: None,
+            }),
+        })
+    }
+
     #[test]
-    fn the_last_page_offers_the_next_entry_once_the_host_has_one() {
+    fn turning_past_the_last_page_pops_up_the_next_entry() {
         let mut reader = hosted_on_last_page(3);
-        show_chrome(&mut reader);
+        assert!(reader.popup().is_none(), "no popup just for being there");
+
+        let _ = reader.update(Message::Next);
+        assert_eq!(reader.current, 2);
+        assert!(shows(&reader, "This volume ended"));
         assert!(shows(&reader, "Looking for what's next…"));
 
-        let _ = reader.update(Message::Command(ReaderCommand::NextEntry {
-            label: Some("Volume 6".to_string()),
-        }));
-        assert!(shows(&reader, "Read next: Volume 6  →"));
+        let _ = reader.update(offer(Direction::Next, "Volume 6"));
+        assert!(shows(&reader, "This volume ended, next one:"));
+        assert!(shows(&reader, "Volume 6"));
+    }
 
+    #[test]
+    fn the_popup_says_when_there_is_no_next_entry() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::Command(ReaderCommand::Adjacent {
+            direction: Direction::Next,
+            entry: None,
+        }));
+        let _ = reader.update(Message::Next);
+
+        assert!(shows(
+            &reader,
+            "This volume ended, there is no next volume."
+        ));
+    }
+
+    #[test]
+    fn turning_back_past_the_first_page_pops_up_the_previous_entry() {
+        let mut reader = hosted_on_last_page(3);
         let _ = reader.update(Message::First);
-        assert!(
-            !shows(&reader, "Read next: Volume 6  →"),
-            "only offered on the last page"
-        );
-    }
+        let _ = reader.update(offer(Direction::Previous, "Volume 4"));
 
-    #[test]
-    fn the_last_page_says_when_nothing_follows() {
-        let mut reader = hosted_on_last_page(3);
-        let _ = reader.update(Message::Command(ReaderCommand::NextEntry { label: None }));
-        show_chrome(&mut reader);
+        let _ = reader.update(Message::Prev);
+        assert_eq!(reader.popup, Some(Direction::Previous));
+        assert!(shows(&reader, "This volume starts here, previous one:"));
+        assert!(shows(&reader, "Volume 4"));
 
-        assert!(shows(&reader, "That's the last one available"));
-    }
-
-    #[test]
-    fn standalone_reader_offers_nothing_on_the_last_page() {
-        let mut reader = reader_with(2);
-        let _ = reader.update(Message::Last);
-
-        assert!(reader.end_bar().is_none());
-    }
-
-    #[test]
-    fn read_next_only_acts_on_an_available_entry() {
-        let mut reader = hosted_on_last_page(3);
-        let _ = reader.update(Message::ReadNext);
-        assert_eq!(reader.next, NextEntry::Unknown, "nothing offered yet");
-
-        let _ = reader.update(Message::Command(ReaderCommand::NextEntry {
-            label: Some("Volume 6".to_string()),
+        let _ = reader.update(Message::Command(ReaderCommand::Adjacent {
+            direction: Direction::Previous,
+            entry: None,
         }));
-        let _ = reader.update(Message::ReadNext);
-        assert_eq!(reader.next, NextEntry::Opening("Volume 6".to_string()));
+        assert!(shows(
+            &reader,
+            "This is the first volume, there is no previous volume."
+        ));
+    }
+
+    #[test]
+    fn a_turn_the_other_way_or_escape_closes_the_popup() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::Next);
+        let _ = reader.update(Message::Prev);
+        assert_eq!(reader.popup, None);
+        assert_eq!(reader.current, 2, "closing the popup doesn't turn the page");
+
+        let _ = reader.update(Message::Next);
+        let _ = reader.update(Message::DismissPopup);
+        assert_eq!(reader.popup, None);
+    }
+
+    #[test]
+    fn a_click_on_the_backdrop_closes_the_popup_but_one_on_the_cover_opens_it() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(offer(Direction::Next, "Volume 6"));
+        let _ = reader.update(Message::Next);
+
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(900.0, 600.0),
+            reader.view(),
+        );
+        // The backdrop, over the "next page" zone.
+        ui.point_at(iced::Point::new(880.0, 300.0));
+        let _ = ui.simulate(iced_test::simulator::click());
+        let _ = ui.click("Volume 6");
+        let messages: Vec<_> = ui
+            .into_messages()
+            .map(|message| format!("{message:?}"))
+            .collect();
+        assert_eq!(messages, ["DismissPopup"], "the label isn't the button");
+
+        // The middle of the window is the cover.
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            iced::Size::new(900.0, 600.0),
+            reader.view(),
+        );
+        ui.point_at(iced::Point::new(450.0, 300.0));
+        let _ = ui.simulate(iced_test::simulator::click());
+        let messages: Vec<_> = ui
+            .into_messages()
+            .map(|message| format!("{message:?}"))
+            .collect();
+        assert_eq!(messages, ["OpenAdjacent"]);
+    }
+
+    #[test]
+    fn standalone_reader_has_no_popup_at_either_end() {
+        let mut reader = reader_with(2);
+        let _ = reader.update(Message::Prev);
+        assert_eq!(reader.popup, None);
+        let _ = reader.update(Message::Last);
+        let _ = reader.update(Message::Next);
+        assert_eq!(reader.popup, None);
+    }
+
+    #[test]
+    fn a_second_turn_opens_only_an_offered_entry() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::Next);
+        let _ = reader.update(Message::Next);
+        assert_eq!(reader.opening, None, "nothing offered yet");
+
+        let _ = reader.update(offer(Direction::Next, "Volume 6"));
+        let _ = reader.update(Message::Next);
+        assert_eq!(reader.opening, Some(Direction::Next));
 
         let _ = reader.update(Message::Prev);
         assert_eq!(reader.current, 2, "no page turns while the next one opens");
+        assert_eq!(reader.popup, Some(Direction::Next), "and the popup stays");
+        assert!(shows(&reader, "Opening Volume 6…"));
+
+        // The host couldn't open it, and offers it again.
+        let _ = reader.update(offer(Direction::Next, "Volume 6"));
+        assert_eq!(reader.opening, None);
+    }
+
+    #[test]
+    fn a_previous_entry_opens_on_its_last_page() {
+        let mut reader = hosted_on_last_page(3);
+        let _ = reader.update(Message::Command(ReaderCommand::OpenSession {
+            series: "One Piece".to_string(),
+            entry: "Volume 4".to_string(),
+            pages: 6,
+            kind: Some(EntryKind::Volume),
+            dir: Some(PathBuf::from("previous-volume")),
+            start_page: 5,
+        }));
+        assert_eq!(reader.current, 5);
+        assert_eq!(reader.popup, None);
     }
 
     #[test]
@@ -1359,7 +1663,9 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 6".to_string(),
             pages: 4,
+            kind: Some(EntryKind::Volume),
             dir: Some(PathBuf::from("next-volume")),
+            start_page: 0,
         }));
 
         assert_eq!(reader.dir, PathBuf::from("next-volume"));
@@ -1368,7 +1674,8 @@ mod tests {
         assert_eq!(reader.entry.as_deref(), Some("Volume 6"));
         assert!(reader.ready.is_empty());
         assert!(!reader.cache.contains(2));
-        assert_eq!(reader.next, NextEntry::Unknown);
+        assert_eq!(reader.next, Adjacent::Unknown);
+        assert_eq!(reader.previous, Adjacent::Unknown);
 
         // A load of the previous entry's page that lands now is dropped.
         let _ = reader.update(Message::PageLoaded {
@@ -1386,7 +1693,9 @@ mod tests {
             series: "S".to_string(),
             entry: "E".to_string(),
             pages: 5,
+            kind: None,
             dir: None,
+            start_page: 0,
         }));
         // Nothing is on disk yet, so the opening page can't load.
         assert!(reader.ready.is_empty());

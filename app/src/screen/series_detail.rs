@@ -5,9 +5,10 @@ use iced::{Element, Task};
 
 use crate::models::{
     AsyncModel,
+    collection::CollectionRef,
     series_entry::{EntryKind, SeriesEntry, cover_key},
 };
-use crate::providers::{Provider, provider_for_library};
+use crate::providers::{Provider, provider_for_integration};
 
 /// The two tabs shown above the contents grid. `Details` carries no data of its
 /// own — it just renders the series' metadata in list form, as a counterpart
@@ -25,9 +26,10 @@ pub struct SeriesDetail {
     series_external_id: String,
     series_name: String,
     series_pages: Option<u16>,
-    /// The external id of the library the series belongs to, used to resolve
-    /// the integration to fetch entries and covers through.
-    library_external_id: String,
+    /// The collection the series was opened from, and its source: the source
+    /// is what entries and covers are fetched through, and the collection is
+    /// where "Back" returns to.
+    location: CollectionRef,
     /// The series' own (large, header) cover, once it has loaded.
     series_cover: Option<image::Handle>,
     entries: AsyncModel<Vec<SeriesEntry>, String>,
@@ -64,8 +66,8 @@ pub enum Message {
 pub enum Action {
     None,
     Run(Task<Message>),
-    /// Navigate back to the browse screen of the carried library.
-    Back(String),
+    /// Navigate back to the carried collection's series.
+    Back(CollectionRef),
 }
 
 impl SeriesDetail {
@@ -73,11 +75,11 @@ impl SeriesDetail {
         series_external_id: String,
         series_name: String,
         series_pages: Option<u16>,
-        library_external_id: String,
+        location: CollectionRef,
     ) -> (Self, Task<Message>) {
         let entries_task = Task::perform(
             crate::runtime::on_tokio(fetch_entries(
-                library_external_id.clone(),
+                location.integration_id.clone(),
                 series_external_id.clone(),
             )),
             Message::EntriesLoaded,
@@ -85,7 +87,7 @@ impl SeriesDetail {
 
         let cover_task = Task::perform(
             crate::runtime::on_tokio(fetch_series_cover(
-                library_external_id.clone(),
+                location.integration_id.clone(),
                 series_external_id.clone(),
             )),
             Message::SeriesCoverLoaded,
@@ -96,7 +98,7 @@ impl SeriesDetail {
                 series_external_id,
                 series_name,
                 series_pages,
-                library_external_id,
+                location,
                 series_cover: None,
                 entries: AsyncModel::Loading,
                 covers: HashMap::new(),
@@ -145,7 +147,7 @@ impl SeriesDetail {
                 Action::None
             }
 
-            Message::BackPressed => Action::Back(self.library_external_id.clone()),
+            Message::BackPressed => Action::Back(self.location.clone()),
 
             Message::EntrySelected(entry) => {
                 // Ignore clicks while a launch is already in flight; the reader
@@ -159,7 +161,7 @@ impl SeriesDetail {
 
                 Action::Run(Task::perform(
                     crate::runtime::on_tokio(crate::reader_launch::prepare_and_launch(
-                        self.library_external_id.clone(),
+                        self.location.integration_id.clone(),
                         self.series_external_id.clone(),
                         self.series_name.clone(),
                         entry,
@@ -223,7 +225,7 @@ impl SeriesDetail {
 
         Some(Task::perform(
             crate::runtime::on_tokio(fetch_entry_covers(
-                self.library_external_id.clone(),
+                self.location.integration_id.clone(),
                 pending,
             )),
             Message::CoversLoaded,
@@ -232,20 +234,17 @@ impl SeriesDetail {
 }
 
 async fn fetch_entries(
-    library_external_id: String,
+    integration_id: String,
     series_external_id: String,
 ) -> Result<Vec<SeriesEntry>, String> {
-    let (provider, _namespace) = provider_for_library(&library_external_id).await?;
+    let (provider, _namespace) = provider_for_integration(&integration_id).await?;
     provider.list_series_entries(&series_external_id).await
 }
 
 /// Fetches the series' own cover, returning `None` on any error (a missing
 /// header cover just renders the placeholder box rather than failing the page).
-async fn fetch_series_cover(
-    library_external_id: String,
-    series_external_id: String,
-) -> Option<Vec<u8>> {
-    let (provider, namespace) = provider_for_library(&library_external_id).await.ok()?;
+async fn fetch_series_cover(integration_id: String, series_external_id: String) -> Option<Vec<u8>> {
+    let (provider, namespace) = provider_for_integration(&integration_id).await.ok()?;
     provider.cover(&namespace, &series_external_id).await.ok()
 }
 
@@ -253,10 +252,10 @@ async fn fetch_series_cover(
 /// one that resolved. Per-entry and whole-batch failures are logged and omitted
 /// rather than surfaced, so a partial result still renders what it can.
 async fn fetch_entry_covers(
-    library_external_id: String,
+    integration_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Vec<(String, Vec<u8>)> {
-    match load_entry_covers(library_external_id, entries).await {
+    match load_entry_covers(integration_id, entries).await {
         Ok(covers) => covers,
         Err(error) => {
             tracing::debug!("failed to load entry covers: {error}");
@@ -266,10 +265,10 @@ async fn fetch_entry_covers(
 }
 
 async fn load_entry_covers(
-    library_external_id: String,
+    integration_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (provider, namespace) = provider_for_library(&library_external_id).await?;
+    let (provider, namespace) = provider_for_integration(&integration_id).await?;
 
     let mut covers = Vec::new();
     for (external_id, kind) in entries {
@@ -757,12 +756,23 @@ mod tests {
         }
     }
 
+    fn location() -> CollectionRef {
+        CollectionRef {
+            integration_id: "source-1".to_string(),
+            collection: crate::models::collection::Collection::new(
+                "lib-1",
+                "Manga",
+                crate::models::collection::CollectionKind::Library,
+            ),
+        }
+    }
+
     fn series_detail(entries: AsyncModel<Vec<SeriesEntry>, String>) -> SeriesDetail {
         SeriesDetail {
             series_external_id: "series-1".to_string(),
             series_name: "Beneath the Trees".to_string(),
             series_pages: Some(183),
-            library_external_id: "lib-1".to_string(),
+            location: location(),
             series_cover: None,
             entries,
             covers: HashMap::new(),
@@ -779,7 +789,7 @@ mod tests {
             "1".to_string(),
             "One Piece".to_string(),
             Some(42),
-            "lib-1".to_string(),
+            location(),
         );
 
         assert!(matches!(detail.entries, AsyncModel::Loading));
@@ -926,12 +936,12 @@ mod tests {
     }
 
     #[test]
-    fn back_pressed_returns_back_with_the_library_id() {
+    fn back_pressed_returns_back_to_the_collection() {
         let mut detail = series_detail(AsyncModel::Loading);
 
         let action = detail.update(Message::BackPressed);
 
-        assert!(matches!(action, Action::Back(id) if id == "lib-1"));
+        assert!(matches!(action, Action::Back(location) if location == self::location()));
     }
 
     #[test]

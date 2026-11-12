@@ -49,6 +49,7 @@ pub async fn create(
         api_key,
         username: None,
         password: None,
+        folder: None,
     })
     .await
 }
@@ -72,6 +73,7 @@ pub async fn create_with_credentials(
         api_key: None,
         username: username.filter(|value| !value.is_empty()),
         password: password.filter(|value| !value.is_empty()),
+        folder: None,
     })
     .await
 }
@@ -95,6 +97,22 @@ pub async fn create_with_auth(
         api_key: api_key.filter(|value| !value.is_empty()),
         username: username.filter(|value| !value.is_empty()),
         password: password.filter(|value| !value.is_empty()),
+        folder: None,
+    })
+    .await
+}
+
+/// Creates a local-folder source reading the folder at `path`.
+pub async fn create_local_folder(name: String, path: String) -> Result<Integration, String> {
+    insert(Integration {
+        id: Uuid::new_v4().to_string(),
+        name,
+        integration_type: IntegrationType::LocalFolder,
+        url: None,
+        api_key: None,
+        username: None,
+        password: None,
+        folder: Some(path),
     })
     .await
 }

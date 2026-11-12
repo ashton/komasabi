@@ -20,9 +20,12 @@ impl LibraryType {
     }
 
     /// Every library type, in display order — for pickers that offer one of each.
+    #[allow(dead_code)]
     pub const ALL: [LibraryType; 3] = [LibraryType::Manga, LibraryType::Comic, LibraryType::Ebook];
 }
 
+/// A library in the user's own Library, separate from the sources' live
+/// collections. Nothing syncs into it.
 #[derive(Clone, Debug, Queryable, Selectable, Insertable, PartialEq)]
 #[diesel(table_name = libraries)]
 pub struct Library {

@@ -33,10 +33,48 @@ pub enum ReaderEvent {
     /// The user is now viewing this page (0-based), emitted on every page change.
     /// The host uses it to prioritise which pages it downloads next.
     ShowingPage { page: usize },
-    /// The user accepted the host's offer of the next entry (see
-    /// [`ReaderCommand::NextEntry`]) and wants to keep reading. The host answers
-    /// with a fresh [`ReaderCommand::OpenSession`] for it.
-    OpenNext,
+    /// The user accepted the host's offer of the entry on the `direction` side
+    /// of this one (see [`ReaderCommand::Adjacent`]) and wants to read it. The
+    /// host answers with a fresh [`ReaderCommand::OpenSession`] for it.
+    OpenAdjacent { direction: Direction },
+}
+
+/// Which way from the entry being read: towards the entries after it, or
+/// before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Next,
+    Previous,
+}
+
+/// Whether an entry is a whole volume or a single chapter, so the reader can
+/// word its messages ("This volume ended").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Volume,
+    Chapter,
+}
+
+impl EntryKind {
+    /// The lower-case noun for the kind: "volume" or "chapter".
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Volume => "volume",
+            Self::Chapter => "chapter",
+        }
+    }
+}
+
+/// An entry next to the one being read, as the host offers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdjacentEntry {
+    pub label: String,
+    pub kind: EntryKind,
+    /// An image file holding the entry's cover, when the host could get one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<PathBuf>,
 }
 
 /// A command the host sends to the reader, one JSON object per line over the
@@ -50,24 +88,37 @@ pub enum ReaderCommand {
     /// session before any page bytes exist on disk.
     ///
     /// A later `OpenSession` replaces the current session (the user moved on to
-    /// the next entry). Its `dir` is the folder the new session's pages land
+    /// an adjacent entry). Its `dir` is the folder the new session's pages land
     /// in, replacing the one the reader was launched on; the reader starts it
-    /// from its first page.
+    /// on `start_page` (the last page, when the user went back an entry).
     OpenSession {
         series: String,
         entry: String,
         pages: usize,
+        /// What the entry is; `None` when the host doesn't say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<EntryKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dir: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        start_page: usize,
     },
     /// Page `index`'s bytes have been written to the reader's folder and can now
     /// be loaded.
     PageReady { index: usize },
-    /// What follows the session's entry, looked up once the user reaches its
-    /// last page: the next entry's label, or `None` when there's nothing after
-    /// it. The reader offers to open it (answered with
-    /// [`ReaderEvent::OpenNext`]).
-    NextEntry { label: Option<String> },
+    /// The entry on the `direction` side of the session's entry, looked up once
+    /// the user reaches that end of it (its last page for the next entry, its
+    /// first for the previous one), or `None` when there's none. The reader
+    /// shows it when the user tries to turn past that end, and offers to open
+    /// it (answered with [`ReaderEvent::OpenAdjacent`]).
+    Adjacent {
+        direction: Direction,
+        entry: Option<AdjacentEntry>,
+    },
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// A handle the reader uses to emit [`ReaderEvent`]s. When connected, events are
@@ -238,7 +289,9 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 5".to_string(),
             pages: 190,
+            kind: None,
             dir: None,
+            start_page: 0,
         };
         let json = serde_json::to_string(&command).unwrap();
 
@@ -254,7 +307,9 @@ mod tests {
             series: "One Piece".to_string(),
             entry: "Volume 6".to_string(),
             pages: 180,
+            kind: Some(EntryKind::Volume),
             dir: Some(PathBuf::from("/tmp/volume-6")),
+            start_page: 179,
         };
         let json = serde_json::to_string(&command).unwrap();
 
@@ -277,20 +332,37 @@ mod tests {
     }
 
     #[test]
-    fn next_entry_and_open_next_round_trip_through_json() {
-        let command = ReaderCommand::NextEntry {
-            label: Some("Volume 6".to_string()),
+    fn adjacent_and_open_adjacent_round_trip_through_json() {
+        let command = ReaderCommand::Adjacent {
+            direction: Direction::Next,
+            entry: Some(AdjacentEntry {
+                label: "Volume 6".to_string(),
+                kind: EntryKind::Volume,
+                cover: None,
+            }),
         };
         let json = serde_json::to_string(&command).unwrap();
-        assert_eq!(json, r#"{"command":"next_entry","label":"Volume 6"}"#);
+        assert_eq!(
+            json,
+            r#"{"command":"adjacent","direction":"next","entry":{"label":"Volume 6","kind":"volume"}}"#
+        );
         assert_eq!(
             serde_json::from_str::<ReaderCommand>(&json).unwrap(),
             command
         );
 
-        let event = ReaderEvent::OpenNext;
+        let none = ReaderCommand::Adjacent {
+            direction: Direction::Previous,
+            entry: None,
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert_eq!(serde_json::from_str::<ReaderCommand>(&json).unwrap(), none);
+
+        let event = ReaderEvent::OpenAdjacent {
+            direction: Direction::Previous,
+        };
         let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(json, r#"{"event":"open_next"}"#);
+        assert_eq!(json, r#"{"event":"open_adjacent","direction":"previous"}"#);
         assert_eq!(serde_json::from_str::<ReaderEvent>(&json).unwrap(), event);
     }
 

@@ -5,9 +5,8 @@ use iced::advanced::widget::Id as WidgetId;
 use iced::widget::image;
 use iced::{Element, Task};
 
-use crate::models::{AsyncModel, library_item::LibraryItem};
-use crate::providers::{Provider, provider_for_library};
-use crate::repository::library as library_repository;
+use crate::models::{AsyncModel, collection::CollectionRef, collection_item::CollectionItem};
+use crate::providers::{Provider, provider_for_integration};
 
 /// Number of items fetched per page, and the unit eviction operates on:
 /// pages are dropped from (or re-fetched back into) memory as a whole,
@@ -31,9 +30,12 @@ const KEEP_PAGES_LOADED: usize = 4;
 /// [`measure_items_scrollable`]).
 const ITEMS_SCROLLABLE_ID: &str = "browse-items";
 
+/// A collection's series, as a paginated grid of cards.
 #[derive(Debug)]
 pub struct Browse {
-    items: AsyncModel<Vec<Option<LibraryItem>>, String>,
+    /// The collection being browsed, and its source.
+    location: CollectionRef,
+    items: AsyncModel<Vec<Option<CollectionItem>>, String>,
     pagination: Option<Pagination>,
     /// Decoded cover images, keyed by item `external_id`. Populated lazily as
     /// pages load (see [`Browse::request_page_covers`]) and pruned alongside
@@ -42,14 +44,10 @@ pub struct Browse {
     /// `external_id`s whose cover is currently being fetched, so a page isn't
     /// requested more than once per session.
     covers_in_flight: HashSet<String>,
-    /// Whether this library accepts imported items (true for local,
-    /// filesystem-backed libraries). Gates the "Import items" control.
-    importable: bool,
 }
 
 #[derive(Debug)]
 struct Pagination {
-    external_id: String,
     next_page: u32,
     page_size: u32,
     has_more: bool,
@@ -62,9 +60,9 @@ struct Pagination {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
-    ItemsLoaded(Result<Vec<LibraryItem>, String>),
-    NextPageLoaded(Result<Vec<LibraryItem>, String>),
-    PageRefetched(usize, Result<Vec<LibraryItem>, String>),
+    ItemsLoaded(Result<Vec<CollectionItem>, String>),
+    NextPageLoaded(Result<Vec<CollectionItem>, String>),
+    PageRefetched(usize, Result<Vec<CollectionItem>, String>),
     /// Cover image bytes that have been loaded for a page, keyed by item
     /// `external_id`. Failed/omitted ids are simply absent.
     CoversLoaded(Vec<(String, Vec<u8>)>),
@@ -75,7 +73,7 @@ pub enum Message {
     BackPressed,
     /// The "Import items" button was pressed; opens the file picker.
     ImportPressed,
-    /// Files chosen in the picker to import into this library (`None` if
+    /// Files chosen in the picker to import into this collection (`None` if
     /// cancelled).
     ImportSourcesPicked(Option<Vec<PathBuf>>),
     /// The import finished, carrying how many items were added (or an error).
@@ -108,33 +106,27 @@ pub enum Action {
         series_external_id: String,
         series_name: String,
         series_pages: Option<u16>,
-        library_external_id: String,
+        location: CollectionRef,
     },
-    BackPressed,
+    /// Back to the collections of this collection's source.
+    BackPressed(String),
 }
 
 impl Browse {
-    /// Opens a remote (integration-backed) library for browsing. Items can't be
-    /// imported into it, so the import control is hidden.
-    pub fn new_remote(external_id: String) -> (Self, Task<Message>) {
-        Self::new_paginated(external_id, false)
-    }
+    /// Opens `location`'s collection, starting on its first page. A collection
+    /// that's [`importable`](crate::models::collection::Collection::importable)
+    /// also offers importing files into it.
+    pub fn new(location: CollectionRef) -> (Self, Task<Message>) {
+        let task = Task::perform(
+            crate::runtime::on_tokio(fetch_items_page(location.clone(), 1, PAGE_SIZE)),
+            Message::ItemsLoaded,
+        );
 
-    /// Opens a local (filesystem-backed) library for browsing. Browsing works
-    /// identically to a remote library — the provider is resolved the same way —
-    /// but it additionally offers importing more items into the library.
-    pub fn new_local(external_id: String) -> (Self, Task<Message>) {
-        Self::new_paginated(external_id, true)
-    }
-
-    /// Shared setup for both library kinds: start on the first page and kick off
-    /// its load. `importable` is the only thing that differs between them.
-    fn new_paginated(external_id: String, importable: bool) -> (Self, Task<Message>) {
         (
             Self {
+                location,
                 items: AsyncModel::Loading,
                 pagination: Some(Pagination {
-                    external_id: external_id.clone(),
                     next_page: 2,
                     page_size: PAGE_SIZE,
                     has_more: true,
@@ -143,12 +135,8 @@ impl Browse {
                 }),
                 covers: HashMap::new(),
                 covers_in_flight: HashSet::new(),
-                importable,
             },
-            Task::perform(
-                crate::runtime::on_tokio(fetch_remote_items_page(external_id, 1, PAGE_SIZE)),
-                Message::ItemsLoaded,
-            ),
+            task,
         )
     }
 
@@ -317,7 +305,7 @@ impl Browse {
             // another page, as if the user had scrolled to the bottom. This
             // repeats (via the Action::Run chain from NextPageLoaded) until
             // either enough items are loaded to overflow the viewport, or
-            // the library is exhausted.
+            // the collection is exhausted.
             Message::ContentOverflowChecked(overflows) => {
                 if overflows {
                     return Action::None;
@@ -327,12 +315,6 @@ impl Browse {
             }
 
             Message::SeriesSelected(external_id) => {
-                let Some(library_external_id) =
-                    self.pagination.as_ref().map(|p| p.external_id.clone())
-                else {
-                    return Action::None;
-                };
-
                 let Some(item) = self.loaded_item(&external_id) else {
                     return Action::None;
                 };
@@ -341,11 +323,11 @@ impl Browse {
                     series_external_id: item.external_id.clone(),
                     series_name: item.name.clone(),
                     series_pages: item.pages,
-                    library_external_id,
+                    location: self.location.clone(),
                 }
             }
 
-            Message::BackPressed => Action::BackPressed,
+            Message::BackPressed => Action::BackPressed(self.location.integration_id.clone()),
 
             Message::ImportPressed => {
                 Action::Run(Task::perform(pick_files(), Message::ImportSourcesPicked))
@@ -353,20 +335,13 @@ impl Browse {
 
             Message::ImportSourcesPicked(None) => Action::None,
             Message::ImportSourcesPicked(Some(sources)) if sources.is_empty() => Action::None,
-            Message::ImportSourcesPicked(Some(sources)) => {
-                let Some(external_id) = self.pagination.as_ref().map(|p| p.external_id.clone())
-                else {
-                    return Action::None;
-                };
-
-                Action::Run(Task::perform(
-                    import_into_library(external_id, sources),
-                    Message::ItemsImported,
-                ))
-            }
+            Message::ImportSourcesPicked(Some(sources)) => Action::Run(Task::perform(
+                crate::runtime::on_tokio(import_files(self.location.clone(), sources)),
+                Message::ItemsImported,
+            )),
 
             Message::ItemsImported(Ok(count)) => {
-                tracing::debug!("imported {count} item(s) into the library");
+                tracing::debug!("imported {count} item(s) into the collection");
                 // Re-scan from the first page so the new series show up.
                 self.reload()
             }
@@ -388,20 +363,19 @@ impl Browse {
         pagination.has_more = true;
         pagination.loading_next = false;
         pagination.refetching_pages.clear();
-        let external_id = pagination.external_id.clone();
 
         self.items = AsyncModel::Loading;
         self.covers.clear();
         self.covers_in_flight.clear();
 
         Action::Run(Task::perform(
-            crate::runtime::on_tokio(fetch_remote_items_page(external_id, 1, PAGE_SIZE)),
+            crate::runtime::on_tokio(fetch_items_page(self.location.clone(), 1, PAGE_SIZE)),
             Message::ItemsLoaded,
         ))
     }
 
     /// Finds a currently-loaded item by its `external_id`, if present.
-    fn loaded_item(&self, external_id: &str) -> Option<&LibraryItem> {
+    fn loaded_item(&self, external_id: &str) -> Option<&CollectionItem> {
         let AsyncModel::Loaded(items) = &self.items else {
             return None;
         };
@@ -413,7 +387,12 @@ impl Browse {
     }
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
-        view_helper::view(&self.items, &self.covers, self.importable)
+        view_helper::view(
+            &self.location.collection.name,
+            &self.items,
+            &self.covers,
+            self.location.collection.importable,
+        )
     }
 
     /// Requests the next page, if pagination is set up for it, there isn't
@@ -427,12 +406,15 @@ impl Browse {
 
         pagination.loading_next = true;
 
-        let external_id = pagination.external_id.clone();
         let page_number = pagination.next_page;
         let page_size = pagination.page_size;
 
         Some(Action::Run(Task::perform(
-            crate::runtime::on_tokio(fetch_remote_items_page(external_id, page_number, page_size)),
+            crate::runtime::on_tokio(fetch_items_page(
+                self.location.clone(),
+                page_number,
+                page_size,
+            )),
             Message::NextPageLoaded,
         )))
     }
@@ -454,22 +436,23 @@ impl Browse {
             page_index + 1
         );
 
-        let external_id = pagination.external_id.clone();
         let page_number = page_index as u32 + 1;
         let page_size = pagination.page_size;
 
         Some(Task::perform(
-            crate::runtime::on_tokio(fetch_remote_items_page(external_id, page_number, page_size)),
+            crate::runtime::on_tokio(fetch_items_page(
+                self.location.clone(),
+                page_number,
+                page_size,
+            )),
             move |result| Message::PageRefetched(page_index, result),
         ))
     }
 
     /// Builds a task to fetch covers for every currently-loaded item whose
     /// cover isn't already cached or in flight, marking them in flight.
-    /// Returns `None` when there's no remote library or nothing left to fetch.
+    /// Returns `None` when there's nothing left to fetch.
     fn request_page_covers(&mut self) -> Option<Task<Message>> {
-        let library_external_id = self.pagination.as_ref()?.external_id.clone();
-
         let AsyncModel::Loaded(items) = &self.items else {
             return None;
         };
@@ -488,7 +471,10 @@ impl Browse {
         self.covers_in_flight.extend(series_ids.iter().cloned());
 
         Some(Task::perform(
-            crate::runtime::on_tokio(fetch_page_covers(library_external_id, series_ids)),
+            crate::runtime::on_tokio(fetch_page_covers(
+                self.location.integration_id.clone(),
+                series_ids,
+            )),
             Message::CoversLoaded,
         ))
     }
@@ -705,14 +691,18 @@ mod viewport_probe {
     }
 }
 
-async fn fetch_remote_items_page(
-    external_id: String,
+async fn fetch_items_page(
+    location: CollectionRef,
     page_number: u32,
     page_size: u32,
-) -> Result<Vec<LibraryItem>, String> {
-    let (provider, _namespace) = provider_for_library(&external_id).await?;
+) -> Result<Vec<CollectionItem>, String> {
+    let (provider, _namespace) = provider_for_integration(&location.integration_id).await?;
     provider
-        .list_items(&external_id, Some(page_number), Some(page_size))
+        .list_items(
+            &location.collection.external_id,
+            Some(page_number),
+            Some(page_size),
+        )
         .await
 }
 
@@ -723,7 +713,10 @@ async fn pick_files() -> Option<Vec<PathBuf>> {
 
     rfd::AsyncFileDialog::new()
         .set_directory(home)
-        .add_filter("Comics & Books", &["cbz", "cbr", "zip", "pdf", "epub", "doc"])
+        .add_filter(
+            "Comics & Books",
+            &["cbz", "cbr", "zip", "pdf", "epub", "doc"],
+        )
         .pick_files()
         .await
         .map(|handles| {
@@ -734,50 +727,23 @@ async fn pick_files() -> Option<Vec<PathBuf>> {
         })
 }
 
-/// Copies each picked file into the library's folder so the next scan surfaces
-/// it as a new series — the same structural rule used when first importing a
-/// folder library. Only folder-backed libraries can take new items; a
-/// single-file library has no folder to grow into. Existing files are left
-/// untouched (never overwritten). Returns how many items were newly copied in.
-async fn import_into_library(external_id: String, sources: Vec<PathBuf>) -> Result<usize, String> {
-    let library = library_repository::find_by_external_id(&external_id).await?;
-    let folder = library
-        .folder
-        .ok_or_else(|| "this library has no folder to import into".to_string())?;
-    let root = PathBuf::from(folder);
-
-    if !root.is_dir() {
-        return Err("cannot import items into a single-file library".to_string());
-    }
-
-    let mut imported = 0;
-    for source in sources {
-        let Some(name) = source.file_name() else {
-            continue;
-        };
-        let destination = root.join(name);
-
-        if destination.exists() {
-            tracing::debug!("skipping import of {}: already present", destination.display());
-            continue;
-        }
-
-        std::fs::copy(&source, &destination)
-            .map_err(|error| format!("could not copy {}: {error}", source.display()))?;
-        imported += 1;
-    }
-
-    Ok(imported)
+/// Imports the picked files into the collection, through its source's
+/// provider. Returns how many were newly added.
+async fn import_files(location: CollectionRef, files: Vec<PathBuf>) -> Result<usize, String> {
+    let (provider, _namespace) = provider_for_integration(&location.integration_id).await?;
+    provider
+        .import_files(&location.collection.external_id, &files)
+        .await
 }
 
 /// Fetches covers for a page's series, returning `(external_id, bytes)` for
 /// each one that resolved. Per-id and whole-batch failures are logged and
 /// omitted rather than surfaced, so a partial result still renders what it can.
 async fn fetch_page_covers(
-    library_external_id: String,
+    integration_id: String,
     series_ids: Vec<String>,
 ) -> Vec<(String, Vec<u8>)> {
-    match load_page_covers(library_external_id, series_ids).await {
+    match load_page_covers(integration_id, series_ids).await {
         Ok(covers) => covers,
         Err(error) => {
             tracing::debug!("failed to load page covers: {error}");
@@ -787,10 +753,10 @@ async fn fetch_page_covers(
 }
 
 async fn load_page_covers(
-    library_external_id: String,
+    integration_id: String,
     series_ids: Vec<String>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (provider, namespace) = provider_for_library(&library_external_id).await?;
+    let (provider, namespace) = provider_for_integration(&integration_id).await?;
 
     let mut covers = Vec::new();
     for series_id in series_ids {
@@ -815,23 +781,30 @@ mod view_helper {
         widget::{button, column, container, grid, image, row, scrollable, text},
     };
 
-    use crate::models::{AsyncModel, library_item::LibraryItem};
+    use crate::models::{AsyncModel, collection_item::CollectionItem};
 
     type Covers = HashMap<String, image::Handle>;
 
     pub fn view<'a>(
-        items: &'a AsyncModel<Vec<Option<LibraryItem>>, String>,
+        title: &'a str,
+        items: &'a AsyncModel<Vec<Option<CollectionItem>>, String>,
         covers: &'a Covers,
         importable: bool,
     ) -> Element<'a, super::Message> {
-        column![top_bar(importable), body(items, covers)]
+        column![top_bar(title, importable), body(items, covers)]
             .width(Fill)
             .height(Fill)
             .into()
     }
 
-    fn top_bar<'a>(importable: bool) -> Element<'a, super::Message> {
-        let mut bar = row![button("Back").on_press(super::Message::BackPressed)].spacing(10);
+    fn top_bar<'a>(title: &'a str, importable: bool) -> Element<'a, super::Message> {
+        let mut bar = row![
+            button("Back").on_press(super::Message::BackPressed),
+            text(title).size(20),
+            iced::widget::space::horizontal(),
+        ]
+        .spacing(10)
+        .align_y(Center);
 
         if importable {
             bar = bar.push(button("Import items").on_press(super::Message::ImportPressed));
@@ -841,7 +814,7 @@ mod view_helper {
     }
 
     fn body<'a>(
-        items: &'a AsyncModel<Vec<Option<LibraryItem>>, String>,
+        items: &'a AsyncModel<Vec<Option<CollectionItem>>, String>,
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
         match items {
@@ -853,7 +826,7 @@ mod view_helper {
     }
 
     fn items_scrollable<'a>(
-        items: &'a [Option<LibraryItem>],
+        items: &'a [Option<CollectionItem>],
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
         crate::touch_scroll::touch_scroll(
@@ -874,7 +847,7 @@ mod view_helper {
     }
 
     fn items_grid<'a>(
-        items: &'a [Option<LibraryItem>],
+        items: &'a [Option<CollectionItem>],
         covers: &'a Covers,
     ) -> Element<'a, super::Message> {
         let cards = items.iter().map(|item| match item {
@@ -894,7 +867,7 @@ mod view_helper {
     }
 
     fn item_card<'a>(
-        item: &'a LibraryItem,
+        item: &'a CollectionItem,
         cover: Option<&image::Handle>,
     ) -> Element<'a, super::Message> {
         let content = column![
@@ -979,45 +952,58 @@ mod tests {
 
     use super::*;
 
-    fn library_item(name: &str, pages: Option<u16>) -> LibraryItem {
-        LibraryItem {
+    fn collection_item(name: &str, pages: Option<u16>) -> CollectionItem {
+        CollectionItem {
             external_id: name.to_string(),
             name: name.to_string(),
             cover: String::new(),
-            library_id: "1".to_string(),
             pages,
         }
     }
 
     /// Builds a `Browse` with empty cover state, so tests only have to specify
     /// the `items`/`pagination` they care about.
+    fn location(importable: bool) -> CollectionRef {
+        CollectionRef {
+            integration_id: "source-1".to_string(),
+            collection: crate::models::collection::Collection {
+                importable,
+                ..crate::models::collection::Collection::new(
+                    "lib-1",
+                    "Manga",
+                    crate::models::collection::CollectionKind::Library,
+                )
+            },
+        }
+    }
+
     fn browse(
-        items: AsyncModel<Vec<Option<LibraryItem>>, String>,
+        items: AsyncModel<Vec<Option<CollectionItem>>, String>,
         pagination: Option<Pagination>,
     ) -> Browse {
         Browse {
+            location: location(false),
             items,
             pagination,
             covers: HashMap::new(),
             covers_in_flight: HashSet::new(),
-            importable: false,
         }
     }
 
-    /// An importable (local, filesystem-backed) `Browse`, for the import tests.
+    /// A `Browse` of an importable collection (a local folder), for the import
+    /// tests.
     fn importable_browse(
-        items: AsyncModel<Vec<Option<LibraryItem>>, String>,
+        items: AsyncModel<Vec<Option<CollectionItem>>, String>,
         pagination: Option<Pagination>,
     ) -> Browse {
         Browse {
-            importable: true,
+            location: location(true),
             ..browse(items, pagination)
         }
     }
 
     fn pagination(has_more: bool, loading_next: bool) -> Pagination {
         Pagination {
-            external_id: "lib-1".to_string(),
             next_page: 2,
             page_size: PAGE_SIZE,
             has_more,
@@ -1060,32 +1046,30 @@ mod tests {
     }
 
     #[test]
-    fn new_local_sets_up_paginated_browsing_and_allows_importing() {
-        let (browse, _task) = Browse::new_local("library-id".to_string());
+    fn new_starts_pagination_at_the_second_page() {
+        let (browse, _task) = Browse::new(location(false));
 
         assert!(matches!(browse.items, AsyncModel::Loading));
-        let pagination = browse.pagination.expect("pagination should be set up");
-        assert_eq!(pagination.external_id, "library-id");
-        assert_eq!(pagination.next_page, 2);
-        assert!(browse.importable);
-    }
-
-    #[test]
-    fn new_remote_starts_pagination_at_the_second_page() {
-        let (browse, _task) = Browse::new_remote("external-id".to_string());
-
         let pagination = browse.pagination.expect("pagination should be set up");
         assert_eq!(pagination.next_page, 2);
         assert!(pagination.has_more);
         assert!(!pagination.loading_next);
-        assert!(!browse.importable);
+    }
+
+    #[test]
+    fn view_shows_the_collection_name() {
+        let browse = browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
+
+        let mut ui = simulator(browse.view());
+
+        assert!(ui.find("Manga").is_ok());
     }
 
     #[test]
     fn update_items_loaded_stores_result_and_checks_the_viewport() {
         let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
-        let action = browse.update(Message::ItemsLoaded(Ok(vec![library_item(
+        let action = browse.update(Message::ItemsLoaded(Ok(vec![collection_item(
             "One Piece",
             Some(42),
         )])));
@@ -1099,7 +1083,7 @@ mod tests {
         let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
         let full_page: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| library_item(&format!("Item {i}"), None))
+            .map(|i| collection_item(&format!("Item {i}"), None))
             .collect();
 
         browse.update(Message::ItemsLoaded(Ok(full_page)));
@@ -1111,7 +1095,7 @@ mod tests {
     fn update_items_loaded_with_a_short_page_clears_has_more() {
         let mut browse = browse(AsyncModel::Loading, Some(pagination(true, false)));
 
-        browse.update(Message::ItemsLoaded(Ok(vec![library_item(
+        browse.update(Message::ItemsLoaded(Ok(vec![collection_item(
             "Only one", None,
         )])));
 
@@ -1131,7 +1115,7 @@ mod tests {
     #[test]
     fn update_series_selected_returns_open_series_with_item_metadata() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
             Some(pagination(true, false)),
         );
 
@@ -1142,12 +1126,13 @@ mod tests {
                 series_external_id,
                 series_name,
                 series_pages,
-                library_external_id,
+                location,
             } => {
                 assert_eq!(series_external_id, "One Piece");
                 assert_eq!(series_name, "One Piece");
                 assert_eq!(series_pages, Some(42));
-                assert_eq!(library_external_id, "lib-1");
+                assert_eq!(location.integration_id, "source-1");
+                assert_eq!(location.collection.external_id, "lib-1");
             }
             other => panic!("expected OpenSeries, got {other:?}"),
         }
@@ -1156,7 +1141,7 @@ mod tests {
     #[test]
     fn update_series_selected_for_an_unknown_item_returns_none() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, false)),
         );
 
@@ -1166,21 +1151,9 @@ mod tests {
     }
 
     #[test]
-    fn update_series_selected_without_pagination_returns_none() {
-        let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
-            None,
-        );
-
-        let action = browse.update(Message::SeriesSelected("One Piece".to_string()));
-
-        assert!(matches!(action, Action::None));
-    }
-
-    #[test]
     fn clicking_an_item_card_sends_series_selected() {
         let browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
             Some(pagination(true, false)),
         );
 
@@ -1201,11 +1174,11 @@ mod tests {
 
         let action = browse.update(Message::BackPressed);
 
-        assert!(matches!(action, Action::BackPressed));
+        assert!(matches!(action, Action::BackPressed(id) if id == "source-1"));
     }
 
     #[test]
-    fn view_shows_the_import_button_only_for_importable_libraries() {
+    fn view_shows_the_import_button_only_for_importable_collections() {
         let remote = browse(AsyncModel::Loaded(vec![]), Some(pagination(false, false)));
         let mut ui = simulator(remote.view());
         assert!(ui.find("Import items").is_err());
@@ -1274,7 +1247,7 @@ mod tests {
     #[test]
     fn items_imported_ok_resets_to_the_first_page_and_reloads() {
         let mut browse = importable_browse(
-            AsyncModel::Loaded(vec![Some(library_item("Old", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("Old", None))]),
             Some(pagination(false, true)),
         );
 
@@ -1291,7 +1264,7 @@ mod tests {
     #[test]
     fn items_imported_err_keeps_the_current_list() {
         let mut browse = importable_browse(
-            AsyncModel::Loaded(vec![Some(library_item("Still here", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("Still here", None))]),
             Some(pagination(false, false)),
         );
 
@@ -1306,7 +1279,7 @@ mod tests {
         let mut browse = browse(
             AsyncModel::Loaded(
                 (0..PAGE_SIZE)
-                    .map(|i| Some(library_item(&format!("Item {i}"), None)))
+                    .map(|i| Some(collection_item(&format!("Item {i}"), None)))
                     .collect(),
             ),
             Some(pagination(true, false)),
@@ -1323,7 +1296,7 @@ mod tests {
         let mut browse = browse(
             AsyncModel::Loaded(
                 (0..PAGE_SIZE)
-                    .map(|i| Some(library_item(&format!("Item {i}"), None)))
+                    .map(|i| Some(collection_item(&format!("Item {i}"), None)))
                     .collect(),
             ),
             Some(pagination(true, false)),
@@ -1338,7 +1311,7 @@ mod tests {
     #[test]
     fn scrolling_near_the_bottom_while_a_page_is_already_loading_does_nothing() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, true)),
         );
 
@@ -1350,7 +1323,7 @@ mod tests {
     #[test]
     fn scrolling_near_the_bottom_without_more_pages_does_nothing() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(false, false)),
         );
 
@@ -1362,11 +1335,11 @@ mod tests {
     #[test]
     fn next_page_loaded_appends_items_and_advances_pagination() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, true)),
         );
 
-        let action = browse.update(Message::NextPageLoaded(Ok(vec![library_item(
+        let action = browse.update(Message::NextPageLoaded(Ok(vec![collection_item(
             "Berserk", None,
         )])));
 
@@ -1387,7 +1360,7 @@ mod tests {
     #[test]
     fn content_overflow_checked_true_does_not_request_a_page() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, false)),
         );
 
@@ -1400,7 +1373,7 @@ mod tests {
     #[test]
     fn content_overflow_checked_false_requests_the_next_page_to_fill_the_viewport() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, false)),
         );
 
@@ -1413,7 +1386,7 @@ mod tests {
     #[test]
     fn content_overflow_checked_false_without_more_pages_does_nothing() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(false, false)),
         );
 
@@ -1425,7 +1398,7 @@ mod tests {
     #[test]
     fn content_overflow_checked_false_while_already_loading_does_nothing() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, true)),
         );
 
@@ -1446,7 +1419,7 @@ mod tests {
     #[test]
     fn next_page_loaded_error_resets_loading_flag_without_dropping_items() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(true, true)),
         );
 
@@ -1461,7 +1434,7 @@ mod tests {
         // KEEP_PAGES_LOADED pages are already loaded (indices 0..KEEP_PAGES_LOADED);
         // loading one more page should push page 0 out of the window.
         let items: Vec<_> = (0..(PAGE_SIZE * KEEP_PAGES_LOADED as u32))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
 
         let mut pagination_state = pagination(true, false);
@@ -1470,7 +1443,7 @@ mod tests {
         let mut browse = browse(AsyncModel::Loaded(items), Some(pagination_state));
 
         let new_page: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| library_item(&format!("New {i}"), None))
+            .map(|i| collection_item(&format!("New {i}"), None))
             .collect();
         browse.update(Message::NextPageLoaded(Ok(new_page)));
 
@@ -1489,13 +1462,13 @@ mod tests {
     #[test]
     fn next_page_loaded_keeps_everything_within_the_keep_window() {
         let items: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
 
         let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(true, false)));
 
         let new_page: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| library_item(&format!("New {i}"), None))
+            .map(|i| collection_item(&format!("New {i}"), None))
             .collect();
         browse.update(Message::NextPageLoaded(Ok(new_page)));
 
@@ -1509,7 +1482,7 @@ mod tests {
     #[test]
     fn scrolling_does_not_evict_anything_on_its_own() {
         let items: Vec<_> = (0..(PAGE_SIZE * 3))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
 
         let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
@@ -1561,7 +1534,7 @@ mod tests {
     #[test]
     fn scrolling_back_onto_an_evicted_page_refetches_it() {
         let mut items: Vec<_> = (0..(PAGE_SIZE * 3))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
         for slot in &mut items[0..PAGE_SIZE as usize] {
             *slot = None;
@@ -1579,7 +1552,7 @@ mod tests {
     #[test]
     fn scrolling_onto_a_page_that_is_not_evicted_does_not_refetch() {
         let items: Vec<_> = (0..(PAGE_SIZE * 3))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
 
         let mut browse = browse(AsyncModel::Loaded(items), Some(pagination(false, false)));
@@ -1593,7 +1566,7 @@ mod tests {
     #[test]
     fn scrolling_onto_an_evicted_page_already_being_refetched_does_not_request_again() {
         let mut items: Vec<_> = (0..(PAGE_SIZE * 3))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
         for slot in &mut items[0..PAGE_SIZE as usize] {
             *slot = None;
@@ -1610,7 +1583,7 @@ mod tests {
     #[test]
     fn scrolling_with_multiple_evicted_pages_visible_refetches_all_of_them() {
         let mut items: Vec<_> = (0..(PAGE_SIZE * 3))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
         for slot in &mut items[0..(PAGE_SIZE as usize * 2)] {
             *slot = None;
@@ -1636,7 +1609,7 @@ mod tests {
     #[test]
     fn page_refetched_ok_splices_items_back_at_the_right_position_and_clears_the_flag() {
         let mut items: Vec<_> = (0..(PAGE_SIZE * 2))
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
         for slot in &mut items[0..PAGE_SIZE as usize] {
             *slot = None;
@@ -1648,7 +1621,7 @@ mod tests {
         let mut browse = browse(AsyncModel::Loaded(items), Some(pagination_state));
 
         let refetched: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| library_item(&format!("Refetched {i}"), None))
+            .map(|i| collection_item(&format!("Refetched {i}"), None))
             .collect();
 
         let action = browse.update(Message::PageRefetched(0, Ok(refetched)));
@@ -1671,7 +1644,7 @@ mod tests {
 
     #[test]
     fn page_refetched_err_clears_the_flag_without_touching_items() {
-        let items = vec![None, Some(library_item("One Piece", None))];
+        let items = vec![None, Some(collection_item("One Piece", None))];
 
         let mut pagination_state = pagination(false, false);
         pagination_state.refetching_pages.insert(0);
@@ -1688,7 +1661,7 @@ mod tests {
     #[test]
     fn covers_loaded_inserts_handles_and_clears_in_flight() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(false, false)),
         );
         browse.covers_in_flight.insert("One Piece".to_string());
@@ -1707,9 +1680,9 @@ mod tests {
     fn request_page_covers_skips_items_already_cached_or_in_flight() {
         let mut browse = browse(
             AsyncModel::Loaded(vec![
-                Some(library_item("cached", None)),
-                Some(library_item("in-flight", None)),
-                Some(library_item("fresh", None)),
+                Some(collection_item("cached", None)),
+                Some(collection_item("in-flight", None)),
+                Some(collection_item("fresh", None)),
             ]),
             Some(pagination(false, false)),
         );
@@ -1730,7 +1703,7 @@ mod tests {
     #[test]
     fn request_page_covers_returns_none_when_everything_is_already_covered() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             Some(pagination(false, false)),
         );
         browse
@@ -1743,7 +1716,7 @@ mod tests {
     #[test]
     fn prune_covers_drops_entries_for_evicted_items() {
         let mut browse = browse(
-            AsyncModel::Loaded(vec![None, Some(library_item("still-here", None))]),
+            AsyncModel::Loaded(vec![None, Some(collection_item("still-here", None))]),
             Some(pagination(false, false)),
         );
         browse
@@ -1762,7 +1735,7 @@ mod tests {
     #[test]
     fn view_renders_item_name_and_pages_when_loaded() {
         let browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
             None,
         );
 
@@ -1775,7 +1748,7 @@ mod tests {
     #[test]
     fn view_does_not_render_pages_when_absent() {
         let browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", None))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
             None,
         );
 
@@ -1809,7 +1782,7 @@ mod tests {
     #[test]
     fn view_renders_items_with_a_visible_non_collapsed_size() {
         let browse = browse(
-            AsyncModel::Loaded(vec![Some(library_item("One Piece", Some(42)))]),
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
             None,
         );
 
@@ -1826,7 +1799,7 @@ mod tests {
     #[test]
     fn scrolling_past_the_bottom_of_a_tall_grid_requests_the_next_page() {
         let items: Vec<_> = (0..PAGE_SIZE)
-            .map(|i| Some(library_item(&format!("Item {i}"), None)))
+            .map(|i| Some(collection_item(&format!("Item {i}"), None)))
             .collect();
 
         let browse = browse(AsyncModel::Loaded(items), Some(pagination(true, false)));

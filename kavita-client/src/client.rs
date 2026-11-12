@@ -4,9 +4,11 @@ use tracing::debug;
 
 mod account;
 mod chapter;
+mod collection;
 mod health;
 mod library;
 mod reader;
+mod reading_list;
 mod series;
 mod volume;
 

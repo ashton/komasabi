@@ -6,12 +6,12 @@ use opds_client::OpdsClient;
 use opds_client::models::{feed::Feed, link::Link, media_type, publication::Publication};
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
-    models::{library::Library, library_item::LibraryItem, series_entry::SeriesEntry},
+    adapter::{CollectionAdapter, ItemAdapter},
+    models::{collection::Collection, collection_item::CollectionItem, series_entry::SeriesEntry},
     providers::{
         PageRef, Provider,
         opds::adapter::{
-            CatalogEntry, OpdsId, OpdsItemAdapter, OpdsLibrary, OpdsLibraryAdapter,
+            CatalogEntry, OpdsCollection, OpdsCollectionAdapter, OpdsId, OpdsItemAdapter,
             publication_entry,
         },
         opds::archive,
@@ -29,8 +29,8 @@ const MAX_NESTED_FEEDS: usize = 30;
 /// A [`Provider`] over an OPDS catalog, speaking OPDS 2 (JSON) or OPDS 1.2
 /// (Atom) — whichever the server answers with (see `opds-client`).
 ///
-/// The app's library → series → entry hierarchy maps onto the catalog as:
-/// - a **library** is a catalog feed (see [`OpdsProvider::list_libraries`]);
+/// The app's collection → series → entry hierarchy maps onto the catalog as:
+/// - a **collection** is a catalog feed (see [`OpdsProvider::list_collections`]);
 /// - its **items** are that feed's entries: navigation links (typically
 ///   series) and publications listed directly;
 /// - an item's **entries** are the publications of the feed it links to (or,
@@ -91,16 +91,17 @@ impl OpdsProvider {
         Ok(catalog.metadata.title)
     }
 
-    /// Discovers the catalog feeds to import as libraries.
+    /// Discovers the catalog feeds that are the source's collections.
     ///
     /// Each navigation link of the root catalog is a candidate. Most become a
-    /// library as-is ("On Deck", "Recently Added", a publications feed, …), but
-    /// a *catalog of catalogs* — a navigation feed whose entries are themselves
-    /// navigation feeds, like Kavita's "All Libraries" or Komga's "Libraries" —
-    /// is expanded into one library per entry instead, since those entries are
-    /// what users think of as libraries. Empty feeds are skipped. A root that
-    /// lists publications directly (and nothing else) is itself the library.
-    pub async fn list_libraries(&self, integration_id: &str) -> Result<Vec<Library>, String> {
+    /// catalog collection as-is ("On Deck", "Recently Added", a publications
+    /// feed, …), but a *catalog of catalogs* — a navigation feed whose entries
+    /// are themselves navigation feeds, like Kavita's "All Libraries" or
+    /// Komga's "Libraries" — is expanded into one library collection per entry
+    /// instead, since those entries are what users think of as libraries. Empty
+    /// feeds are skipped. A root that lists publications directly (and nothing
+    /// else) is itself the only collection.
+    pub async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         let root = self
             .client
             .catalog()
@@ -140,30 +141,33 @@ impl OpdsProvider {
             if self.is_catalog_of_catalogs(&feed).await {
                 for library in self.navigation_of(feed, &href).await {
                     if seen.insert(library.link.href.clone()) {
-                        libraries.push(OpdsLibrary {
+                        libraries.push(OpdsCollection {
                             title: library.title().to_string(),
                             url: library.link.href,
+                            is_library: true,
                         });
                     }
                 }
             } else {
-                libraries.push(OpdsLibrary {
+                libraries.push(OpdsCollection {
                     title: candidate.title().to_string(),
                     url: href,
+                    is_library: false,
                 });
             }
         }
 
         if libraries.is_empty() && root.all_publications().next().is_some() {
-            libraries.push(OpdsLibrary {
+            libraries.push(OpdsCollection {
                 title: root.metadata.title.clone(),
                 url: root_url,
+                is_library: false,
             });
         }
 
         Ok(libraries
             .into_iter()
-            .map(|library| OpdsLibraryAdapter::adapt_library(library, integration_id))
+            .map(OpdsCollectionAdapter::adapt_collection)
             .collect())
     }
 
@@ -237,7 +241,7 @@ impl OpdsProvider {
         url: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
+    ) -> Result<Vec<CollectionItem>, String> {
         let page_size = page_size.map_or(usize::MAX, |size| size as usize);
         let start = (page.unwrap_or(1).max(1) as usize - 1).saturating_mul(page_size);
         let end = start.saturating_add(page_size);
@@ -583,14 +587,18 @@ fn remember_cover(id: &str, href: Option<&str>) {
 }
 
 impl Provider for OpdsProvider {
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        self.list_collections().await
+    }
+
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
-        let OpdsId::Feed(url) = OpdsId::decode(library_external_id)? else {
-            return Err("an OPDS library must be a feed".to_string());
+    ) -> Result<Vec<CollectionItem>, String> {
+        let OpdsId::Feed(url) = OpdsId::decode(collection_id)? else {
+            return Err("an OPDS collection must be a feed".to_string());
         };
 
         self.list_feed_items(&url, page, page_size).await
@@ -635,6 +643,15 @@ impl Provider for OpdsProvider {
     ) -> Result<Option<SeriesEntry>, String> {
         let entries = Provider::list_series_entries(self, series_id).await?;
         Ok(crate::providers::entry_after(entries, current))
+    }
+
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_before(entries, current))
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
@@ -684,6 +701,7 @@ impl Provider for OpdsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::collection::CollectionKind;
 
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -723,7 +741,7 @@ mod tests {
         )
     }
 
-    fn names(libraries: &[Library]) -> Vec<&str> {
+    fn names(libraries: &[Collection]) -> Vec<&str> {
         libraries
             .iter()
             .map(|library| library.name.as_str())
@@ -731,7 +749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_libraries_expands_catalogs_of_catalogs_and_skips_empty_and_self_links() {
+    async fn list_collections_expands_catalogs_of_catalogs_and_skips_empty_and_self_links() {
         let server = MockServer::start().await;
         serve_atom(
             &server,
@@ -771,17 +789,20 @@ mod tests {
         .await;
 
         let provider = OpdsProvider::connect(format!("{}/opds", server.uri()), None, None);
-        let libraries = provider.list_libraries("integration").await.unwrap();
+        let libraries = provider.list_collections().await.unwrap();
 
         assert_eq!(names(&libraries), vec!["On Deck", "Manga", "Comics"]);
         assert_eq!(
-            OpdsId::decode(libraries[1].external_id.as_deref().unwrap()).unwrap(),
+            OpdsId::decode(&libraries[1].external_id).unwrap(),
             OpdsId::Feed(format!("{}/opds/libraries/1", server.uri()))
         );
+        // A catalog of catalogs' entries are the server's libraries.
+        assert_eq!(libraries[0].kind, CollectionKind::Catalog);
+        assert_eq!(libraries[1].kind, CollectionKind::Library);
     }
 
     #[tokio::test]
-    async fn list_libraries_uses_an_opds2_root_that_only_lists_publications() {
+    async fn list_collections_uses_an_opds2_root_that_only_lists_publications() {
         let server = MockServer::start().await;
         serve_json(
             &server,
@@ -793,7 +814,7 @@ mod tests {
         .await;
 
         let provider = OpdsProvider::connect(format!("{}/catalog.json", server.uri()), None, None);
-        let libraries = provider.list_libraries("integration").await.unwrap();
+        let libraries = provider.list_collections().await.unwrap();
 
         assert_eq!(names(&libraries), vec!["Shelf"]);
     }
@@ -836,8 +857,9 @@ mod tests {
         let library = OpdsId::Feed(format!("{}/library", server.uri())).encode();
         let page = |n| Provider::list_items(&provider, &library, Some(n), Some(2));
 
-        let names =
-            |items: Vec<LibraryItem>| items.into_iter().map(|item| item.name).collect::<Vec<_>>();
+        let names = |items: Vec<CollectionItem>| {
+            items.into_iter().map(|item| item.name).collect::<Vec<_>>()
+        };
         assert_eq!(names(page(1).await.unwrap()), vec!["S1", "S2"]);
         assert_eq!(names(page(2).await.unwrap()), vec!["S3", "S4"]);
         assert_eq!(names(page(3).await.unwrap()), vec!["S5", "S6"]);
@@ -1068,7 +1090,7 @@ mod tests {
         runtime.block_on(async {
             let provider = OpdsProvider::connect(url, None, None);
 
-            let libraries = provider.list_libraries("live").await.unwrap();
+            let libraries = provider.list_collections().await.unwrap();
             println!(
                 "libraries: {:?}",
                 libraries.iter().map(|l| &l.name).collect::<Vec<_>>()
@@ -1076,10 +1098,10 @@ mod tests {
             assert!(!libraries.is_empty());
 
             for library in &libraries {
-                let library_id = library.external_id.as_deref().unwrap();
-                let items = Provider::list_items(&provider, library_id, Some(1), Some(20))
-                    .await
-                    .unwrap();
+                let items =
+                    Provider::list_items(&provider, &library.external_id, Some(1), Some(20))
+                        .await
+                        .unwrap();
                 println!("{}: {} items on page 1", library.name, items.len());
 
                 let Some(item) = items.first() else { continue };

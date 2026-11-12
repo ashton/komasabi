@@ -43,7 +43,8 @@ pub enum Action {
     None,
     Run(Task<Message>),
     BackPressed,
-    Created(IntegrationModel),
+    /// The source was saved.
+    Created,
 }
 
 impl Opds {
@@ -83,7 +84,7 @@ impl Opds {
                 Message::Created,
             )),
 
-            Message::Created(Ok(integration)) => Action::Created(integration),
+            Message::Created(Ok(_)) => Action::Created,
             Message::Created(Err(_)) => Action::None,
 
             Message::TestConnectionPressed => {
@@ -221,6 +222,7 @@ mod tests {
             api_key: None,
             username: None,
             password: None,
+            folder: None,
         }
     }
 
@@ -295,7 +297,7 @@ mod tests {
 
         assert!(matches!(
             opds.update(Message::Created(Ok(integration_model("Library")))),
-            Action::Created(_)
+            Action::Created
         ));
         assert!(matches!(
             opds.update(Message::Created(Err("boom".to_string()))),

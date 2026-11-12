@@ -1,14 +1,13 @@
-//! A [`Provider`] backed by the local filesystem, the counterpart to
-//! [`KavitaProvider`](crate::providers::kavita::provider::KavitaProvider) for
-//! libraries imported from a folder (or a single file) rather than a remote
-//! service.
+//! A [`Provider`] backed by the local filesystem: a local-folder source, the
+//! counterpart to the remote backends for content on this machine.
 //!
-//! Like the Kavita provider, it holds no local copy of the library's contents:
-//! every call re-reads the filesystem, so the library always reflects what's on
+//! Like the remote providers, it holds no local copy of the folder's contents:
+//! every call re-reads the filesystem, so the source always reflects what's on
 //! disk. The structural rules it applies:
 //!
-//! - The library root is either a **single file** (imported on its own) or a
-//!   **folder**. A file root is one series holding one standalone volume.
+//! - The source has a single collection, its root, which is either a **folder**
+//!   or a **single file**. A file root is one series holding one standalone
+//!   volume.
 //! - In a folder root, each child (sub-folder or loose file) is a **series**.
 //! - Within a series folder, if it holds sub-folders each is a **volume** whose
 //!   files are its **chapters**; if it holds only files, each file is a
@@ -22,10 +21,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::models::{
-    library_item::LibraryItem,
+    collection::{Collection, CollectionKind},
+    collection_item::CollectionItem,
     series_entry::{EntryKind, SeriesEntry},
 };
-use crate::providers::{PageRef, Provider};
+use crate::providers::{PageRef, Provider, paginate};
 
 /// File extensions treated as page images inside an archive.
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif"];
@@ -34,13 +34,18 @@ const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", 
 const READABLE_ARCHIVE_EXTENSIONS: &[&str] = &["cbz", "zip"];
 
 pub struct FileSystemProvider {
-    /// The library's root path: either a single imported file or a folder.
+    /// The source's root path: a folder, or a single file.
     root: PathBuf,
+    /// The source's name, which its one collection takes.
+    name: String,
 }
 
 impl FileSystemProvider {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            name: name.into(),
+        }
     }
 
     /// Reads from the on-disk cover cache for `key`, falling back to `produce`
@@ -67,26 +72,40 @@ impl FileSystemProvider {
 }
 
 impl Provider for FileSystemProvider {
+    /// The root folder is the source's only collection. It takes imported files
+    /// when it's a folder (a single-file root has nowhere to put them).
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        Ok(vec![Collection {
+            importable: self.root.is_dir(),
+            ..Collection::new(encode_id(&self.root), &self.name, CollectionKind::Folder)
+        }])
+    }
+
     async fn list_items(
         &self,
-        _library_external_id: &str,
+        _collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
+    ) -> Result<Vec<CollectionItem>, String> {
         let series = scan_series(&self.root);
 
-        let items: Vec<LibraryItem> = series
+        let items: Vec<CollectionItem> = series
             .into_iter()
-            .map(|path| LibraryItem {
+            .map(|path| CollectionItem {
                 external_id: encode_id(&path),
                 name: display_name(&path),
                 cover: String::new(),
-                library_id: encode_id(&self.root),
                 pages: None,
             })
             .collect();
 
         Ok(paginate(items, page, page_size))
+    }
+
+    /// Copies each file into the root folder, so the next scan surfaces it as a
+    /// new series. Existing files are left untouched (never overwritten).
+    async fn import_files(&self, _collection_id: &str, files: &[PathBuf]) -> Result<usize, String> {
+        import_into(&self.root, files)
     }
 
     async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String> {
@@ -113,6 +132,15 @@ impl Provider for FileSystemProvider {
     ) -> Result<Option<SeriesEntry>, String> {
         let entries = Provider::list_series_entries(self, series_id).await?;
         Ok(crate::providers::entry_after(entries, current))
+    }
+
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_before(entries, current))
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
@@ -169,6 +197,36 @@ impl Provider for FileSystemProvider {
 /// UTF-8 bytes. Hex contains only `[0-9a-f]`, so an id never carries a path
 /// separator into a cache key, yet [`decode_id`] recovers the exact path without
 /// a rescan.
+/// Copies `files` into the folder `root`, skipping any whose name is already
+/// there. Returns how many were copied in.
+fn import_into(root: &Path, files: &[PathBuf]) -> Result<usize, String> {
+    if !root.is_dir() {
+        return Err("cannot import items into a single-file source".to_string());
+    }
+
+    let mut imported = 0;
+    for source in files {
+        let Some(name) = source.file_name() else {
+            continue;
+        };
+        let destination = root.join(name);
+
+        if destination.exists() {
+            tracing::debug!(
+                "skipping import of {}: already present",
+                destination.display()
+            );
+            continue;
+        }
+
+        std::fs::copy(source, &destination)
+            .map_err(|error| format!("could not copy {}: {error}", source.display()))?;
+        imported += 1;
+    }
+
+    Ok(imported)
+}
+
 fn encode_id(path: &Path) -> String {
     let bytes = path.to_string_lossy();
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -210,7 +268,7 @@ fn display_name(path: &Path) -> String {
     }
 }
 
-/// The series of a library root: the root itself if it's a single file,
+/// The series of a source root: the root itself if it's a single file,
 /// otherwise each of its children (sub-folders and loose files), name-sorted.
 fn scan_series(root: &Path) -> Vec<PathBuf> {
     if root.is_file() {
@@ -348,26 +406,6 @@ fn zip_image_names(path: &Path) -> Option<Vec<String>> {
 /// Keeps only the requested page of `items`, matching the Kavita provider's
 /// pagination contract (1-based page number). An out-of-range page yields an
 /// empty slice, which the browse screen reads as "no more items".
-fn paginate(
-    items: Vec<LibraryItem>,
-    page: Option<u32>,
-    page_size: Option<u32>,
-) -> Vec<LibraryItem> {
-    let (Some(page), Some(page_size)) = (page, page_size) else {
-        return items;
-    };
-    if page == 0 || page_size == 0 {
-        return items;
-    }
-
-    let start = ((page - 1) * page_size) as usize;
-    items
-        .into_iter()
-        .skip(start)
-        .take(page_size as usize)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,26 +440,6 @@ mod tests {
         assert!(is_image_name("cover.png"));
         assert!(!is_image_name("info.txt"));
         assert!(!is_image_name("chapter.cbz"));
-    }
-
-    #[test]
-    fn paginate_slices_by_page_and_size() {
-        let items: Vec<LibraryItem> = (0..5)
-            .map(|i| LibraryItem {
-                external_id: i.to_string(),
-                name: i.to_string(),
-                cover: String::new(),
-                library_id: "lib".to_string(),
-                pages: None,
-            })
-            .collect();
-
-        let page2 = paginate(items.clone(), Some(2), Some(2));
-        assert_eq!(page2.len(), 2);
-        assert_eq!(page2[0].name, "2");
-
-        let past_end = paginate(items, Some(9), Some(2));
-        assert!(past_end.is_empty());
     }
 
     /// Builds a temp directory unique to this test run, cleaned up by the caller.
@@ -526,7 +544,7 @@ mod tests {
         write_cbz(&volume.join("ch1.cbz"), &["01.jpg", "02.jpg"]);
         write_cbz(&volume.join("ch2.cbz"), &["01.jpg"]);
 
-        let provider = FileSystemProvider::new(&root);
+        let provider = FileSystemProvider::new(&root, "Comics");
 
         let items = block_on(provider.list_items("lib", Some(1), Some(10))).unwrap();
         let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
@@ -552,11 +570,11 @@ mod tests {
     #[test]
     fn provider_reads_a_single_file_series_as_a_standalone_volume() {
         let root = temp_dir("provider-file-series");
-        // A single-file "library": the file itself is the library root.
+        // A single-file source: the file itself is the root.
         let file = root.join("Oneshot.cbz");
         write_cbz(&file, &["01.jpg", "02.jpg"]);
 
-        let provider = FileSystemProvider::new(&file);
+        let provider = FileSystemProvider::new(&file, "Comics");
 
         let items = block_on(provider.list_items("lib", None, None)).unwrap();
         assert_eq!(items.len(), 1);
@@ -569,6 +587,62 @@ mod tests {
         assert_eq!(pages.len(), 2);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_folder_source_is_one_importable_folder_collection() {
+        let root = temp_dir("collections-folder");
+        let provider = FileSystemProvider::new(&root, "My Comics");
+
+        let collections = block_on(provider.list_collections()).unwrap();
+
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].name, "My Comics");
+        assert_eq!(collections[0].kind, CollectionKind::Folder);
+        assert!(collections[0].importable);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_single_file_source_is_not_importable() {
+        let root = temp_dir("collections-file");
+        let file = root.join("Oneshot.cbz");
+        write_cbz(&file, &["01.jpg"]);
+        let provider = FileSystemProvider::new(&file, "Oneshot");
+
+        let collections = block_on(provider.list_collections()).unwrap();
+
+        assert!(!collections[0].importable);
+        assert!(block_on(provider.import_files("", &[root.join("x.cbz")])).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn import_files_copies_new_files_and_skips_existing_ones() {
+        let root = temp_dir("import-target");
+        let outside = temp_dir("import-source");
+        write_cbz(&root.join("Berserk.cbz"), &["01.jpg"]);
+        write_cbz(&outside.join("Berserk.cbz"), &["01.jpg", "02.jpg"]);
+        write_cbz(&outside.join("Akira.cbz"), &["01.jpg"]);
+        let provider = FileSystemProvider::new(&root, "Comics");
+
+        let imported = block_on(provider.import_files(
+            "",
+            &[outside.join("Berserk.cbz"), outside.join("Akira.cbz")],
+        ))
+        .unwrap();
+
+        assert_eq!(imported, 1);
+        let items = block_on(provider.list_items("", None, None)).unwrap();
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["Akira", "Berserk"]);
+        // The existing file wasn't overwritten.
+        assert_eq!(archive_image_count(&root.join("Berserk.cbz")), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 
     #[test]

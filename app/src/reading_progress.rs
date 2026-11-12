@@ -95,7 +95,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::models::library_item::LibraryItem;
+    use crate::models::collection_item::CollectionItem;
     use crate::models::series_entry::SeriesEntry;
 
     /// A provider that records the progress it's sent, failing the pages listed
@@ -118,12 +118,17 @@ mod tests {
     }
 
     impl Provider for RecordingProvider {
+        async fn list_collections(
+            &self,
+        ) -> Result<Vec<crate::models::collection::Collection>, String> {
+            unimplemented!()
+        }
         async fn list_items(
             &self,
             _: &str,
             _: Option<u32>,
             _: Option<u32>,
-        ) -> Result<Vec<LibraryItem>, String> {
+        ) -> Result<Vec<CollectionItem>, String> {
             unimplemented!()
         }
         async fn list_series_entries(&self, _: &str) -> Result<Vec<SeriesEntry>, String> {
@@ -145,6 +150,14 @@ mod tests {
             unimplemented!()
         }
         async fn next_entry(
+            &self,
+            _: &str,
+            _: &SeriesEntry,
+        ) -> Result<Option<SeriesEntry>, String> {
+            unimplemented!()
+        }
+
+        async fn previous_entry(
             &self,
             _: &str,
             _: &SeriesEntry,

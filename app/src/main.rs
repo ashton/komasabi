@@ -1,9 +1,8 @@
 // Release builds on Windows are GUI programs, so no console window opens next
 // to the app; debug builds keep theirs for logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-
 // A build with no integration features only reads local folders, leaving the
-// integration plumbing (sync job, repository writes, …) unused.
+// remote-source plumbing (credential repository writes, …) unused.
 #![cfg_attr(
     not(any(
         feature = "kavita",
@@ -19,7 +18,6 @@ mod cache;
 pub mod database;
 mod error;
 mod icons;
-mod jobs;
 mod menu;
 mod models;
 mod providers;
@@ -33,7 +31,8 @@ mod touch_scroll;
 
 use crate::{
     menu::{Menu, MenuItem},
-    screen::{Home, browse, home, integration, library, series_detail, settings},
+    models::collection::CollectionRef,
+    screen::{Home, browse, collections, home, integration, library, series_detail, settings},
 };
 use iced::{
     Element,
@@ -56,6 +55,7 @@ enum Message {
     Settings(settings::Message),
     Home(home::Message),
     Library(library::Message),
+    Collections(collections::Message),
     Browse(browse::Message),
     SeriesDetail(series_detail::Message),
     Integrations(integration::Message),
@@ -76,14 +76,9 @@ impl KomasabiApp {
                         MenuItem::new("bars", "", false, Some(Message::ExpandMenu)),
                         MenuItem::new("house", "Home", true, Some(Message::OpenHome)),
                         MenuItem::new("book_open", "Library", false, Some(Message::OpenLibrary)),
+                        MenuItem::new("cloud", "Sources", false, Some(Message::OpenIntegrations)),
                         MenuItem::new("magnifying_glass", "Search", false, None),
                         MenuItem::new("download", "Downloads", false, None),
-                        MenuItem::new(
-                            "cloud",
-                            "Integrations",
-                            false,
-                            Some(Message::OpenIntegrations),
-                        ),
                     ],
                     vec![MenuItem::new(
                         "gear",
@@ -125,13 +120,19 @@ impl KomasabiApp {
 
                 match library.update(msg) {
                     library::Action::None => Task::none(),
-                    library::Action::Run(task) => task.map(Message::Library),
-                    library::Action::BrowseRemoteLibrary(external_id) => {
-                        self.open_browse_remote(external_id)
-                    }
-                    library::Action::BrowseLibrary(library_id) => {
-                        self.open_browse_local(library_id)
-                    }
+                }
+            }
+
+            Message::Collections(msg) => {
+                let Screen::Collections(collections) = &mut self.screen else {
+                    return Task::none();
+                };
+
+                match collections.update(msg) {
+                    collections::Action::None => Task::none(),
+                    collections::Action::Run(task) => task.map(Message::Collections),
+                    collections::Action::OpenCollection(location) => self.open_browse(location),
+                    collections::Action::Back => self.open_integrations(),
                 }
             }
 
@@ -143,17 +144,19 @@ impl KomasabiApp {
                 match browse.update(msg) {
                     browse::Action::None => Task::none(),
                     browse::Action::Run(task) => task.map(Message::Browse),
-                    browse::Action::BackPressed => self.open_library(),
+                    browse::Action::BackPressed(integration_id) => {
+                        self.open_collections(integration_id)
+                    }
                     browse::Action::OpenSeries {
                         series_external_id,
                         series_name,
                         series_pages,
-                        library_external_id,
+                        location,
                     } => self.open_series_detail(
                         series_external_id,
                         series_name,
                         series_pages,
-                        library_external_id,
+                        location,
                     ),
                 }
             }
@@ -166,9 +169,7 @@ impl KomasabiApp {
                 match series_detail.update(msg) {
                     series_detail::Action::None => Task::none(),
                     series_detail::Action::Run(task) => task.map(Message::SeriesDetail),
-                    series_detail::Action::Back(library_external_id) => {
-                        self.open_browse_remote(library_external_id)
-                    }
+                    series_detail::Action::Back(location) => self.open_browse(location),
                 }
             }
 
@@ -180,6 +181,9 @@ impl KomasabiApp {
                 match integrations.update(msg) {
                     integration::Action::None => Task::none(),
                     integration::Action::Run(task) => task.map(Message::Integrations),
+                    integration::Action::OpenSource(integration_id) => {
+                        self.open_collections(integration_id)
+                    }
                 }
             }
 
@@ -227,6 +231,7 @@ impl KomasabiApp {
         let screen = match &self.screen {
             Screen::Home(home) => home.view().map(Message::Home),
             Screen::Library(library) => library.view().map(Message::Library),
+            Screen::Collections(collections) => collections.view().map(Message::Collections),
             Screen::Browse(browse) => browse.view().map(Message::Browse),
             Screen::SeriesDetail(series_detail) => series_detail.view().map(Message::SeriesDetail),
             Screen::Settings(settings) => settings.view().map(Message::Settings),
@@ -271,15 +276,18 @@ impl KomasabiApp {
         task.map(Message::Library)
     }
 
-    fn open_browse_remote(&mut self, external_id: String) -> Task<Message> {
-        let (params, task) = screen::Browse::new_remote(external_id);
-        self.screen = Screen::Browse(params);
+    /// Opens a source's collections. The sources menu item stays active
+    /// while the user is anywhere inside a source.
+    fn open_collections(&mut self, integration_id: String) -> Task<Message> {
+        let (params, task) = screen::Collections::new(integration_id);
+        self.screen = Screen::Collections(params);
+        self.menu.set_active(&Message::OpenIntegrations);
 
-        task.map(Message::Browse)
+        task.map(Message::Collections)
     }
 
-    fn open_browse_local(&mut self, library_id: String) -> Task<Message> {
-        let (params, task) = screen::Browse::new_local(library_id);
+    fn open_browse(&mut self, location: CollectionRef) -> Task<Message> {
+        let (params, task) = screen::Browse::new(location);
         self.screen = Screen::Browse(params);
 
         task.map(Message::Browse)
@@ -290,14 +298,10 @@ impl KomasabiApp {
         series_external_id: String,
         series_name: String,
         series_pages: Option<u16>,
-        library_external_id: String,
+        location: CollectionRef,
     ) -> Task<Message> {
-        let (params, task) = screen::SeriesDetail::new(
-            series_external_id,
-            series_name,
-            series_pages,
-            library_external_id,
-        );
+        let (params, task) =
+            screen::SeriesDetail::new(series_external_id, series_name, series_pages, location);
         self.screen = Screen::SeriesDetail(params);
 
         task.map(Message::SeriesDetail)

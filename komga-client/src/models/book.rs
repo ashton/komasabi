@@ -6,6 +6,9 @@ use serde::Deserialize;
 pub struct Book {
     pub id: String,
     pub series_id: String,
+    /// The title of the book's series, which Komga includes so a book listed
+    /// outside its series (e.g. in a read list) can say where it's from.
+    pub series_title: String,
     pub library_id: String,
     /// The file name without extension; [`BookMetadata::title`] is the display
     /// title.

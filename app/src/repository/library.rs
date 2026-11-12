@@ -1,3 +1,7 @@
+//! The user's own Library. Sources no longer sync their collections into it,
+//! and nothing writes to it yet, so only [`all`] is in use.
+#![allow(dead_code)]
+
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
@@ -35,9 +39,7 @@ pub async fn find_by_external_id(remote_id: &str) -> Result<Library, String> {
 }
 
 /// Creates a local, filesystem-backed library over `path` (a folder or a single
-/// imported file). It gets its own id as its `external_id` so it resolves
-/// through [`provider_for_library`](crate::providers::provider_for_library) the
-/// same way a remote library does, and no integration.
+/// imported file), with its own id as its `external_id` and no integration.
 pub async fn create_local(
     name: String,
     kind: LibraryType,

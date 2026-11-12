@@ -1,11 +1,15 @@
 use komga_client::client::{Auth, KomgaClient};
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
-    models::{library::Library, library_item::LibraryItem, series_entry::SeriesEntry},
+    adapter::{CollectionAdapter, ItemAdapter},
+    models::{collection::Collection, collection_item::CollectionItem, series_entry::SeriesEntry},
     providers::{
         PageRef, Provider,
-        komga::adapter::{KomgaItemAdapter, KomgaLibraryAdapter, book_entry},
+        komga::adapter::{
+            KomgaCollectionAdapter, KomgaCollectionId, KomgaItemAdapter, book_entry,
+            read_list_series,
+        },
+        paginate,
     },
 };
 
@@ -13,9 +17,9 @@ use crate::{
 /// the browse screen's.
 const DEFAULT_PAGE_SIZE: u32 = 20;
 
-/// A [`Provider`] over a Komga server. Komga's library → series → book
-/// hierarchy maps directly onto the app's library → item → entry one; a book
-/// is read page by page through Komga's page endpoint.
+/// A [`Provider`] over a Komga server. Komga's libraries, collections and read
+/// lists are the source's collections, its series the items and its books the
+/// entries; a book is read page by page through Komga's page endpoint.
 pub struct KomgaProvider {
     client: KomgaClient,
 }
@@ -75,18 +79,62 @@ impl KomgaProvider {
             .map_err(crate::error::log_and_stringify)
     }
 
-    pub async fn list_libraries(&self, integration_id: &str) -> Result<Vec<Library>, String> {
+    /// Lists the server's available libraries, then its collections and read
+    /// lists. Those two are extras: if either can't be listed, the libraries
+    /// still are.
+    pub async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         let libraries = self
             .client
             .list_libraries()
             .await
             .map_err(crate::error::log_and_stringify)?;
-
-        Ok(libraries
+        let mut collections: Vec<Collection> = libraries
             .into_iter()
             .filter(|library| !library.unavailable)
-            .map(|library| KomgaLibraryAdapter::adapt_library(library, integration_id))
-            .collect())
+            .map(KomgaCollectionAdapter::adapt_collection)
+            .collect();
+
+        match self.client.list_collections().await {
+            Ok(found) => collections.extend(
+                found
+                    .into_iter()
+                    .map(KomgaCollectionAdapter::adapt_collection),
+            ),
+            Err(error) => tracing::debug!("could not list Komga collections: {error}"),
+        }
+        match self.client.list_read_lists().await {
+            Ok(found) => collections.extend(
+                found
+                    .into_iter()
+                    .map(KomgaCollectionAdapter::adapt_collection),
+            ),
+            Err(error) => tracing::debug!("could not list Komga read lists: {error}"),
+        }
+
+        Ok(collections)
+    }
+
+    /// The book after (`forward`) or before `current` in its series, skipping
+    /// books Komga has marked deleted.
+    async fn sibling_entry(
+        &self,
+        current: &SeriesEntry,
+        forward: bool,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let mut book_id = current.external_id.clone();
+        loop {
+            let sibling = if forward {
+                self.client.next_book(&book_id).await
+            } else {
+                self.client.previous_book(&book_id).await
+            }
+            .map_err(crate::error::log_and_stringify)?;
+            match sibling {
+                Some(book) if book.deleted => book_id = book.id,
+                Some(book) => return Ok(Some(book_entry(book))),
+                None => return Ok(None),
+            }
+        }
     }
 
     /// Returns cover bytes from the on-disk cache for `key`, or awaits `fetch`
@@ -121,22 +169,43 @@ impl KomgaProvider {
 }
 
 impl Provider for KomgaProvider {
-    /// Lists one page of a library's series. The browse screen's pages are
-    /// 1-based; Komga's are 0-based.
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        self.list_collections().await
+    }
+
+    /// Lists one page of a collection's series. The browse screen's pages are
+    /// 1-based; Komga's are 0-based. A read list holds books, so its series
+    /// are the ones those books belong to, cut into pages here.
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
-        let page = page.unwrap_or(1).saturating_sub(1);
+    ) -> Result<Vec<CollectionItem>, String> {
+        let komga_page = page.unwrap_or(1).saturating_sub(1);
         let size = page_size.unwrap_or(DEFAULT_PAGE_SIZE);
 
-        let series = self
-            .client
-            .list_series_of_library(library_external_id, page, size)
-            .await
-            .map_err(crate::error::log_and_stringify)?;
+        let series = match KomgaCollectionId::decode(collection_id)? {
+            KomgaCollectionId::Library(id) => {
+                self.client
+                    .list_series_of_library(&id, komga_page, size)
+                    .await
+            }
+            KomgaCollectionId::Collection(id) => {
+                self.client
+                    .list_series_of_collection(&id, komga_page, size)
+                    .await
+            }
+            KomgaCollectionId::ReadList(id) => {
+                let books = self
+                    .client
+                    .list_books_of_read_list(&id)
+                    .await
+                    .map_err(crate::error::log_and_stringify)?;
+                return Ok(paginate(read_list_series(books), page, Some(size)));
+            }
+        }
+        .map_err(crate::error::log_and_stringify)?;
 
         Ok(series
             .content
@@ -167,19 +236,15 @@ impl Provider for KomgaProvider {
         _series_id: &str,
         current: &SeriesEntry,
     ) -> Result<Option<SeriesEntry>, String> {
-        let mut book_id = current.external_id.clone();
-        loop {
-            let next = self
-                .client
-                .next_book(&book_id)
-                .await
-                .map_err(crate::error::log_and_stringify)?;
-            match next {
-                Some(book) if book.deleted => book_id = book.id,
-                Some(book) => return Ok(Some(book_entry(book))),
-                None => return Ok(None),
-            }
-        }
+        self.sibling_entry(current, true).await
+    }
+
+    async fn previous_entry(
+        &self,
+        _series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        self.sibling_entry(current, false).await
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
@@ -362,7 +427,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let items = Provider::list_items(&provider_for(&server), "L1", Some(2), Some(20))
+        let items = Provider::list_items(&provider_for(&server), "library:L1", Some(2), Some(20))
             .await
             .unwrap();
 
@@ -475,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_libraries_skips_unavailable_libraries() {
+    async fn list_collections_skips_unavailable_libraries_and_adds_collections_and_read_lists() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -487,14 +552,93 @@ mod tests {
             ))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/collections"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"content": [{"id": "C1", "name": "Classics"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/readlists"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"content": [{"id": "R1", "name": "Event"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
 
-        let libraries = provider_for(&server)
-            .list_libraries("integration-id")
+        let collections = provider_for(&server).list_collections().await.unwrap();
+
+        let ids: Vec<&str> = collections.iter().map(|c| c.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["library:L1", "collection:C1", "read-list:R1"]);
+    }
+
+    #[tokio::test]
+    async fn list_collections_still_lists_libraries_when_the_extras_fail() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/libraries"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"[{"id": "L1", "name": "Manga"}]"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let collections = provider_for(&server).list_collections().await.unwrap();
+
+        assert_eq!(collections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_items_of_a_collection_pages_its_series() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/collections/C1/series"))
+            .and(query_param("page", "0"))
+            .and(query_param("size", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"content": [{"id": "S1", "name": "Alpha"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let items =
+            Provider::list_items(&provider_for(&server), "collection:C1", Some(1), Some(20))
+                .await
+                .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].external_id, "S1");
+    }
+
+    #[tokio::test]
+    async fn list_items_of_a_read_list_lists_the_series_of_its_books() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/readlists/R1/books"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"content": [
+                    {"id": "B1", "seriesId": "S1", "seriesTitle": "Alpha"},
+                    {"id": "B2", "seriesId": "S2", "seriesTitle": "Beta"},
+                    {"id": "B3", "seriesId": "S1", "seriesTitle": "Alpha"}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let items = Provider::list_items(&provider_for(&server), "read-list:R1", Some(1), Some(20))
             .await
             .unwrap();
 
-        assert_eq!(libraries.len(), 1);
-        assert_eq!(libraries[0].external_id, Some("L1".to_string()));
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "Beta"]);
     }
 
     /// Exercises the provider against a real Komga server:
@@ -511,14 +655,14 @@ mod tests {
             .unwrap();
 
         let provider = KomgaProvider::connect(url, api_key, None, None).unwrap();
-        let libraries = provider.list_libraries("live").await.unwrap();
+        let collections = provider.list_collections().await.unwrap();
         println!(
-            "libraries: {:?}",
-            libraries.iter().map(|l| &l.name).collect::<Vec<_>>()
+            "collections: {:?}",
+            collections.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
 
-        let library_id = libraries[0].external_id.clone().unwrap();
-        let items = Provider::list_items(&provider, &library_id, Some(1), Some(20))
+        let collection_id = collections[0].external_id.clone();
+        let items = Provider::list_items(&provider, &collection_id, Some(1), Some(20))
             .await
             .unwrap();
         println!(

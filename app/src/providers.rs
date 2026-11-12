@@ -1,7 +1,10 @@
-use crate::models::integration::IntegrationType;
-use crate::models::library_item::LibraryItem;
+use std::path::PathBuf;
+
+use crate::models::collection::Collection;
+use crate::models::collection_item::CollectionItem;
+use crate::models::integration::{Integration, IntegrationType};
 use crate::models::series_entry::SeriesEntry;
-use crate::repository::{integration as integration_repository, library as library_repository};
+use crate::repository::integration as integration_repository;
 
 pub mod file_system;
 #[cfg(feature = "kavita")]
@@ -54,20 +57,34 @@ impl ReadingProgress {
     }
 }
 
-/// The backend-agnostic operations the app performs against a library's source.
-/// Kavita is the first implementation; others plug in by adding a
-/// [`ResolvedProvider`] variant. Uses native `async fn`, so it is not
+/// The backend-agnostic operations the app performs against a source (an
+/// integration). Each backend plugs in by adding a [`ResolvedProvider`]
+/// variant. Uses native `async fn`, so it is not
 /// `dyn`-compatible — callers hold a [`ResolvedProvider`] (an `impl Provider`),
 /// not a trait object.
 pub trait Provider {
-    /// Lists a library's series as display items, one page at a time (1-based
-    /// `page`), mirroring the browse screen's pagination.
+    /// Lists everything in the source that gathers series (libraries,
+    /// collections, reading lists, categories, feeds, …), live from the backend.
+    async fn list_collections(&self) -> Result<Vec<Collection>, String>;
+    /// Lists a collection's series as display items, one page at a time
+    /// (1-based `page`), mirroring the browse screen's pagination.
+    /// `collection_id` is a [`Collection::external_id`] this provider listed.
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String>;
+    ) -> Result<Vec<CollectionItem>, String>;
+    /// Copies `files` into the collection, for collections that are
+    /// [`Collection::importable`], returning how many were added. The default
+    /// refuses, for backends whose collections can't take files.
+    async fn import_files(
+        &self,
+        _collection_id: &str,
+        _files: &[PathBuf],
+    ) -> Result<usize, String> {
+        Err("this collection doesn't accept imported files".to_string())
+    }
     async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String>;
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String>;
     async fn volume_cover(&self, integration_id: &str, volume_id: &str) -> Result<Vec<u8>, String>;
@@ -98,6 +115,34 @@ pub trait Provider {
         series_id: &str,
         current: &SeriesEntry,
     ) -> Result<Option<SeriesEntry>, String>;
+    /// The entry to read before `current` in the series `series_id`, offered
+    /// when the reader turns back past `current`'s first page. `None` when
+    /// `current` is the first one. The mirror image of [`Self::next_entry`]
+    /// (see [`entry_before`]).
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String>;
+}
+
+/// Cuts the 1-based `page` of `page_size` items out of `items`, for backends
+/// that hand over a whole collection at once. Without both (or with either
+/// zero), every item is returned.
+pub fn paginate<T>(items: Vec<T>, page: Option<u32>, page_size: Option<u32>) -> Vec<T> {
+    let (Some(page), Some(page_size)) = (page, page_size) else {
+        return items;
+    };
+    if page == 0 || page_size == 0 {
+        return items;
+    }
+
+    let start = ((page - 1) * page_size) as usize;
+    items
+        .into_iter()
+        .skip(start)
+        .take(page_size as usize)
+        .collect()
 }
 
 /// The entry that follows `current` in `entries`, a series' entries in reading
@@ -110,7 +155,16 @@ pub fn entry_after(entries: Vec<SeriesEntry>, current: &SeriesEntry) -> Option<S
     entries.into_iter().nth(position + 1)
 }
 
-/// A provider resolved for a particular library, erasing the concrete backend
+/// The entry that precedes `current` in `entries`, a series' entries in reading
+/// order. `None` when `current` is the first one, or isn't among them at all.
+pub fn entry_before(entries: Vec<SeriesEntry>, current: &SeriesEntry) -> Option<SeriesEntry> {
+    let position = entries
+        .iter()
+        .position(|entry| entry.kind == current.kind && entry.external_id == current.external_id)?;
+    entries.into_iter().nth(position.checked_sub(1)?)
+}
+
+/// A provider resolved for a particular source, erasing the concrete backend
 /// behind the [`Provider`] trait. One variant per supported backend.
 pub enum ResolvedProvider {
     #[cfg(feature = "kavita")]
@@ -146,13 +200,21 @@ macro_rules! dispatch {
 }
 
 impl Provider for ResolvedProvider {
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        dispatch!(self, list_collections())
+    }
+
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
-        dispatch!(self, list_items(library_external_id, page, page_size))
+    ) -> Result<Vec<CollectionItem>, String> {
+        dispatch!(self, list_items(collection_id, page, page_size))
+    }
+
+    async fn import_files(&self, collection_id: &str, files: &[PathBuf]) -> Result<usize, String> {
+        dispatch!(self, import_files(collection_id, files))
     }
 
     async fn list_series_entries(&self, series_id: &str) -> Result<Vec<SeriesEntry>, String> {
@@ -194,78 +256,76 @@ impl Provider for ResolvedProvider {
     ) -> Result<Option<SeriesEntry>, String> {
         dispatch!(self, next_entry(series_id, current))
     }
+
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        dispatch!(self, previous_entry(series_id, current))
+    }
 }
 
-/// Resolves the provider (and the cache namespace to key its covers/pages
-/// under) for the library with `library_external_id`. A library tied to an
-/// integration authenticates that backend; a local library (one with a `folder`
-/// and no integration) resolves a [`FileSystemProvider`] over that path. The
-/// `match` on the integration type is the single place new remote backends are
-/// wired.
-pub async fn provider_for_library(
-    library_external_id: &str,
+/// Resolves the provider for the source (integration) `integration_id`, plus
+/// the cache namespace to key its covers/pages under, which is the
+/// integration's id (a UUID, so always a safe cache-key segment).
+pub async fn provider_for_integration(
+    integration_id: &str,
 ) -> Result<(ResolvedProvider, String), String> {
-    let library = library_repository::find_by_external_id(library_external_id).await?;
+    let integration = integration_repository::find(integration_id).await?;
+    let provider = resolve(integration).await?;
+    Ok((provider, integration_id.to_string()))
+}
 
-    let Some(integration_id) = library.integration_id.clone() else {
-        // No integration: a local, filesystem-backed library. Its own id is the
-        // cache namespace (a UUID, so always a safe cache-key segment).
-        let folder = library
-            .folder
-            .ok_or_else(|| "local library has no folder to read from".to_string())?;
-        return Ok((
-            ResolvedProvider::FileSystem(FileSystemProvider::new(folder)),
-            library.id,
-        ));
-    };
-
-    let integration = integration_repository::find(&integration_id).await?;
+/// Connects (authenticating where the backend needs it) the provider for
+/// `integration`. The `match` on the integration type is the single place new
+/// backends are wired.
+pub async fn resolve(integration: Integration) -> Result<ResolvedProvider, String> {
+    let missing_url = || "integration is missing a url".to_string();
 
     match integration.integration_type {
+        IntegrationType::LocalFolder => {
+            let folder = integration
+                .folder
+                .ok_or_else(|| "local folder source has no folder to read from".to_string())?;
+            Ok(ResolvedProvider::FileSystem(FileSystemProvider::new(
+                folder,
+                integration.name,
+            )))
+        }
         #[cfg(feature = "kavita")]
         IntegrationType::Kavita => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
+            let url = integration.url.ok_or_else(missing_url)?;
             let api_key = integration
                 .api_key
                 .ok_or_else(|| "integration is missing an api key".to_string())?;
 
             let provider = KavitaProvider::authenticate(url, api_key).await?;
-            Ok((ResolvedProvider::Kavita(provider), integration_id))
+            Ok(ResolvedProvider::Kavita(provider))
         }
         #[cfg(feature = "opds")]
         IntegrationType::Opds => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-
+            let url = integration.url.ok_or_else(missing_url)?;
             let provider = OpdsProvider::connect(url, integration.username, integration.password);
-            Ok((ResolvedProvider::Opds(provider), integration_id))
+            Ok(ResolvedProvider::Opds(provider))
         }
         #[cfg(feature = "komga")]
         IntegrationType::Komga => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-
+            let url = integration.url.ok_or_else(missing_url)?;
             let provider = KomgaProvider::connect(
                 url,
                 integration.api_key,
                 integration.username,
                 integration.password,
             )?;
-            Ok((ResolvedProvider::Komga(provider), integration_id))
+            Ok(ResolvedProvider::Komga(provider))
         }
         #[cfg(feature = "suwayomi")]
         IntegrationType::Suwayomi => {
-            let url = integration
-                .url
-                .ok_or_else(|| "integration is missing a url".to_string())?;
-
+            let url = integration.url.ok_or_else(missing_url)?;
             let provider =
                 SuwayomiProvider::connect(url, integration.username, integration.password)?;
-            Ok((ResolvedProvider::Suwayomi(provider), integration_id))
+            Ok(ResolvedProvider::Suwayomi(provider))
         }
         #[allow(unreachable_patterns)]
         integration_type => Err(not_built_in(integration_type)),
@@ -297,6 +357,16 @@ mod tests {
     }
 
     #[test]
+    fn paginate_slices_by_page_and_size() {
+        let items: Vec<u32> = (0..5).collect();
+
+        assert_eq!(paginate(items.clone(), Some(2), Some(2)), vec![2, 3]);
+        assert_eq!(paginate(items.clone(), Some(3), Some(2)), vec![4]);
+        assert!(paginate(items.clone(), Some(9), Some(2)).is_empty());
+        assert_eq!(paginate(items, None, Some(2)).len(), 5);
+    }
+
+    #[test]
     fn entry_after_is_the_following_entry_of_the_same_kind_and_id() {
         let entries = vec![
             entry(EntryKind::Volume, "1"),
@@ -318,5 +388,28 @@ mod tests {
             None
         );
         assert_eq!(entry_after(entries, &entry(EntryKind::Chapter, "9")), None);
+    }
+
+    #[test]
+    fn entry_before_is_the_preceding_entry_of_the_same_kind_and_id() {
+        let entries = vec![
+            entry(EntryKind::Volume, "1"),
+            entry(EntryKind::Chapter, "1"),
+            entry(EntryKind::Chapter, "2"),
+        ];
+
+        assert_eq!(
+            entry_before(entries.clone(), &entry(EntryKind::Chapter, "1")),
+            Some(entry(EntryKind::Volume, "1"))
+        );
+        assert_eq!(
+            entry_before(entries.clone(), &entry(EntryKind::Chapter, "2")),
+            Some(entry(EntryKind::Chapter, "1"))
+        );
+        assert_eq!(
+            entry_before(entries.clone(), &entry(EntryKind::Volume, "1")),
+            None
+        );
+        assert_eq!(entry_before(entries, &entry(EntryKind::Chapter, "9")), None);
     }
 }

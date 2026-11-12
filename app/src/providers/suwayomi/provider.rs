@@ -1,12 +1,12 @@
 use suwayomi_client::client::{Auth, SuwayomiClient};
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
-    models::{library::Library, library_item::LibraryItem, series_entry::SeriesEntry},
+    adapter::{CollectionAdapter, ItemAdapter},
+    models::{collection::Collection, collection_item::CollectionItem, series_entry::SeriesEntry},
     providers::{
         PageRef, Provider,
         suwayomi::adapter::{
-            SuwayomiItemAdapter, SuwayomiLibraryAdapter, category_id, chapter_entry,
+            SuwayomiCollectionAdapter, SuwayomiItemAdapter, category_id, chapter_entry,
             page_chapter_id, parse_chapter_external_id, parse_page_chapter_id,
         },
     },
@@ -70,10 +70,10 @@ impl SuwayomiProvider {
             .to_string())
     }
 
-    /// Lists the server's categories as libraries. The default category is
+    /// Lists the server's categories as collections. The default category is
     /// skipped while it's empty (every manga is in another category), as
     /// Suwayomi's own UI does.
-    pub async fn list_libraries(&self, integration_id: &str) -> Result<Vec<Library>, String> {
+    pub async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         let categories = self
             .client
             .list_categories()
@@ -83,26 +83,66 @@ impl SuwayomiProvider {
         Ok(categories
             .into_iter()
             .filter(|category| !category.default || category.mangas.total_count > 0)
-            .map(|category| SuwayomiLibraryAdapter::adapt_library(category, integration_id))
+            .map(SuwayomiCollectionAdapter::adapt_collection)
             .collect())
+    }
+
+    /// The chapter of manga `series_id` with the closest source order after
+    /// (`forward`) or before `current`'s.
+    async fn sibling_chapter(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+        forward: bool,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let (_, chapter_id) = parse_chapter_external_id(&current.external_id)?;
+        let chapters = self
+            .client
+            .list_chapters(parse_manga_id(series_id)?)
+            .await
+            .map_err(crate::error::log_and_stringify)?;
+
+        let Some(current_order) = chapters
+            .iter()
+            .find(|chapter| chapter.id == chapter_id)
+            .map(|chapter| chapter.source_order)
+        else {
+            return Ok(None);
+        };
+
+        let siblings = chapters.into_iter();
+        let sibling = if forward {
+            siblings
+                .filter(|chapter| chapter.source_order > current_order)
+                .min_by_key(|chapter| chapter.source_order)
+        } else {
+            siblings
+                .filter(|chapter| chapter.source_order < current_order)
+                .max_by_key(|chapter| chapter.source_order)
+        };
+        Ok(sibling.map(chapter_entry))
     }
 }
 
 impl Provider for SuwayomiProvider {
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        self.list_collections().await
+    }
+
     /// Lists one page of a category's mangas. Suwayomi returns a category's
     /// mangas all at once, so the 1-based page is cut out of the full list.
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
+    ) -> Result<Vec<CollectionItem>, String> {
         let page = page.unwrap_or(1).saturating_sub(1) as usize;
         let size = page_size.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
 
         let mangas = self
             .client
-            .list_category_mangas(category_id(library_external_id)?)
+            .list_category_mangas(category_id(collection_id)?)
             .await
             .map_err(crate::error::log_and_stringify)?;
 
@@ -110,7 +150,7 @@ impl Provider for SuwayomiProvider {
             .into_iter()
             .skip(page * size)
             .take(size)
-            .map(|manga| SuwayomiItemAdapter::adapt_item((manga, library_external_id)))
+            .map(SuwayomiItemAdapter::adapt_item)
             .collect())
     }
 
@@ -131,26 +171,15 @@ impl Provider for SuwayomiProvider {
         series_id: &str,
         current: &SeriesEntry,
     ) -> Result<Option<SeriesEntry>, String> {
-        let (_, chapter_id) = parse_chapter_external_id(&current.external_id)?;
-        let chapters = self
-            .client
-            .list_chapters(parse_manga_id(series_id)?)
-            .await
-            .map_err(crate::error::log_and_stringify)?;
+        self.sibling_chapter(series_id, current, true).await
+    }
 
-        let Some(current_order) = chapters
-            .iter()
-            .find(|chapter| chapter.id == chapter_id)
-            .map(|chapter| chapter.source_order)
-        else {
-            return Ok(None);
-        };
-
-        Ok(chapters
-            .into_iter()
-            .filter(|chapter| chapter.source_order > current_order)
-            .min_by_key(|chapter| chapter.source_order)
-            .map(chapter_entry))
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        self.sibling_chapter(series_id, current, false).await
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
@@ -295,6 +324,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(last, None);
+
+        let previous = Provider::previous_entry(&provider, "25", &chapter("25-47"))
+            .await
+            .unwrap();
+        assert_eq!(
+            previous.map(|entry| entry.external_id).as_deref(),
+            Some("25-46")
+        );
+
+        let first = Provider::previous_entry(&provider, "25", &chapter("25-45"))
+            .await
+            .unwrap();
+        assert_eq!(first, None);
     }
 
     #[test]
@@ -329,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_libraries_skips_an_empty_default_category() {
+    async fn list_collections_skips_an_empty_default_category() {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
@@ -344,17 +386,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let libraries = provider_for(&server)
-            .list_libraries("integration-id")
-            .await
-            .unwrap();
+        let collections = provider_for(&server).list_collections().await.unwrap();
 
         assert_eq!(
-            libraries
+            collections
                 .iter()
-                .map(|library| library.external_id.clone().unwrap())
+                .map(|collection| collection.external_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["integration-id:1", "integration-id:2"]
+            vec!["category:1", "category:2"]
         );
     }
 
@@ -372,10 +411,10 @@ mod tests {
             .await;
 
         let provider = provider_for(&server);
-        let second = Provider::list_items(&provider, "integration-id:3", Some(2), Some(2))
+        let second = Provider::list_items(&provider, "category:3", Some(2), Some(2))
             .await
             .unwrap();
-        let past_the_end = Provider::list_items(&provider, "integration-id:3", Some(4), Some(2))
+        let past_the_end = Provider::list_items(&provider, "category:3", Some(4), Some(2))
             .await
             .unwrap();
 
@@ -387,7 +426,6 @@ mod tests {
             vec!["Manga 3", "Manga 4"]
         );
         assert_eq!(second[0].external_id, "3");
-        assert_eq!(second[0].library_id, "integration-id:3");
         assert!(past_the_end.is_empty());
     }
 
@@ -514,14 +552,14 @@ mod tests {
         );
 
         let provider = SuwayomiProvider::connect(url, username, password).unwrap();
-        let libraries = provider.list_libraries("live").await.unwrap();
+        let collections = provider.list_collections().await.unwrap();
         println!(
-            "libraries: {:?}",
-            libraries.iter().map(|l| &l.name).collect::<Vec<_>>()
+            "categories: {:?}",
+            collections.iter().map(|c| &c.name).collect::<Vec<_>>()
         );
 
-        let library_id = libraries[0].external_id.clone().unwrap();
-        let items = Provider::list_items(&provider, &library_id, Some(1), Some(20))
+        let collection_id = collections[0].external_id.clone();
+        let items = Provider::list_items(&provider, &collection_id, Some(1), Some(20))
             .await
             .unwrap();
         println!(
