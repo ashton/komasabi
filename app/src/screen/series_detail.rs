@@ -404,9 +404,11 @@ mod view_helper {
     }
 
     fn top_bar<'a>() -> Element<'a, super::Message> {
-        container(button("Back").on_press(super::Message::BackPressed))
-            .padding(20)
-            .into()
+        container(crate::screen::back_button::back_button(
+            super::Message::BackPressed,
+        ))
+        .padding(20)
+        .into()
     }
 
     fn header<'a>(
@@ -1017,7 +1019,9 @@ mod tests {
         let detail = series_detail(AsyncModel::Loading);
 
         let mut ui = simulator(detail.view());
-        let _ = ui.click("Back").expect("Back button should be found");
+        let _ = ui
+            .click(iced::widget::Id::new(crate::screen::back_button::ID))
+            .expect("the back chevron should be found");
 
         let messages: Vec<_> = ui.into_messages().collect();
 

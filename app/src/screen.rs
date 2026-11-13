@@ -1,3 +1,4 @@
+mod back_button;
 pub mod browse;
 pub mod collections;
 pub mod home;

@@ -106,6 +106,10 @@ active screen's `update`. `src/menu.rs` is the generic sidebar widget; it tracks
 "active" by comparing message *discriminants*, not values — new nav messages must be unit-like
 variants (or the single discriminant will match multiple items).
 
+A screen's top-bar "back" control is `screen::back_button::back_button(msg)`, a chevron with no
+text, so tests click it by its container id (`back_button::ID`). The Back buttons beside a form's
+Save (`screen/integration/*`) stay labelled buttons.
+
 Wrap every `scrollable` in `touch_scroll::touch_scroll(...)`. iced only touch-scrolls when the content
 doesn't capture the finger press, and buttons (every card) do, so without the wrapper a touch screen
 can't scroll. The wrapper turns a drag into pixel wheel scrolls, with flick momentum.

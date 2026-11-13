@@ -171,7 +171,7 @@ mod view_helper {
     fn top_bar<'a>(title: &'a str) -> Element<'a, Message> {
         container(
             row![
-                button("Back").on_press(Message::BackPressed),
+                crate::screen::back_button::back_button(Message::BackPressed),
                 text(title).size(20),
             ]
             .spacing(10)

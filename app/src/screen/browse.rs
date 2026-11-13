@@ -799,7 +799,7 @@ mod view_helper {
 
     fn top_bar<'a>(title: &'a str, importable: bool) -> Element<'a, super::Message> {
         let mut bar = row![
-            button("Back").on_press(super::Message::BackPressed),
+            crate::screen::back_button::back_button(super::Message::BackPressed),
             text(title).size(20),
             iced::widget::space::horizontal(),
         ]
@@ -1772,7 +1772,9 @@ mod tests {
         let browse = browse(AsyncModel::Loading, None);
 
         let mut ui = simulator(browse.view());
-        let _ = ui.click("Back").expect("Back button should be found");
+        let _ = ui
+            .click(iced::widget::Id::new(crate::screen::back_button::ID))
+            .expect("the back chevron should be found");
 
         let messages: Vec<_> = ui.into_messages().collect();
 
