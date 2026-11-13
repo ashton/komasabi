@@ -198,7 +198,13 @@ impl From<AdjacentEntry> for Offer {
         Self {
             label: entry.label,
             kind: entry.kind,
-            cover: entry.cover.map(image::Handle::from_path),
+            // Read as bytes, so the format is told from the content: opened by
+            // path, it would be guessed from the file's extension, and cached
+            // covers have none.
+            cover: entry
+                .cover
+                .and_then(|path| std::fs::read(path).ok())
+                .map(image::Handle::from_bytes),
         }
     }
 }
