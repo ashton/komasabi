@@ -1150,7 +1150,8 @@ impl PageCache {
 }
 
 /// Lists the image files in `dir` in filename order. The host writes pages as
-/// zero-padded names so lexicographic order is reading order.
+/// zero-padded names so lexicographic order is reading order. JSON files are
+/// left out: a downloaded entry's folder keeps its manifest beside its pages.
 fn list_pages(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
@@ -1159,6 +1160,7 @@ fn list_pages(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.is_file())
+        .filter(|path| path.extension().is_none_or(|extension| extension != "json"))
         .collect();
 
     pages.sort();

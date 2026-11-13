@@ -2,7 +2,7 @@
 //! added from their sources. Opening a series shows the items added from it
 //! (see [`super::SeriesDetail::from_library`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iced::widget::image;
 use iced::{Element, Task};
@@ -12,6 +12,7 @@ use crate::models::{
     library_item::{LibraryItem, LibrarySeries, group_into_series},
 };
 use crate::repository::library as library_repository;
+use crate::screen::card::DownloadState;
 
 #[derive(Debug, Default)]
 pub struct Home {
@@ -20,8 +21,13 @@ pub struct Home {
     covers: HashMap<String, image::Handle>,
     /// The [`series_key`] of the series whose card menu is open, if any.
     menu: Option<String>,
-    /// The last remove-from-library failure, shown until the next attempt.
+    /// The last remove-from-library or download failure, shown until the next
+    /// attempt.
     error: Option<String>,
+    /// [`series_key`]s of the series downloaded in full.
+    downloaded: HashSet<String>,
+    /// [`series_key`]s of the series being downloaded.
+    downloading: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +49,14 @@ pub enum Message {
     /// A series (by [`series_key`]) was removed from the Library, or failed
     /// to be.
     SeriesRemoved(String, Result<usize, String>),
+    /// The series downloaded in full, as `(source id, series id)`s.
+    DownloadedSeriesLoaded(HashSet<(String, String)>),
+    /// "Download" was chosen in a series' menu: download each of its
+    /// volumes/chapters for reading offline.
+    DownloadSeries(LibrarySeries),
+    /// A series (by [`series_key`]) finished downloading, carrying how many of
+    /// its entries were downloaded, or why some couldn't be.
+    SeriesDownloaded(String, Result<usize, String>),
 }
 
 #[derive(Debug)]
@@ -75,8 +89,16 @@ impl Home {
                 covers: HashMap::new(),
                 menu: None,
                 error: None,
+                downloaded: HashSet::new(),
+                downloading: HashSet::new(),
             },
-            Task::perform(library_repository::all(), Message::ItemsLoaded),
+            Task::batch([
+                Task::perform(library_repository::all(), Message::ItemsLoaded),
+                Task::perform(
+                    crate::downloads::all_downloaded_series(),
+                    Message::DownloadedSeriesLoaded,
+                ),
+            ]),
         )
     }
 
@@ -84,7 +106,10 @@ impl Home {
         // Doing anything else on the screen closes an open card menu.
         if matches!(
             message,
-            Message::SeriesSelected(_) | Message::RemoveSeries(_) | Message::MenuDismissed
+            Message::SeriesSelected(_)
+                | Message::RemoveSeries(_)
+                | Message::DownloadSeries(_)
+                | Message::MenuDismissed
         ) {
             self.menu = None;
         }
@@ -182,6 +207,58 @@ impl Home {
                 self.error = Some(format!("Could not remove from library: {error}"));
                 Action::None
             }
+
+            Message::DownloadedSeriesLoaded(series) => {
+                self.downloaded.extend(
+                    series
+                        .iter()
+                        .map(|(source, series)| cover_key(source, series)),
+                );
+                Action::None
+            }
+
+            Message::DownloadSeries(series) => {
+                let key = series_key(&series);
+                if self.downloaded.contains(&key) || !self.downloading.insert(key.clone()) {
+                    return Action::None;
+                }
+                self.error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::downloads::download_series(
+                        series.integration_id,
+                        series.series_external_id,
+                        series.name,
+                    )),
+                    move |result| Message::SeriesDownloaded(key.clone(), result),
+                ))
+            }
+
+            Message::SeriesDownloaded(key, result) => {
+                self.downloading.remove(&key);
+                match result {
+                    Ok(downloaded) => {
+                        tracing::debug!("downloaded {downloaded} item(s) of {key}");
+                        self.downloaded.insert(key);
+                    }
+                    Err(error) => {
+                        tracing::debug!("failed to download {key}: {error}");
+                        self.error = Some(format!("Could not download: {error}"));
+                    }
+                }
+                Action::None
+            }
+        }
+    }
+
+    /// Whether the series with the [`series_key`] `key` is downloaded.
+    fn download_state(&self, key: &str) -> DownloadState {
+        if self.downloading.contains(key) {
+            DownloadState::Downloading
+        } else if self.downloaded.contains(key) {
+            DownloadState::Downloaded
+        } else {
+            DownloadState::NotDownloaded
         }
     }
 
@@ -191,6 +268,7 @@ impl Home {
             &self.covers,
             self.menu.as_deref(),
             self.error.as_deref(),
+            &|key: &str| self.download_state(key),
         )
     }
 }
@@ -243,7 +321,10 @@ mod view_helper {
     use super::{Message, series_key};
     use crate::icons;
     use crate::models::{AsyncModel, library_item::LibrarySeries};
-    use crate::screen::card::{self, COVER_RADIUS};
+    use crate::screen::card::{self, COVER_RADIUS, DownloadState};
+
+    /// Whether a series (by [`series_key`]) is downloaded.
+    type DownloadStateOf<'b> = &'b dyn Fn(&str) -> DownloadState;
     use crate::touch_scroll::touch_scroll;
 
     pub fn view<'a>(
@@ -251,11 +332,12 @@ mod view_helper {
         covers: &'a HashMap<String, image::Handle>,
         open_menu: Option<&str>,
         error: Option<&'a str>,
+        download_state: DownloadStateOf<'_>,
     ) -> Element<'a, Message> {
         let body: Element<'a, Message> = match series {
             // Centered on the whole screen, with no title above it.
             AsyncModel::Loaded(series) if series.is_empty() => return empty_state(),
-            AsyncModel::Loaded(series) => series_grid(series, covers, open_menu),
+            AsyncModel::Loaded(series) => series_grid(series, covers, open_menu, download_state),
             AsyncModel::Error(error) => container(text(error)).center_x(Fill).padding(40).into(),
             AsyncModel::NotLoaded | AsyncModel::Loading => container(row![]).padding(40).into(),
         };
@@ -285,11 +367,12 @@ mod view_helper {
         series: &'a [LibrarySeries],
         covers: &'a HashMap<String, image::Handle>,
         open_menu: Option<&str>,
+        download_state: DownloadStateOf<'_>,
     ) -> Element<'a, Message> {
         let cards = series.iter().map(|series| {
             let key = series_key(series);
             let menu_open = open_menu == Some(key.as_str());
-            series_card(series, covers.get(&key), menu_open)
+            series_card(series, covers.get(&key), menu_open, download_state(&key))
         });
 
         grid(cards)
@@ -305,6 +388,7 @@ mod view_helper {
         series: &'a LibrarySeries,
         cover: Option<&image::Handle>,
         menu_open: bool,
+        download: DownloadState,
     ) -> Element<'a, Message> {
         // Only its top corners are rounded: the bar carries on below it.
         let image: Element<'a, Message> = match cover {
@@ -342,18 +426,24 @@ mod view_helper {
         let cover = if menu_open {
             stack![
                 cover,
-                card::menu(vec![card::menu_item(
-                    "trash",
-                    "Remove from library",
-                    Message::RemoveSeries(series.clone()),
-                )])
+                card::menu(
+                    download
+                        .menu_item(Message::DownloadSeries(series.clone()))
+                        .into_iter()
+                        .chain([card::menu_item(
+                            "trash",
+                            "Remove from library",
+                            Message::RemoveSeries(series.clone()),
+                        )])
+                        .collect()
+                )
             ]
             .into()
         } else {
             cover
         };
 
-        column![cover, card_bar(series)]
+        column![cover, card_bar(series, download)]
             .width(Fill)
             .height(Fill)
             .into()
@@ -361,7 +451,7 @@ mod view_helper {
 
     /// The bar under a series' cover: its title, a link to the series, its
     /// item count, and the "⋮" button opening its menu.
-    fn card_bar<'a>(series: &'a LibrarySeries) -> Element<'a, Message> {
+    fn card_bar<'a>(series: &'a LibrarySeries, download: DownloadState) -> Element<'a, Message> {
         // A title too long for the card is cut off (by the bar), not wrapped.
         let title = button(text(&series.name).size(13).wrapping(text::Wrapping::None))
             .on_press(Message::SeriesSelected(series.clone()))
@@ -386,7 +476,7 @@ mod view_helper {
         .spacing(2);
 
         card::bar(
-            "cloud",
+            download.icon(),
             name.into(),
             Some(Message::MenuToggled(series_key(series))),
         )
@@ -552,6 +642,53 @@ mod tests {
         assert!(matches!(&home.series, AsyncModel::Loaded(series) if series.len() == 1));
         let mut ui = simulator(home.view());
         assert!(ui.find("Could not remove from library: locked").is_ok());
+    }
+
+    #[test]
+    fn a_series_is_offered_a_download_until_it_is_downloaded() {
+        let mut home = loaded(vec![item("s", "1", "1", 10, 0)]);
+        let series = match &home.series {
+            AsyncModel::Loaded(series) => series[0].clone(),
+            _ => panic!("the series should be loaded"),
+        };
+        assert_eq!(home.download_state("s/1").icon(), "cloud");
+
+        let _ = home.update(Message::MenuToggled("s/1".to_string()));
+        let mut ui = simulator(home.view());
+        let _ = ui
+            .click("Download")
+            .expect("the download item should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(messages.contains(&Message::DownloadSeries(series.clone())));
+
+        assert!(matches!(
+            home.update(Message::DownloadSeries(series.clone())),
+            Action::Run(_)
+        ));
+        assert_eq!(home.download_state("s/1"), DownloadState::Downloading);
+        assert!(matches!(
+            home.update(Message::DownloadSeries(series.clone())),
+            Action::None
+        ));
+
+        let _ = home.update(Message::SeriesDownloaded("s/1".to_string(), Ok(1)));
+        assert_eq!(home.download_state("s/1").icon(), "download");
+        let _ = home.update(Message::MenuToggled("s/1".to_string()));
+        let mut ui = simulator(home.view());
+        assert!(ui.find("Download").is_err());
+        assert!(ui.find("Remove from library").is_ok());
+    }
+
+    #[test]
+    fn series_downloaded_earlier_show_as_downloaded() {
+        let mut home = loaded(vec![item("s", "1", "1", 10, 0)]);
+
+        let _ = home.update(Message::DownloadedSeriesLoaded(HashSet::from([(
+            "s".to_string(),
+            "1".to_string(),
+        )])));
+
+        assert_eq!(home.download_state("s/1"), DownloadState::Downloaded);
     }
 
     #[test]

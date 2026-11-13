@@ -190,11 +190,13 @@ runs `library::add_series_to_library` to save every entry the source lists for t
 Under each series cover is the same bar as an entry card's (`screen::card`, also shared), with the
 title as a link to the series. A series with any item in the Library (`repository::library::series_ids`,
 loaded when the screen opens) shows "In library" and gets the "⋮" menu, whose "Remove from library"
-runs `repository::library::remove_series`. Adding never downloads anything. Each entry card has a
-bar under its cover (name, page count) with, when the entry is in the Library, a "⋮" button. It
-toggles a menu stacked over the cover (iced has no context menu; a `mouse_area` over the screen closes
-it on an outside click) offering "Delete" (`repository::library::remove`). A Library series that loses
-its last item goes back home. `screen/home.rs` lists the Library's series
+runs `repository::library::remove_series`. Adding never downloads anything: that's the separate
+download feature (see below). Each entry card has a bar under its cover (download icon, name,
+page count) with a "⋮" button. It toggles a menu stacked over the cover (iced has no context menu; a
+`mouse_area` over the screen closes it on an outside click) offering "Download" until the entry is
+downloaded (`downloads::download_one`) and, when the entry is in the Library, "Delete"
+(`repository::library::remove`). A downloaded entry outside the Library has no "⋮". A Library series that loses its last item goes back
+home. `screen/home.rs` lists the Library's series
 (`library_item::group_into_series`), with covers fetched from their sources. Each series card has the
 same bar (`screen::card`), whose "⋮" menu always offers "Remove from library"
 (`repository::library::remove_series`). Opening one opens
@@ -209,6 +211,22 @@ as saved and `library::sync_progress` runs in the background: for sources whose
 `Provider::tracks_reading_progress` is true (Kavita, Komga, Suwayomi), it lists each series' entries
 and copies their read state onto the items (the source wins, even backwards), then the screen shows
 the synced items.
+
+**Downloads (`src/downloads.rs`, `screen/downloads.rs`).** A series card's "⋮" menu (browse and
+home) offers "Download" until the series is downloaded; `screen::card::DownloadState` drives that
+item and the bar's leading icon (`cloud`, then `download`). `downloads::download_series` lists the
+series' entries through its provider and saves each one not yet downloaded to
+`<data dir>/downloads/<source>/<series>/<entry>/` (names escaped by `cache::file_name`): its pages as
+`reader_launch::page_file` names, filled in a `.part` folder that's renamed into place once its
+`manifest.json` (entry, series and `PageRef`s) is written. A single entry is downloaded from its card's menu
+(`downloads::download_one`), and `downloads::downloaded_entries` tells a series screen which are. A
+`series.json` marks a series whose every entry downloaded (written by either path once all are);
+removing any entry drops it. Nothing is in the database: the folders are the
+record. The sidebar's Downloads screen lists every downloaded entry under its series (first page as
+cover); clicking reads it, and its "⋮" menu's "Remove download" runs `downloads::remove`. Reading
+any entry (`reader_launch`) first checks `downloads::local_entry`: a downloaded one opens on its
+folder with its saved pages, so nothing is streamed, and when its source can't even be resolved it's
+served through `reader_launch::Offline` (no adjacent entries or reading history).
 
 **OPDS provider (`providers::opds`).** Added via the integrations screen's "OPDS" type (catalog URL +
 optional basic-auth username/password, stored in `integrations.username`/`password`). OPDS has no

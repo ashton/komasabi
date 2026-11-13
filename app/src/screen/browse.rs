@@ -8,6 +8,7 @@ use iced::{Element, Task};
 use crate::models::{AsyncModel, collection::CollectionRef, collection_item::CollectionItem};
 use crate::providers::{Provider, provider_for_integration};
 use crate::repository::library as library_repository;
+use crate::screen::card::DownloadState;
 
 /// Number of items fetched per page, and the unit eviction operates on:
 /// pages are dropped from (or re-fetched back into) memory as a whole,
@@ -56,6 +57,11 @@ pub struct Browse {
     add_error: Option<String>,
     /// The `external_id` of the series whose card menu is open, if any.
     menu: Option<String>,
+    /// `external_id`s of this source's series downloaded in full, loaded when
+    /// the screen opens and kept up to date as series are downloaded.
+    downloaded_series: HashSet<String>,
+    /// `external_id`s of the series being downloaded.
+    downloading: HashSet<String>,
 }
 
 /// Whether a series card offers to add the whole series to the Library.
@@ -73,6 +79,7 @@ pub enum AddState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardState {
     pub add: AddState,
+    pub download: DownloadState,
     /// Whether the card's menu is open.
     pub menu_open: bool,
 }
@@ -121,6 +128,14 @@ pub enum Message {
     /// A series (by `external_id`) was removed from the Library, carrying how
     /// many items went with it, or it failed to be.
     SeriesRemovedFromLibrary(String, Result<usize, String>),
+    /// The ids of this source's series downloaded in full.
+    DownloadedSeriesLoaded(HashSet<String>),
+    /// "Download" was chosen in a series' menu (by `external_id`): download
+    /// each of its volumes/chapters for reading offline.
+    DownloadSeries(String),
+    /// A series (by `external_id`) finished downloading, carrying how many of
+    /// its entries were downloaded, or why some couldn't be.
+    SeriesDownloaded(String, Result<usize, String>),
     BackPressed,
     /// The "Import items" button was pressed; opens the file picker.
     ImportPressed,
@@ -177,6 +192,10 @@ impl Browse {
                 library_repository::series_ids(location.integration_id.clone()),
                 Message::LibrarySeriesLoaded,
             ),
+            Task::perform(
+                crate::downloads::downloaded_series(location.integration_id.clone()),
+                Message::DownloadedSeriesLoaded,
+            ),
         ]);
 
         (
@@ -196,6 +215,8 @@ impl Browse {
                 library_series: HashSet::new(),
                 add_error: None,
                 menu: None,
+                downloaded_series: HashSet::new(),
+                downloading: HashSet::new(),
             },
             task,
         )
@@ -210,6 +231,7 @@ impl Browse {
                 | Message::ImportPressed
                 | Message::AddSeriesToLibrary(_)
                 | Message::RemoveSeriesFromLibrary(_)
+                | Message::DownloadSeries(_)
                 | Message::MenuDismissed
         ) {
             self.menu = None;
@@ -447,6 +469,48 @@ impl Browse {
                 Action::None
             }
 
+            Message::DownloadedSeriesLoaded(series) => {
+                self.downloaded_series.extend(series);
+                Action::None
+            }
+
+            Message::DownloadSeries(external_id) => {
+                let Some(item) = self.loaded_item(&external_id) else {
+                    return Action::None;
+                };
+                let series_name = item.name.clone();
+                if self.downloaded_series.contains(&external_id)
+                    || !self.downloading.insert(external_id.clone())
+                {
+                    return Action::None;
+                }
+                self.add_error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::downloads::download_series(
+                        self.location.integration_id.clone(),
+                        external_id.clone(),
+                        series_name,
+                    )),
+                    move |result| Message::SeriesDownloaded(external_id.clone(), result),
+                ))
+            }
+
+            Message::SeriesDownloaded(external_id, result) => {
+                self.downloading.remove(&external_id);
+                match result {
+                    Ok(downloaded) => {
+                        tracing::debug!("downloaded {downloaded} item(s) of {external_id}");
+                        self.downloaded_series.insert(external_id);
+                    }
+                    Err(error) => {
+                        tracing::debug!("failed to download {external_id}: {error}");
+                        self.add_error = Some(format!("Could not download: {error}"));
+                    }
+                }
+                Action::None
+            }
+
             Message::MenuToggled(external_id) => {
                 self.menu = (self.menu.as_ref() != Some(&external_id)).then_some(external_id);
                 Action::None
@@ -552,8 +616,17 @@ impl Browse {
 
     /// How the series `external_id`'s card is drawn.
     fn card_state(&self, external_id: &str) -> CardState {
+        let download = if self.downloading.contains(external_id) {
+            DownloadState::Downloading
+        } else if self.downloaded_series.contains(external_id) {
+            DownloadState::Downloaded
+        } else {
+            DownloadState::NotDownloaded
+        };
+
         CardState {
             add: self.add_state(external_id),
+            download,
             menu_open: self.menu.as_deref() == Some(external_id),
         }
     }
@@ -958,7 +1031,7 @@ mod view_helper {
         },
     };
 
-    use super::{AddState, CardState};
+    use super::{AddState, CardState, DownloadState};
     use crate::models::{AsyncModel, collection_item::CollectionItem};
     use crate::screen::card::{self, COVER_RADIUS};
     use crate::screen::cover_overlay;
@@ -1106,21 +1179,25 @@ mod view_helper {
         let name = column![title_link(item), pages_label(item.pages)].spacing(2);
 
         card::bar(
-            "cloud",
+            state.download.icon(),
             name.into(),
             has_menu(state).then(|| super::Message::MenuToggled(item.external_id.clone())),
         )
     }
 
-    /// Whether a series' menu has anything to offer: removing it from the
-    /// Library, if it's in it.
+    /// Whether a series' menu has anything to offer: downloading it, unless
+    /// it's downloaded, and removing it from the Library, if it's in it.
     pub(super) fn has_menu(state: CardState) -> bool {
-        state.add == AddState::Added
+        state.add == AddState::Added || state.download != DownloadState::Downloaded
     }
 
     /// A series' open menu, laid over the bottom-right of its cover.
     fn series_menu<'a>(item: &CollectionItem, state: CardState) -> Element<'a, super::Message> {
-        let mut items: Vec<Element<'a, super::Message>> = Vec::new();
+        let mut items: Vec<Element<'a, super::Message>> = state
+            .download
+            .menu_item(super::Message::DownloadSeries(item.external_id.clone()))
+            .into_iter()
+            .collect();
         if state.add == AddState::Added {
             items.push(card::menu_item(
                 "trash",
@@ -1287,6 +1364,8 @@ mod tests {
             library_series: HashSet::new(),
             add_error: None,
             menu: None,
+            downloaded_series: HashSet::new(),
+            downloading: HashSet::new(),
         }
     }
 
@@ -1574,6 +1653,102 @@ mod tests {
             browse.update(Message::AddSeriesToLibrary("One Piece".to_string())),
             Action::None
         ));
+    }
+
+    #[test]
+    fn a_series_not_downloaded_offers_a_download_with_a_cloud_icon() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let state = browse.card_state("One Piece");
+        assert_eq!(state.download, DownloadState::NotDownloaded);
+        assert_eq!(state.download.icon(), "cloud");
+        // Not in the Library, but downloadable, so it has a menu.
+        assert!(view_helper::has_menu(state));
+
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+        let mut ui = simulator(browse.view());
+        let _ = ui
+            .click("Download")
+            .expect("the download item should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(messages.contains(&Message::DownloadSeries("One Piece".to_string())));
+    }
+
+    #[test]
+    fn downloading_a_series_runs_once_then_shows_it_downloaded() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+
+        assert!(matches!(
+            browse.update(Message::DownloadSeries("One Piece".to_string())),
+            Action::Run(_)
+        ));
+        assert_eq!(
+            browse.card_state("One Piece").download,
+            DownloadState::Downloading
+        );
+        assert!(matches!(
+            browse.update(Message::DownloadSeries("One Piece".to_string())),
+            Action::None
+        ));
+
+        let _ = browse.update(Message::SeriesDownloaded("One Piece".to_string(), Ok(4)));
+        let state = browse.card_state("One Piece");
+        assert_eq!(state.download, DownloadState::Downloaded);
+        assert_eq!(state.download.icon(), "download");
+        // Downloaded and not in the Library: nothing left for its menu.
+        assert!(!view_helper::has_menu(state));
+        assert!(matches!(
+            browse.update(Message::DownloadSeries("One Piece".to_string())),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn a_downloaded_series_is_not_offered_a_download() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+        let _ = browse.update(Message::DownloadedSeriesLoaded(HashSet::from([
+            "One Piece".to_string(),
+        ])));
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+
+        let mut ui = simulator(browse.view());
+        assert!(ui.find("Download").is_err());
+        assert!(ui.find("Remove from library").is_ok());
+    }
+
+    #[test]
+    fn a_failed_download_is_reported_and_can_be_retried() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::DownloadSeries("One Piece".to_string()));
+
+        let _ = browse.update(Message::SeriesDownloaded(
+            "One Piece".to_string(),
+            Err("1 of 2 could not be downloaded".to_string()),
+        ));
+
+        assert_eq!(
+            browse.card_state("One Piece").download,
+            DownloadState::NotDownloaded
+        );
+        let mut ui = simulator(browse.view());
+        assert!(
+            ui.find("Could not download: 1 of 2 could not be downloaded")
+                .is_ok()
+        );
     }
 
     #[test]

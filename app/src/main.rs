@@ -16,6 +16,7 @@
 mod adapter;
 mod cache;
 pub mod database;
+mod downloads;
 mod error;
 mod icons;
 mod library;
@@ -33,7 +34,10 @@ mod touch_scroll;
 use crate::{
     menu::{Menu, MenuItem},
     models::collection::CollectionRef,
-    screen::{Home, browse, collections, home, integration, series_detail, settings},
+    screen::{
+        Home, browse, collections, downloads as downloads_screen, home, integration, series_detail,
+        settings,
+    },
 };
 use iced::{
     Element,
@@ -52,12 +56,14 @@ enum Message {
     OpenSettings,
     OpenHome,
     OpenIntegrations,
+    OpenDownloads,
     Settings(settings::Message),
     Home(home::Message),
     Collections(collections::Message),
     Browse(browse::Message),
     SeriesDetail(series_detail::Message),
     Integrations(integration::Message),
+    Downloads(downloads_screen::Message),
 }
 
 struct KomasabiApp {
@@ -77,7 +83,7 @@ impl KomasabiApp {
                         MenuItem::new("house", "Home", true, Some(Message::OpenHome)),
                         MenuItem::new("cloud", "Sources", false, Some(Message::OpenIntegrations)),
                         MenuItem::new("magnifying_glass", "Search", false, None),
-                        MenuItem::new("download", "Downloads", false, None),
+                        MenuItem::new("download", "Downloads", false, Some(Message::OpenDownloads)),
                     ],
                     vec![MenuItem::new(
                         "gear",
@@ -221,6 +227,17 @@ impl KomasabiApp {
             Message::OpenSettings => self.open_settings(),
             Message::OpenHome => self.open_home(),
             Message::OpenIntegrations => self.open_integrations(),
+            Message::OpenDownloads => self.open_downloads(),
+            Message::Downloads(msg) => {
+                let Screen::Downloads(downloads) = &mut self.screen else {
+                    return Task::none();
+                };
+
+                match downloads.update(msg) {
+                    downloads_screen::Action::None => Task::none(),
+                    downloads_screen::Action::Run(task) => task.map(Message::Downloads),
+                }
+            }
         }
     }
 
@@ -232,6 +249,7 @@ impl KomasabiApp {
             Screen::SeriesDetail(series_detail) => series_detail.view().map(Message::SeriesDetail),
             Screen::Settings(settings) => settings.view().map(Message::Settings),
             Screen::Integrations(integrations) => integrations.view().map(Message::Integrations),
+            Screen::Downloads(downloads) => downloads.view().map(Message::Downloads),
         };
 
         container(
@@ -317,6 +335,14 @@ impl KomasabiApp {
         self.menu.set_active(&Message::OpenIntegrations);
 
         task.map(Message::Integrations)
+    }
+
+    fn open_downloads(&mut self) -> Task<Message> {
+        let (params, task) = screen::Downloads::new();
+        self.screen = Screen::Downloads(params);
+        self.menu.set_active(&Message::OpenDownloads);
+
+        task.map(Message::Downloads)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {

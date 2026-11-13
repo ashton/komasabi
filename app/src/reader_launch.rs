@@ -21,6 +21,12 @@
 //! up ([`ReaderEvent::OpenAdjacent`]), the same reader window moves on to that
 //! entry: the worker opens a new session in it, with its own page folder (from
 //! its last page, going back), and streams its pages the same way.
+//!
+//! A downloaded entry (see [`downloads`]) isn't streamed: the reader is pointed
+//! at its download folder, whose pages are all there already, and its pages are
+//! the ones saved with it, so the source isn't asked for any. It's read even
+//! when the source can't be reached, only without the source's reading history
+//! and adjacent entries.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -39,6 +45,7 @@ use uuid::Uuid;
 use komasabi_reader::{AdjacentEntry, Direction, ReaderCommand, ReaderEvent};
 
 use crate::cache;
+use crate::downloads::{self, DownloadedEntry};
 use crate::models::library_item::LibraryItem;
 use crate::models::series_entry::{EntryKind, SeriesEntry};
 use crate::providers::{PageRef, Provider, provider_for_integration};
@@ -62,6 +69,8 @@ struct SessionSpec {
     dir: PathBuf,
     /// The page (0-based) to open the entry on.
     start_page: usize,
+    /// The entry's download, when it's downloaded: `dir` is then its folder.
+    local: Option<DownloadedEntry>,
     /// Told once the reader has closed, when someone wants to know.
     closed: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -75,9 +84,8 @@ pub async fn prepare_and_launch(
     series_name: String,
     entry: SeriesEntry,
 ) -> Result<(), String> {
-    // A source's pages are cached under its id (see
-    // `providers::provider_for_integration`).
-    let dir = entry_dir(&integration_id, &entry)?;
+    let local = downloads::local_entry(&integration_id, &series_external_id, &entry);
+    let dir = reading_dir(&integration_id, &entry, local.as_ref())?;
 
     let socket_name = bind_and_serve(SessionSpec {
         integration_id,
@@ -86,6 +94,7 @@ pub async fn prepare_and_launch(
         entry,
         dir: dir.clone(),
         start_page: 0,
+        local,
         closed: None,
     })?;
 
@@ -101,7 +110,8 @@ pub fn launch_library_item(
     item: LibraryItem,
 ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
     let entry = item.as_entry();
-    let dir = entry_dir(&item.integration_id, &entry)?;
+    let local = downloads::local_entry(&item.integration_id, &item.series_external_id, &entry);
+    let dir = reading_dir(&item.integration_id, &entry, local.as_ref())?;
     let (done, closed) = tokio::sync::oneshot::channel();
 
     let socket_name = bind_and_serve(SessionSpec {
@@ -111,11 +121,27 @@ pub fn launch_library_item(
         start_page: resume_page(item.pages_read, item.pages),
         entry,
         dir: dir.clone(),
+        local,
         closed: Some(done),
     })?;
 
     spawn_reader(&dir, &socket_name)?;
     Ok(closed)
+}
+
+/// The folder the reader shows `entry`'s pages from: its download's, when
+/// it's downloaded, otherwise the cache folder they're streamed into.
+fn reading_dir(
+    namespace: &str,
+    entry: &SeriesEntry,
+    local: Option<&DownloadedEntry>,
+) -> Result<PathBuf, String> {
+    match local {
+        Some(local) => Ok(local.dir.clone()),
+        // A source's pages are cached under its id (see
+        // `providers::provider_for_integration`).
+        None => entry_dir(namespace, entry),
+    }
 }
 
 /// Creates (if need be) and returns the cache folder `entry`'s pages are
@@ -209,10 +235,32 @@ fn serve_session(listener: Listener, mut spec: SessionSpec) {
 /// next entry, the same reader is handed a new session for it, until the reader
 /// closes.
 async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String> {
-    let (provider, namespace) = provider_for_integration(&spec.integration_id).await?;
+    match provider_for_integration(&spec.integration_id).await {
+        Ok((provider, namespace)) => run_session_with(&provider, namespace, listener, spec).await,
+        // A downloaded entry needs nothing from its source to be read.
+        Err(error) if spec.local.is_some() => {
+            tracing::warn!("reading a download offline, as its source failed: {error}");
+            let namespace = spec.integration_id.clone();
+            run_session_with(&Offline(error), namespace, listener, spec).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// [`run_session`], with the source's `provider` resolved (or standing in for
+/// it, see [`Offline`]).
+async fn run_session_with(
+    provider: &impl Provider,
+    namespace: String,
+    listener: Listener,
+    spec: SessionSpec,
+) -> Result<(), String> {
     let mut entry = spec.entry;
     let mut dir = spec.dir;
-    let mut plan = provider.reader_pages(&entry).await?;
+    let mut plan = match spec.local {
+        Some(local) => local.pages,
+        None => provider.reader_pages(&entry).await?,
+    };
     if plan.is_empty() {
         return Err("this entry has no pages to read".to_string());
     }
@@ -259,11 +307,11 @@ async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String
             dir: &dir,
             stream: &stream,
         };
-        let Some(chosen) = serve_entry(&provider, session, &mut events).await else {
+        let Some(chosen) = serve_entry(provider, session, &mut events).await else {
             return Ok(());
         };
 
-        match prepare_entry(&provider, &namespace, &chosen.entry).await {
+        match prepare_entry(provider, &namespace, &spec.series_id, &chosen.entry).await {
             Ok((new_dir, new_plan)) => {
                 // Going back, carry on from the end of the entry before.
                 let start_page = match chosen.direction {
@@ -292,6 +340,53 @@ async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String
     }
 }
 
+/// Stands in for a source that can't be reached while a downloaded entry is
+/// read: every request fails with why the source couldn't be resolved, so the
+/// reader just isn't offered adjacent entries, and no reading history is sent.
+struct Offline(String);
+
+impl Provider for Offline {
+    async fn list_collections(&self) -> Result<Vec<crate::models::collection::Collection>, String> {
+        Err(self.0.clone())
+    }
+    async fn list_items(
+        &self,
+        _: &str,
+        _: Option<u32>,
+        _: Option<u32>,
+    ) -> Result<Vec<crate::models::collection_item::CollectionItem>, String> {
+        Err(self.0.clone())
+    }
+    async fn list_series_entries(&self, _: &str) -> Result<Vec<SeriesEntry>, String> {
+        Err(self.0.clone())
+    }
+    async fn cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        Err(self.0.clone())
+    }
+    async fn volume_cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        Err(self.0.clone())
+    }
+    async fn chapter_cover(&self, _: &str, _: &str) -> Result<Vec<u8>, String> {
+        Err(self.0.clone())
+    }
+    async fn reader_pages(&self, _: &SeriesEntry) -> Result<Vec<PageRef>, String> {
+        Err(self.0.clone())
+    }
+    async fn reader_image(&self, _: &str, _: u16) -> Result<Vec<u8>, String> {
+        Err(self.0.clone())
+    }
+    async fn next_entry(&self, _: &str, _: &SeriesEntry) -> Result<Option<SeriesEntry>, String> {
+        Err(self.0.clone())
+    }
+    async fn previous_entry(
+        &self,
+        _: &str,
+        _: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        Err(self.0.clone())
+    }
+}
+
 /// The reader's name for an entry's kind.
 fn reader_kind(kind: EntryKind) -> komasabi_reader::EntryKind {
     match kind {
@@ -300,12 +395,17 @@ fn reader_kind(kind: EntryKind) -> komasabi_reader::EntryKind {
     }
 }
 
-/// The page folder and pages of `entry`, ready for a new reader session.
+/// The page folder and pages of `entry`, of the series `series_id`, ready for
+/// a new reader session: its download's, when it's downloaded.
 async fn prepare_entry(
     provider: &impl Provider,
     namespace: &str,
+    series_id: &str,
     entry: &SeriesEntry,
 ) -> Result<(PathBuf, Vec<PageRef>), String> {
+    if let Some(local) = downloads::local_entry(namespace, series_id, entry) {
+        return Ok((local.dir, local.pages));
+    }
     let dir = entry_dir(namespace, entry)?;
     let plan = provider.reader_pages(entry).await?;
     if plan.is_empty() {
@@ -622,7 +722,7 @@ fn write_page(dir: &Path, index: usize, bytes: &[u8]) -> std::io::Result<()> {
 
 /// The file name for page `index`: zero-padded so it matches what the reader
 /// derives from the index.
-fn page_file(index: usize) -> String {
+pub(crate) fn page_file(index: usize) -> String {
     format!("{index:05}.img")
 }
 

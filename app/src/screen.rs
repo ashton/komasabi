@@ -3,6 +3,7 @@ pub mod browse;
 mod card;
 pub mod collections;
 mod cover_overlay;
+pub mod downloads;
 pub mod home;
 pub mod integration;
 pub mod series_detail;
@@ -10,6 +11,7 @@ pub mod settings;
 
 pub use browse::Browse;
 pub use collections::Collections;
+pub use downloads::Downloads;
 pub use home::Home;
 pub use integration::Integrations;
 pub use series_detail::SeriesDetail;
@@ -25,5 +27,7 @@ pub enum Screen {
     /// One collection's series.
     Browse(Browse),
     SeriesDetail(SeriesDetail),
+    /// Every downloaded volume/chapter.
+    Downloads(Downloads),
     Settings(Settings),
 }

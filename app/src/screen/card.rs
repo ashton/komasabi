@@ -165,3 +165,41 @@ fn menu_button_style(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// Whether a series is downloaded for reading offline (see
+/// [`crate::downloads`]), which its card shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DownloadState {
+    /// Read from its source: offer to download it.
+    #[default]
+    NotDownloaded,
+    /// Being downloaded.
+    Downloading,
+    /// Every entry of it is downloaded.
+    Downloaded,
+}
+
+impl DownloadState {
+    /// The icon leading a series card's bar: a cloud while it's read from its
+    /// source, a download arrow once it's downloaded.
+    pub fn icon(self) -> &'static str {
+        match self {
+            DownloadState::NotDownloaded | DownloadState::Downloading => "cloud",
+            DownloadState::Downloaded => "download",
+        }
+    }
+
+    /// The card menu's item for downloading the series, sending `download`,
+    /// or `None` once it's downloaded.
+    pub fn menu_item<'a, Message: Clone + 'a>(
+        self,
+        download: Message,
+    ) -> Option<Element<'a, Message>> {
+        match self {
+            DownloadState::NotDownloaded => Some(menu_item("download", "Download", download)),
+            DownloadState::Downloading => {
+                Some(menu_item_maybe::<Message>("spinner", "Downloading…", None))
+            }
+            DownloadState::Downloaded => None,
+        }
+    }
+}
