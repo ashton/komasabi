@@ -7,6 +7,8 @@ use crate::schema::integrations;
 pub enum IntegrationType {
     Kavita,
     Komga,
+    /// A folder on this machine, read straight from disk.
+    LocalFolder,
     Opds,
     Suwayomi,
 }
@@ -16,6 +18,7 @@ impl IntegrationType {
         match self {
             IntegrationType::Kavita => "Kavita",
             IntegrationType::Komga => "Komga",
+            IntegrationType::LocalFolder => "Local folder",
             IntegrationType::Suwayomi => "Suwayomi",
             IntegrationType::Opds => "OPDS Server",
         }
@@ -34,4 +37,6 @@ pub struct Integration {
     /// (OPDS catalogs).
     pub username: Option<String>,
     pub password: Option<String>,
+    /// The folder a [`IntegrationType::LocalFolder`] source reads from.
+    pub folder: Option<String>,
 }

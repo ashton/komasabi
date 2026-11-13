@@ -50,7 +50,7 @@ const MAX_KEY_LEN: usize = 160;
 /// The file name for `key`: the escaped key when short enough, otherwise a
 /// stable hash of it. Provider ids can be long (an OPDS id encodes a URL), and
 /// a name past the filesystem's limit would make the cache silently miss.
-fn file_name(key: &str) -> String {
+pub(crate) fn file_name(key: &str) -> String {
     let escaped = escape(key);
     if escaped.len() <= MAX_KEY_LEN {
         escaped
@@ -67,14 +67,15 @@ fn file_name(key: &str) -> String {
 fn escape(key: &str) -> String {
     use std::fmt::Write;
 
-    key.bytes().fold(String::with_capacity(key.len()), |mut out, byte| {
-        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
-            out.push(char::from(byte));
-        } else {
-            let _ = write!(out, "%{byte:02X}");
-        }
-        out
-    })
+    key.bytes()
+        .fold(String::with_capacity(key.len()), |mut out, byte| {
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
+                out.push(char::from(byte));
+            } else {
+                let _ = write!(out, "%{byte:02X}");
+            }
+            out
+        })
 }
 
 /// 64-bit FNV-1a: tiny, and stable across Rust versions and runs (unlike

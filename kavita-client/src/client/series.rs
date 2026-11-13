@@ -39,6 +39,40 @@ impl KavitaClient {
         page_number: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<Vec<Series>, reqwest::Error> {
+        self.list_series_where(
+            SeriesFilterField::Libraries,
+            library_id,
+            page_number,
+            page_size,
+        )
+        .await
+    }
+
+    /// Lists the series of the collection (Kavita's "collection tag")
+    /// `collection_id`, by name, one page at a time.
+    pub async fn list_series_of_collection_paginated(
+        &self,
+        collection_id: String,
+        page_number: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Vec<Series>, reqwest::Error> {
+        self.list_series_where(
+            SeriesFilterField::CollectionTags,
+            collection_id,
+            page_number,
+            page_size,
+        )
+        .await
+    }
+
+    /// Lists, by name, the series whose `field` equals `value`.
+    async fn list_series_where(
+        &self,
+        field: SeriesFilterField,
+        value: String,
+        page_number: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Vec<Series>, reqwest::Error> {
         let filter = SeriesFilter {
             id: 0,
             name: None,
@@ -51,21 +85,13 @@ impl KavitaClient {
             },
             statements: vec![SeriesFilterStatement {
                 comparison: SeriesFilterComparison::Equal,
-                field: SeriesFilterField::Libraries,
-                value: Some(library_id),
+                field,
+                value: Some(value),
             }],
         };
 
-        self.execute_json(
-            self.http_client
-                .post(format!("{}/api/Series/v2", self.base_url))
-                .query(&SeriesFilterParams {
-                    page_number,
-                    page_size,
-                })
-                .json(&filter),
-        )
-        .await
+        self.list_series_with_filter(&filter, page_number, page_size)
+            .await
     }
 
     pub async fn list_series_of_library(
@@ -228,6 +254,31 @@ mod tests {
 
         let expected: Series = serde_json::from_str(SERIES_JSON).unwrap();
         assert_eq!(series, vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn list_series_of_collection_paginated_filters_by_collection_tag() {
+        let mock_server = MockServer::start().await;
+        let mut expected_filter = library_filter("4");
+        expected_filter.statements[0].field = SeriesFilterField::CollectionTags;
+        let body = format!("[{}]", SERIES_JSON);
+
+        Mock::given(method("POST"))
+            .and(path("/api/Series/v2"))
+            .and(query_param("PageNumber", "1"))
+            .and(query_param("PageSize", "20"))
+            .and(body_json(&expected_filter))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&mock_server)
+            .await;
+
+        let client = client_for(&mock_server);
+        let series = client
+            .list_series_of_collection_paginated("4".to_string(), Some(1), Some(20))
+            .await
+            .unwrap();
+
+        assert_eq!(series.len(), 1);
     }
 
     #[tokio::test]

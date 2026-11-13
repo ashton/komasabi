@@ -1,24 +1,23 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use opds_client::models::{feed::Navigation, publication::Publication};
-use uuid::Uuid;
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
+    adapter::{CollectionAdapter, ItemAdapter},
     models::{
-        library::{Library, LibraryType},
-        library_item::LibraryItem,
+        collection::{Collection, CollectionKind},
+        collection_item::CollectionItem,
         series_entry::{EntryKind, SeriesEntry},
     },
 };
 
-/// What an OPDS-backed library, item or entry id points at. OPDS has no stable
+/// What an OPDS-backed collection, item or entry id points at. OPDS has no stable
 /// numeric ids — everything is addressed by URL — so ids encode enough to fetch
 /// the thing again: a feed's URL, or the URL of the feed page a publication
 /// was listed on plus where it sat there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpdsId {
-    /// A feed: a library, or a navigation entry (e.g. a series) within one.
+    /// A feed: a collection, or a navigation entry (e.g. a series) within one.
     Feed(String),
     /// A publication, found again by refetching `feed` and taking the
     /// publication at `index` — or, if the feed shifted, the one whose
@@ -62,11 +61,14 @@ impl OpdsId {
     }
 }
 
-/// A feed discovered in the catalog that becomes one of the app's libraries.
+/// A feed discovered in the catalog that becomes one of the source's
+/// collections: a server's library (an entry of a catalog of catalogs, like
+/// Kavita's "All Libraries") or any other feed of the root catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpdsLibrary {
+pub struct OpdsCollection {
     pub title: String,
     pub url: String,
+    pub is_library: bool,
 }
 
 /// One browsable thing on a catalog page: a link to a deeper feed (typically a
@@ -109,50 +111,43 @@ impl CatalogEntry {
     }
 }
 
-pub struct OpdsLibraryAdapter;
+pub struct OpdsCollectionAdapter;
 
-impl LibraryAdapter<OpdsLibrary> for OpdsLibraryAdapter {
-    fn adapt_library(source: OpdsLibrary, integration_id: &str) -> Library {
-        Library {
-            id: Uuid::new_v4().to_string(),
-            // OPDS doesn't say what a feed holds; comics are this app's focus.
-            kind: LibraryType::Comic,
-            name: source.title,
-            external_id: Some(OpdsId::Feed(source.url).encode()),
-            folder: None,
-            cover: None,
-            integration_id: Some(integration_id.to_string()),
-        }
+impl CollectionAdapter<OpdsCollection> for OpdsCollectionAdapter {
+    fn adapt_collection(source: OpdsCollection) -> Collection {
+        let kind = if source.is_library {
+            CollectionKind::Library
+        } else {
+            CollectionKind::Catalog
+        };
+
+        Collection::new(OpdsId::Feed(source.url).encode(), source.title, kind)
     }
 }
 
 pub struct OpdsItemAdapter;
 
 impl ItemAdapter<CatalogEntry> for OpdsItemAdapter {
-    fn adapt_item(source: CatalogEntry) -> LibraryItem {
+    fn adapt_item(source: CatalogEntry) -> CollectionItem {
         let external_id = source.id().encode();
 
         match source {
-            CatalogEntry::Navigation(navigation) => LibraryItem {
+            CatalogEntry::Navigation(navigation) => CollectionItem {
                 external_id,
                 name: navigation.title().to_string(),
                 cover: navigation
                     .cover()
                     .map(|link| link.href.clone())
                     .unwrap_or_default(),
-                library_id: String::new(),
                 pages: navigation.link.properties.page_count.and_then(to_pages),
             },
-            CatalogEntry::Publication {
-                feed, publication, ..
-            } => LibraryItem {
+            CatalogEntry::Publication { publication, .. } => CollectionItem {
                 external_id,
                 name: publication.metadata.title.clone(),
                 cover: publication
                     .cover()
                     .map(|link| link.href.clone())
                     .unwrap_or_default(),
-                library_id: OpdsId::Feed(feed).encode(),
                 pages: publication.page_count().and_then(to_pages),
             },
         }
@@ -239,22 +234,26 @@ mod tests {
     }
 
     #[test]
-    fn adapt_library_encodes_the_feed_url_as_external_id() {
-        let library = OpdsLibraryAdapter::adapt_library(
-            OpdsLibrary {
-                title: "DC".into(),
-                url: "http://h/libraries/1".into(),
-            },
-            "integration-id",
-        );
+    fn adapt_collection_encodes_the_feed_url_as_external_id() {
+        let library = OpdsCollectionAdapter::adapt_collection(OpdsCollection {
+            title: "DC".into(),
+            url: "http://h/libraries/1".into(),
+            is_library: true,
+        });
 
         assert_eq!(library.name, "DC");
-        assert_eq!(library.kind, LibraryType::Comic);
-        assert_eq!(library.integration_id.as_deref(), Some("integration-id"));
+        assert_eq!(library.kind, CollectionKind::Library);
         assert_eq!(
-            OpdsId::decode(library.external_id.as_deref().unwrap()).unwrap(),
+            OpdsId::decode(&library.external_id).unwrap(),
             OpdsId::Feed("http://h/libraries/1".into())
         );
+
+        let feed = OpdsCollectionAdapter::adapt_collection(OpdsCollection {
+            title: "On Deck".into(),
+            url: "http://h/on-deck".into(),
+            is_library: false,
+        });
+        assert_eq!(feed.kind, CollectionKind::Catalog);
     }
 
     #[test]

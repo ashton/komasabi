@@ -5,9 +5,13 @@ use iced::{Element, Task};
 
 use crate::models::{
     AsyncModel,
+    collection::CollectionRef,
+    library_item::LibraryItem,
     series_entry::{EntryKind, SeriesEntry, cover_key},
 };
-use crate::providers::{Provider, provider_for_library};
+use crate::providers::{Provider, provider_for_integration};
+use crate::repository::library as library_repository;
+use crate::screen::card::DownloadState;
 
 /// The two tabs shown above the contents grid. `Details` carries no data of its
 /// own — it just renders the series' metadata in list form, as a counterpart
@@ -18,6 +22,57 @@ pub enum Tab {
     Details,
 }
 
+/// Where a series was opened from, which decides where its entries come from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Origin {
+    /// A source's collection: the entries are listed live by the source, and
+    /// "Back" returns to the collection.
+    Source(CollectionRef),
+    /// The user's Library: the entries are the items of the series added from
+    /// the source `integration_id`, which they're still read through.
+    Library { integration_id: String },
+}
+
+impl Origin {
+    /// The source the series belongs to.
+    fn integration_id(&self) -> &str {
+        match self {
+            Origin::Source(location) => &location.integration_id,
+            Origin::Library { integration_id } => integration_id,
+        }
+    }
+
+    fn is_library(&self) -> bool {
+        matches!(self, Origin::Library { .. })
+    }
+}
+
+/// Whether an entry card offers to add the entry to the Library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddState {
+    /// Not in the Library: offer to add it.
+    Available,
+    /// Being saved in the Library.
+    Adding,
+    /// Already in the Library.
+    Added,
+    /// Not offered at all (the series is the Library's own).
+    Hidden,
+}
+
+/// How an entry's card is drawn, beyond the entry itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardState {
+    pub add: AddState,
+    /// Whether the entry is in the Library, so its menu offers to delete it.
+    pub in_library: bool,
+    /// Whether the card's menu is open.
+    pub menu_open: bool,
+    /// Whether the entry is downloaded, which leads its bar and decides
+    /// whether its menu offers to download it.
+    pub download: DownloadState,
+}
+
 #[derive(Debug)]
 pub struct SeriesDetail {
     /// The series' provider-side id, which the reader session needs to look up
@@ -25,12 +80,16 @@ pub struct SeriesDetail {
     series_external_id: String,
     series_name: String,
     series_pages: Option<u16>,
-    /// The external id of the library the series belongs to, used to resolve
-    /// the integration to fetch entries and covers through.
-    library_external_id: String,
+    origin: Origin,
     /// The series' own (large, header) cover, once it has loaded.
     series_cover: Option<image::Handle>,
     entries: AsyncModel<Vec<SeriesEntry>, String>,
+    /// The series' items in the Library, keyed by [`SeriesEntry::cover_key`]:
+    /// which entries are already in it, or, for the Library's own series, the
+    /// items the entries were made from.
+    library: HashMap<String, LibraryItem>,
+    /// Cover keys of the entries being saved in the Library.
+    adding: HashSet<String>,
     /// Decoded entry cover images, keyed by [`SeriesEntry::cover_key`].
     covers: HashMap<String, image::Handle>,
     /// cover keys whose cover is currently being fetched, so it isn't requested
@@ -40,9 +99,15 @@ pub struct SeriesDetail {
     /// Whether an entry is currently being prepared and opened in the reader.
     /// Guards against double-launching while pages are still downloading.
     launching: bool,
-    /// The last reader-launch failure, shown as a status banner until the next
-    /// attempt.
+    /// The last reader-launch or add-to-library failure, shown as a status
+    /// banner until the next attempt.
     launch_error: Option<String>,
+    /// The cover key of the entry whose card menu is open, if any.
+    menu: Option<String>,
+    /// Cover keys of the series' downloaded entries.
+    downloaded: HashSet<String>,
+    /// Cover keys of the entries being downloaded.
+    downloading: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,32 +117,64 @@ pub enum Message {
     /// Cover image bytes that have been loaded, keyed by [`SeriesEntry::cover_key`].
     /// Failed/omitted entries are simply absent.
     CoversLoaded(Vec<(String, Vec<u8>)>),
+    /// The series' items in the Library have been loaded.
+    LibraryLoaded(Result<Vec<LibraryItem>, String>),
+    /// A Library series' items, once their progress was synced from the
+    /// source.
+    LibrarySynced(Vec<LibraryItem>),
     TabSelected(Tab),
     BackPressed,
-    /// A volume/chapter card was clicked; prepare it and open it in the reader.
+    /// "Read" was chosen on a volume/chapter; prepare it and open it in the
+    /// reader.
     EntrySelected(SeriesEntry),
     /// The reader-launch task finished (the reader window is open, or it failed).
     ReaderLaunched(Result<(), String>),
+    /// "Add to library" was chosen on a volume/chapter: save it in the
+    /// Library.
+    AddToLibrary(SeriesEntry),
+    /// An entry (by cover key) was saved in the Library, or failed to be.
+    AddedToLibrary(String, Result<Box<LibraryItem>, String>),
+    /// The reader showing a Library item closed, so its progress may have moved.
+    LibraryReaderClosed,
+    /// The "⋮" button of an entry's card (by cover key) was pressed: open its
+    /// menu, or close it if it's the one open.
+    MenuToggled(String),
+    /// A click landed outside the open menu, closing it.
+    MenuDismissed,
+    /// "Delete" was chosen in an entry's menu: remove it from the Library.
+    RemoveFromLibrary(SeriesEntry),
+    /// An entry (by cover key) was removed from the Library, or failed to be.
+    RemovedFromLibrary(String, Result<(), String>),
+    /// The cover keys of the series' downloaded entries.
+    DownloadsLoaded(HashSet<String>),
+    /// "Download" was chosen in an entry's menu: download it for reading
+    /// offline.
+    DownloadEntry(SeriesEntry),
+    /// An entry (by cover key) finished downloading, or failed to.
+    EntryDownloaded(String, Result<(), String>),
 }
 
 #[derive(Debug)]
 pub enum Action {
     None,
     Run(Task<Message>),
-    /// Navigate back to the browse screen of the carried library.
-    Back(String),
+    /// Navigate back to the carried collection's series.
+    Back(CollectionRef),
+    /// Navigate back to the Library (home).
+    BackToLibrary,
 }
 
 impl SeriesDetail {
+    /// A series browsed live from a source's collection.
     pub fn new(
         series_external_id: String,
         series_name: String,
         series_pages: Option<u16>,
-        library_external_id: String,
+        location: CollectionRef,
     ) -> (Self, Task<Message>) {
         let entries_task = Task::perform(
             crate::runtime::on_tokio(fetch_entries(
-                library_external_id.clone(),
+                location.integration_id.clone(),
                 series_external_id.clone(),
             )),
             Message::EntriesLoaded,
@@ -85,31 +182,94 @@ impl SeriesDetail {
 
         let cover_task = Task::perform(
             crate::runtime::on_tokio(fetch_series_cover(
-                library_external_id.clone(),
+                location.integration_id.clone(),
+                series_external_id.clone(),
+            )),
+            Message::SeriesCoverLoaded,
+        );
+
+        let library_task = load_library(&location.integration_id, &series_external_id);
+        let downloads_task = load_downloads(&location.integration_id, &series_external_id);
+
+        (
+            Self::with_origin(
+                series_external_id,
+                series_name,
+                series_pages,
+                Origin::Source(location),
+            ),
+            Task::batch([entries_task, cover_task, library_task, downloads_task]),
+        )
+    }
+
+    /// A series of the user's Library: the items added from it.
+    pub fn from_library(
+        integration_id: String,
+        series_external_id: String,
+        series_name: String,
+    ) -> (Self, Task<Message>) {
+        let library_task = load_library(&integration_id, &series_external_id);
+        let downloads_task = load_downloads(&integration_id, &series_external_id);
+        let cover_task = Task::perform(
+            crate::runtime::on_tokio(fetch_series_cover(
+                integration_id.clone(),
                 series_external_id.clone(),
             )),
             Message::SeriesCoverLoaded,
         );
 
         (
-            Self {
+            Self::with_origin(
                 series_external_id,
                 series_name,
-                series_pages,
-                library_external_id,
-                series_cover: None,
-                entries: AsyncModel::Loading,
-                covers: HashMap::new(),
-                covers_in_flight: HashSet::new(),
-                active_tab: Tab::Contents,
-                launching: false,
-                launch_error: None,
-            },
-            Task::batch([entries_task, cover_task]),
+                None,
+                Origin::Library { integration_id },
+            ),
+            Task::batch([library_task, cover_task, downloads_task]),
         )
     }
 
+    fn with_origin(
+        series_external_id: String,
+        series_name: String,
+        series_pages: Option<u16>,
+        origin: Origin,
+    ) -> Self {
+        Self {
+            series_external_id,
+            series_name,
+            series_pages,
+            origin,
+            series_cover: None,
+            entries: AsyncModel::Loading,
+            library: HashMap::new(),
+            adding: HashSet::new(),
+            covers: HashMap::new(),
+            covers_in_flight: HashSet::new(),
+            active_tab: Tab::Contents,
+            launching: false,
+            launch_error: None,
+            menu: None,
+            downloaded: HashSet::new(),
+            downloading: HashSet::new(),
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Action {
+        // Doing anything else on the screen closes an open card menu.
+        if matches!(
+            message,
+            Message::TabSelected(_)
+                | Message::BackPressed
+                | Message::EntrySelected(_)
+                | Message::AddToLibrary(_)
+                | Message::RemoveFromLibrary(_)
+                | Message::DownloadEntry(_)
+                | Message::MenuDismissed
+        ) {
+            self.menu = None;
+        }
+
         match message {
             Message::EntriesLoaded(result) => {
                 let loaded = result.is_ok();
@@ -140,12 +300,44 @@ impl SeriesDetail {
                 Action::None
             }
 
+            Message::LibraryLoaded(Ok(items)) => {
+                // A Library series is shown as saved right away, then again
+                // once synced with the source's progress.
+                let sync = (self.origin.is_library() && !items.is_empty()).then(|| {
+                    Task::perform(
+                        crate::runtime::on_tokio(crate::library::sync_progress(items.clone())),
+                        Message::LibrarySynced,
+                    )
+                });
+                let covers = self.show_library(items);
+
+                match (sync, covers) {
+                    (None, None) => Action::None,
+                    (sync, covers) => Action::Run(Task::batch(sync.into_iter().chain(covers))),
+                }
+            }
+            Message::LibrarySynced(items) => match self.show_library(items) {
+                Some(task) => Action::Run(task),
+                None => Action::None,
+            },
+            Message::LibraryLoaded(Err(error)) => {
+                if self.origin.is_library() {
+                    self.entries = AsyncModel::Error(error);
+                } else {
+                    tracing::debug!("could not load the series' library items: {error}");
+                }
+                Action::None
+            }
+
             Message::TabSelected(tab) => {
                 self.active_tab = tab;
                 Action::None
             }
 
-            Message::BackPressed => Action::Back(self.library_external_id.clone()),
+            Message::BackPressed => match &self.origin {
+                Origin::Source(location) => Action::Back(location.clone()),
+                Origin::Library { .. } => Action::BackToLibrary,
+            },
 
             Message::EntrySelected(entry) => {
                 // Ignore clicks while a launch is already in flight; the reader
@@ -153,19 +345,39 @@ impl SeriesDetail {
                 if self.launching {
                     return Action::None;
                 }
-
-                self.launching = true;
                 self.launch_error = None;
 
-                Action::Run(Task::perform(
-                    crate::runtime::on_tokio(crate::reader_launch::prepare_and_launch(
-                        self.library_external_id.clone(),
-                        self.series_external_id.clone(),
-                        self.series_name.clone(),
-                        entry,
-                    )),
-                    Message::ReaderLaunched,
-                ))
+                match &self.origin {
+                    Origin::Source(location) => {
+                        self.launching = true;
+
+                        Action::Run(Task::perform(
+                            crate::runtime::on_tokio(crate::reader_launch::prepare_and_launch(
+                                location.integration_id.clone(),
+                                self.series_external_id.clone(),
+                                self.series_name.clone(),
+                                entry,
+                            )),
+                            Message::ReaderLaunched,
+                        ))
+                    }
+                    Origin::Library { .. } => {
+                        let Some(item) = self.library.get(&entry.cover_key()) else {
+                            return Action::None;
+                        };
+
+                        match crate::reader_launch::launch_library_item(item.clone()) {
+                            Ok(closed) => {
+                                Action::Run(Task::perform(closed, |_| Message::LibraryReaderClosed))
+                            }
+                            Err(error) => {
+                                tracing::debug!("failed to open reader: {error}");
+                                self.launch_error = Some(error);
+                                Action::None
+                            }
+                        }
+                    }
+                }
             }
 
             Message::ReaderLaunched(result) => {
@@ -173,6 +385,124 @@ impl SeriesDetail {
                 if let Err(error) = result {
                     tracing::debug!("failed to open reader: {error}");
                     self.launch_error = Some(error);
+                }
+                Action::None
+            }
+
+            Message::AddToLibrary(entry) => {
+                let key = entry.cover_key();
+                if self.origin.is_library()
+                    || self.library.contains_key(&key)
+                    || !self.adding.insert(key.clone())
+                {
+                    return Action::None;
+                }
+                self.launch_error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::library::add_to_library(
+                        self.origin.integration_id().to_string(),
+                        self.series_external_id.clone(),
+                        self.series_name.clone(),
+                        entry,
+                    )),
+                    move |result| Message::AddedToLibrary(key.clone(), result.map(Box::new)),
+                ))
+            }
+
+            Message::AddedToLibrary(key, result) => {
+                self.adding.remove(&key);
+                match result {
+                    Ok(item) => {
+                        self.library.insert(key, *item);
+                    }
+                    Err(error) => {
+                        tracing::debug!("failed to add to the library: {error}");
+                        self.launch_error = Some(format!("Could not add to library: {error}"));
+                    }
+                }
+                Action::None
+            }
+
+            Message::LibraryReaderClosed => Action::Run(load_library(
+                self.origin.integration_id(),
+                &self.series_external_id,
+            )),
+
+            Message::MenuToggled(key) => {
+                self.menu = (self.menu.as_ref() != Some(&key)).then_some(key);
+                Action::None
+            }
+            Message::MenuDismissed => Action::None,
+
+            Message::RemoveFromLibrary(entry) => {
+                let key = entry.cover_key();
+                let Some(item) = self.library.get(&key) else {
+                    return Action::None;
+                };
+                self.launch_error = None;
+
+                Action::Run(Task::perform(
+                    library_repository::remove(item.id.clone()),
+                    move |result| Message::RemovedFromLibrary(key.clone(), result),
+                ))
+            }
+
+            Message::RemovedFromLibrary(key, Ok(())) => {
+                self.library.remove(&key);
+                if !self.origin.is_library() {
+                    return Action::None;
+                }
+
+                // The Library's own series loses the entry, and once it has
+                // none left, it's no longer in the Library to show.
+                if let AsyncModel::Loaded(entries) = &mut self.entries {
+                    entries.retain(|entry| entry.cover_key() != key);
+                    if entries.is_empty() {
+                        return Action::BackToLibrary;
+                    }
+                }
+                Action::None
+            }
+            Message::RemovedFromLibrary(_, Err(error)) => {
+                tracing::debug!("failed to remove from the library: {error}");
+                self.launch_error = Some(format!("Could not remove from library: {error}"));
+                Action::None
+            }
+
+            Message::DownloadsLoaded(keys) => {
+                self.downloaded.extend(keys);
+                Action::None
+            }
+
+            Message::DownloadEntry(entry) => {
+                let key = entry.cover_key();
+                if self.downloaded.contains(&key) || !self.downloading.insert(key.clone()) {
+                    return Action::None;
+                }
+                self.launch_error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::downloads::download_one(
+                        self.origin.integration_id().to_string(),
+                        self.series_external_id.clone(),
+                        self.series_name.clone(),
+                        entry,
+                    )),
+                    move |result| Message::EntryDownloaded(key.clone(), result),
+                ))
+            }
+
+            Message::EntryDownloaded(key, result) => {
+                self.downloading.remove(&key);
+                match result {
+                    Ok(()) => {
+                        self.downloaded.insert(key);
+                    }
+                    Err(error) => {
+                        tracing::debug!("failed to download {key}: {error}");
+                        self.launch_error = Some(format!("Could not download: {error}"));
+                    }
                 }
                 Action::None
             }
@@ -192,9 +522,58 @@ impl SeriesDetail {
             self.series_cover.as_ref(),
             &self.entries,
             &self.covers,
+            &|entry: &SeriesEntry| self.card_state(entry),
             self.active_tab,
             status,
+            self.menu.is_some(),
         )
+    }
+
+    /// How `entry`'s card is drawn.
+    fn card_state(&self, entry: &SeriesEntry) -> CardState {
+        let key = entry.cover_key();
+        CardState {
+            add: self.add_state(entry),
+            in_library: self.library.contains_key(&key),
+            menu_open: self.menu.as_ref() == Some(&key),
+            download: if self.downloading.contains(&key) {
+                DownloadState::Downloading
+            } else if self.downloaded.contains(&key) {
+                DownloadState::Downloaded
+            } else {
+                DownloadState::NotDownloaded
+            },
+        }
+    }
+
+    /// Keeps the series' Library `items`, which, for the Library's own series,
+    /// are the entries shown. Returns the task fetching any covers they need.
+    fn show_library(&mut self, items: Vec<LibraryItem>) -> Option<Task<Message>> {
+        let entries: Vec<SeriesEntry> = items.iter().map(LibraryItem::as_entry).collect();
+        self.library = items
+            .into_iter()
+            .map(|item| (item.as_entry().cover_key(), item))
+            .collect();
+
+        if !self.origin.is_library() {
+            return None;
+        }
+        self.entries = AsyncModel::Loaded(entries);
+        self.request_entry_covers()
+    }
+
+    /// Whether `entry`'s card offers to add it to the Library.
+    fn add_state(&self, entry: &SeriesEntry) -> AddState {
+        let key = entry.cover_key();
+        if self.origin.is_library() {
+            AddState::Hidden
+        } else if self.library.contains_key(&key) {
+            AddState::Added
+        } else if self.adding.contains(&key) {
+            AddState::Adding
+        } else {
+            AddState::Available
+        }
     }
 
     /// Builds a task to fetch covers for every loaded entry whose cover isn't
@@ -221,9 +600,10 @@ impl SeriesDetail {
         self.covers_in_flight
             .extend(pending.iter().map(|(id, kind)| cover_key(*kind, id)));
 
+        // Library items are covered by their source, like its own entries.
         Some(Task::perform(
             crate::runtime::on_tokio(fetch_entry_covers(
-                self.library_external_id.clone(),
+                self.origin.integration_id().to_string(),
                 pending,
             )),
             Message::CoversLoaded,
@@ -231,21 +611,40 @@ impl SeriesDetail {
     }
 }
 
+/// Loads the Library's items of a series.
+fn load_library(integration_id: &str, series_external_id: &str) -> Task<Message> {
+    Task::perform(
+        library_repository::series_items(
+            integration_id.to_string(),
+            series_external_id.to_string(),
+        ),
+        Message::LibraryLoaded,
+    )
+}
+
+/// Loads which of a series' entries are downloaded.
+fn load_downloads(integration_id: &str, series_external_id: &str) -> Task<Message> {
+    Task::perform(
+        crate::downloads::downloaded_entries(
+            integration_id.to_string(),
+            series_external_id.to_string(),
+        ),
+        Message::DownloadsLoaded,
+    )
+}
+
 async fn fetch_entries(
-    library_external_id: String,
+    integration_id: String,
     series_external_id: String,
 ) -> Result<Vec<SeriesEntry>, String> {
-    let (provider, _namespace) = provider_for_library(&library_external_id).await?;
+    let (provider, _namespace) = provider_for_integration(&integration_id).await?;
     provider.list_series_entries(&series_external_id).await
 }
 
 /// Fetches the series' own cover, returning `None` on any error (a missing
 /// header cover just renders the placeholder box rather than failing the page).
-async fn fetch_series_cover(
-    library_external_id: String,
-    series_external_id: String,
-) -> Option<Vec<u8>> {
-    let (provider, namespace) = provider_for_library(&library_external_id).await.ok()?;
+async fn fetch_series_cover(integration_id: String, series_external_id: String) -> Option<Vec<u8>> {
+    let (provider, namespace) = provider_for_integration(&integration_id).await.ok()?;
     provider.cover(&namespace, &series_external_id).await.ok()
 }
 
@@ -253,10 +652,10 @@ async fn fetch_series_cover(
 /// one that resolved. Per-entry and whole-batch failures are logged and omitted
 /// rather than surfaced, so a partial result still renders what it can.
 async fn fetch_entry_covers(
-    library_external_id: String,
+    integration_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Vec<(String, Vec<u8>)> {
-    match load_entry_covers(library_external_id, entries).await {
+    match load_entry_covers(integration_id, entries).await {
         Ok(covers) => covers,
         Err(error) => {
             tracing::debug!("failed to load entry covers: {error}");
@@ -266,10 +665,10 @@ async fn fetch_entry_covers(
 }
 
 async fn load_entry_covers(
-    library_external_id: String,
+    integration_id: String,
     entries: Vec<(String, EntryKind)>,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (provider, namespace) = provider_for_library(&library_external_id).await?;
+    let (provider, namespace) = provider_for_integration(&integration_id).await?;
 
     let mut covers = Vec::new();
     for (external_id, kind) in entries {
@@ -291,35 +690,43 @@ mod view_helper {
     use std::collections::HashMap;
 
     use iced::{
-        Background, Border, Center, ContentFit, Element, Font,
+        Background, Border, ContentFit, Element, Font,
         Length::{Fill, Fixed},
-        Theme,
+        Theme, border,
         widget::{
-            button, column, container, grid, image, progress_bar, row, scrollable, stack, text,
+            button, column, container, grid, hover, image, mouse_area, progress_bar, row,
+            scrollable, stack, text,
         },
     };
 
-    use super::Tab;
+    use super::{AddState, CardState, DownloadState, Tab};
     use crate::models::{
         AsyncModel,
         series_entry::{ReadState, SeriesEntry},
     };
+    use crate::screen::card::{self, COVER_RADIUS};
+    use crate::screen::cover_overlay;
     use crate::touch_scroll::touch_scroll;
 
     type Covers = HashMap<String, image::Handle>;
+    /// How an entry's card is drawn (see [`CardState`]).
+    type CardStateOf<'b> = &'b dyn Fn(&SeriesEntry) -> CardState;
 
     /// Width of the large header cover, in pixels (height follows the 2:3
     /// comic aspect ratio).
     const HEADER_COVER_WIDTH: f32 = 200.0;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn view<'a>(
         series_name: &'a str,
         series_pages: Option<u16>,
         series_cover: Option<&'a image::Handle>,
         entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
         active_tab: Tab,
         status: Option<&'a str>,
+        menu_open: bool,
     ) -> Element<'a, super::Message> {
         let count = match entries {
             AsyncModel::Loaded(entries) => Some(entries.len()),
@@ -344,16 +751,26 @@ mod view_helper {
                 series_pages,
                 entries,
                 covers,
+                card_state,
                 noun,
             ));
 
-        column![
+        let screen = column![
             top_bar(),
             touch_scroll(scrollable(content).width(Fill).height(Fill))
         ]
         .width(Fill)
-        .height(Fill)
-        .into()
+        .height(Fill);
+
+        // With a card's menu open, a click anywhere the menu (or another
+        // button) doesn't take closes it.
+        if menu_open {
+            mouse_area(screen)
+                .on_press(super::Message::MenuDismissed)
+                .into()
+        } else {
+            screen.into()
+        }
     }
 
     /// A one-line status banner (reader preparing / last launch error).
@@ -405,9 +822,11 @@ mod view_helper {
     }
 
     fn top_bar<'a>() -> Element<'a, super::Message> {
-        container(button("Back").on_press(super::Message::BackPressed))
-            .padding(20)
-            .into()
+        container(crate::screen::back_button::back_button(
+            super::Message::BackPressed,
+        ))
+        .padding(20)
+        .into()
     }
 
     fn header<'a>(
@@ -476,7 +895,7 @@ mod view_helper {
     }
 
     fn header_cover<'a>(handle: Option<&image::Handle>) -> Element<'a, super::Message> {
-        container(cover_image(handle, 1.0))
+        container(cover_image(handle, 1.0, COVER_RADIUS.into()))
             .width(Fixed(HEADER_COVER_WIDTH))
             .height(Fixed(HEADER_COVER_WIDTH * 3.0 / 2.0))
             .clip(true)
@@ -523,10 +942,11 @@ mod view_helper {
         series_pages: Option<u16>,
         entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
         noun: Noun,
     ) -> Element<'a, super::Message> {
         match active_tab {
-            Tab::Contents => contents_body(entries, covers),
+            Tab::Contents => contents_body(entries, covers, card_state),
             Tab::Details => details_body(series_name, series_pages, entries, noun),
         }
     }
@@ -534,10 +954,11 @@ mod view_helper {
     fn contents_body<'a>(
         entries: &'a AsyncModel<Vec<SeriesEntry>, String>,
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
     ) -> Element<'a, super::Message> {
         match entries {
             AsyncModel::Loaded(entries) if entries.is_empty() => empty_state(),
-            AsyncModel::Loaded(entries) => entries_grid(entries, covers),
+            AsyncModel::Loaded(entries) => entries_grid(entries, covers, card_state),
             AsyncModel::Error(error) => error_state(error),
             AsyncModel::NotLoaded | AsyncModel::Loading => loading_state(),
         }
@@ -546,10 +967,11 @@ mod view_helper {
     fn entries_grid<'a>(
         entries: &'a [SeriesEntry],
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
     ) -> Element<'a, super::Message> {
         let cards = entries
             .iter()
-            .map(|entry| entry_card(entry, covers.get(&entry.cover_key())));
+            .map(|entry| entry_card(entry, covers.get(&entry.cover_key()), card_state(entry)));
 
         container(
             grid(cards)
@@ -561,34 +983,117 @@ mod view_helper {
         .into()
     }
 
+    /// An entry's card: its cover, with a bar under it naming the entry and
+    /// holding its menu.
     fn entry_card<'a>(
         entry: &'a SeriesEntry,
         cover: Option<&image::Handle>,
+        state: CardState,
     ) -> Element<'a, super::Message> {
-        let cover = container(cover_image(cover, cover_opacity(entry.read_state)))
-            .width(Fill)
-            .height(Fill)
-            .clip(true)
-            .style(cover_box_style);
+        // Only its top corners are rounded: the bar carries on below it.
+        let cover = container(cover_image(
+            cover,
+            cover_opacity(entry.read_state),
+            border::top(COVER_RADIUS),
+        ))
+        .width(Fill)
+        .height(Fill)
+        .clip(true)
+        .style(|theme: &Theme| container::Style {
+            border: Border {
+                radius: border::top(COVER_RADIUS),
+                ..Border::default()
+            },
+            ..cover_box_style(theme)
+        });
 
         let cover: Element<'a, super::Message> = match progress_value(entry.read_state) {
             Some(value) => stack![cover, read_progress_bar(value)].into(),
             None => cover.into(),
         };
 
-        let content = column![cover, text(&entry.label).size(13), pages_label(entry.pages),]
-            .width(Fill)
-            .height(Fill)
-            .spacing(4)
-            .align_x(Center);
+        // Hovering the cover shades it and offers what to do with the entry.
+        let cover = hover(cover, cover_actions(entry, state.add));
 
-        button(content)
-            .on_press(super::Message::EntrySelected(entry.clone()))
-            .padding(0)
+        // The open menu sits over the cover, just above its "⋮" button.
+        let cover: Element<'a, super::Message> = if state.menu_open {
+            stack![cover, entry_menu(entry, state)].into()
+        } else {
+            cover
+        };
+
+        column![cover, card_bar(entry, state)]
             .width(Fill)
             .height(Fill)
-            .style(button::text)
             .into()
+    }
+
+    /// The bar under a card's cover: whether the entry is downloaded, its
+    /// name and page count, and the "⋮" button opening its menu, when the menu
+    /// has anything in it.
+    fn card_bar<'a>(entry: &'a SeriesEntry, state: CardState) -> Element<'a, super::Message> {
+        // A name too long for the card is cut off, not wrapped.
+        let name = column![
+            text(&entry.label).size(13).wrapping(text::Wrapping::None),
+            pages_label(entry.pages),
+        ]
+        .spacing(2);
+
+        card::bar(
+            state.download.icon(),
+            name.into(),
+            has_menu(state).then(|| super::Message::MenuToggled(entry.cover_key())),
+        )
+    }
+
+    /// Whether an entry's menu has anything to offer: downloading it, unless
+    /// it's downloaded, and deleting it from the Library, if it's in it.
+    pub(super) fn has_menu(state: CardState) -> bool {
+        state.in_library || state.download != DownloadState::Downloaded
+    }
+
+    /// An entry's open menu, laid over the bottom-right of its cover.
+    fn entry_menu<'a>(entry: &SeriesEntry, state: CardState) -> Element<'a, super::Message> {
+        let mut items: Vec<Element<'a, super::Message>> = state
+            .download
+            .menu_item(super::Message::DownloadEntry(entry.clone()))
+            .into_iter()
+            .collect();
+        if state.in_library {
+            items.push(card::menu_item(
+                "trash",
+                "Delete",
+                super::Message::RemoveFromLibrary(entry.clone()),
+            ));
+        }
+
+        card::menu(items)
+    }
+
+    /// The shade laid over a hovered cover, with the entry's actions side by
+    /// side: adding it to the Library (unless that's where it's shown) and
+    /// reading it.
+    fn cover_actions<'a>(entry: &SeriesEntry, add_state: AddState) -> Element<'a, super::Message> {
+        let add = match add_state {
+            AddState::Available => Some(cover_overlay::action(
+                "circle-plus",
+                "Add to library",
+                Some(super::Message::AddToLibrary(entry.clone())),
+            )),
+            AddState::Adding => Some(cover_overlay::action("download", "Adding…", None)),
+            AddState::Added => Some(cover_overlay::action("circle-check", "In library", None)),
+            AddState::Hidden => None,
+        };
+        let read = cover_overlay::action(
+            "book-open",
+            "Read",
+            Some(super::Message::EntrySelected(entry.clone())),
+        );
+
+        cover_overlay::shade(
+            add.into_iter().chain([read]).collect(),
+            border::top(COVER_RADIUS),
+        )
     }
 
     /// How opaque an entry's cover is drawn: a read entry's is faded, so what's
@@ -646,6 +1151,7 @@ mod view_helper {
     fn cover_image<'a>(
         handle: Option<&image::Handle>,
         opacity: f32,
+        radius: border::Radius,
     ) -> Element<'a, super::Message> {
         match handle {
             Some(handle) => image(handle.clone())
@@ -653,6 +1159,7 @@ mod view_helper {
                 .height(Fill)
                 .content_fit(ContentFit::Cover)
                 .opacity(opacity)
+                .border_radius(radius)
                 .into(),
             None => row![].into(),
         }
@@ -664,7 +1171,7 @@ mod view_helper {
                 theme.extended_palette().background.strong.color,
             )),
             border: Border {
-                radius: 8.0.into(),
+                radius: COVER_RADIUS.into(),
                 ..Border::default()
             },
             ..container::Style::default()
@@ -757,20 +1264,42 @@ mod tests {
         }
     }
 
+    fn location() -> CollectionRef {
+        CollectionRef {
+            integration_id: "source-1".to_string(),
+            collection: crate::models::collection::Collection::new(
+                "lib-1",
+                "Manga",
+                crate::models::collection::CollectionKind::Library,
+            ),
+        }
+    }
+
     fn series_detail(entries: AsyncModel<Vec<SeriesEntry>, String>) -> SeriesDetail {
         SeriesDetail {
-            series_external_id: "series-1".to_string(),
-            series_name: "Beneath the Trees".to_string(),
-            series_pages: Some(183),
-            library_external_id: "lib-1".to_string(),
-            series_cover: None,
             entries,
-            covers: HashMap::new(),
-            covers_in_flight: HashSet::new(),
-            active_tab: Tab::Contents,
-            launching: false,
-            launch_error: None,
+            ..SeriesDetail::with_origin(
+                "series-1".to_string(),
+                "Beneath the Trees".to_string(),
+                Some(183),
+                Origin::Source(location()),
+            )
         }
+    }
+
+    fn library_detail() -> SeriesDetail {
+        SeriesDetail::with_origin(
+            "1".to_string(),
+            "Series 1".to_string(),
+            None,
+            Origin::Library {
+                integration_id: "s".to_string(),
+            },
+        )
+    }
+
+    fn library_item(id: &str, pages: i32, read: i32) -> LibraryItem {
+        crate::models::library_item::tests::item("s", "1", id, pages, read)
     }
 
     #[test]
@@ -779,7 +1308,7 @@ mod tests {
             "1".to_string(),
             "One Piece".to_string(),
             Some(42),
-            "lib-1".to_string(),
+            location(),
         );
 
         assert!(matches!(detail.entries, AsyncModel::Loading));
@@ -926,12 +1455,12 @@ mod tests {
     }
 
     #[test]
-    fn back_pressed_returns_back_with_the_library_id() {
+    fn back_pressed_returns_back_to_the_collection() {
         let mut detail = series_detail(AsyncModel::Loading);
 
         let action = detail.update(Message::BackPressed);
 
-        assert!(matches!(action, Action::Back(id) if id == "lib-1"));
+        assert!(matches!(action, Action::Back(location) if location == self::location()));
     }
 
     #[test]
@@ -1007,7 +1536,9 @@ mod tests {
         let detail = series_detail(AsyncModel::Loading);
 
         let mut ui = simulator(detail.view());
-        let _ = ui.click("Back").expect("Back button should be found");
+        let _ = ui
+            .click(iced::widget::Id::new(crate::screen::back_button::ID))
+            .expect("the back chevron should be found");
 
         let messages: Vec<_> = ui.into_messages().collect();
 
@@ -1073,5 +1604,353 @@ mod tests {
         for label in ["#1", "#2", "#3"] {
             assert!(ui.find(label).is_ok(), "{label} card should render");
         }
+    }
+
+    #[test]
+    fn hovering_a_cover_offers_to_add_the_entry_or_read_it() {
+        let detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", Some(24))]));
+        let entry = chapter_entry("1", "#1", Some(24));
+
+        let mut ui = simulator(detail.view());
+        let _ = ui
+            .click("Add to library")
+            .expect("the add action should be found");
+        let _ = ui.click("Read").expect("the read action should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::AddToLibrary(entry.clone()),
+                Message::EntrySelected(entry)
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_already_in_the_library_are_not_offered_again() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let _ = detail.update(Message::LibraryLoaded(Ok(vec![library_item("1", 10, 0)])));
+
+        assert_eq!(
+            detail.add_state(&chapter_entry("1", "#1", None)),
+            AddState::Added
+        );
+        let action = detail.update(Message::AddToLibrary(chapter_entry("1", "#1", None)));
+        assert!(matches!(action, Action::None));
+
+        let mut ui = simulator(detail.view());
+        assert!(ui.find("In library").is_ok());
+        assert!(ui.find("Add to library").is_err());
+    }
+
+    #[test]
+    fn adding_to_the_library_saves_once_and_records_the_result() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let entry = chapter_entry("1", "#1", None);
+
+        // The task isn't run here, so nothing is saved.
+        assert!(matches!(
+            detail.update(Message::AddToLibrary(entry.clone())),
+            Action::Run(_)
+        ));
+        assert_eq!(detail.add_state(&entry), AddState::Adding);
+        // A second click while it's saved does nothing.
+        assert!(matches!(
+            detail.update(Message::AddToLibrary(entry.clone())),
+            Action::None
+        ));
+
+        let _ = detail.update(Message::AddedToLibrary(
+            "ch:1".to_string(),
+            Ok(Box::new(library_item("1", 10, 0))),
+        ));
+        assert_eq!(detail.add_state(&entry), AddState::Added);
+    }
+
+    #[test]
+    fn a_failed_add_is_reported_and_can_be_retried() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let entry = chapter_entry("1", "#1", None);
+        let _ = detail.update(Message::AddToLibrary(entry.clone()));
+
+        let _ = detail.update(Message::AddedToLibrary(
+            "ch:1".to_string(),
+            Err("offline".to_string()),
+        ));
+
+        assert_eq!(detail.add_state(&entry), AddState::Available);
+        assert!(detail.launch_error.as_deref().unwrap().contains("offline"));
+    }
+
+    #[test]
+    fn a_library_series_lists_its_items_with_their_read_state() {
+        let mut detail = library_detail();
+
+        let _ = detail.update(Message::LibraryLoaded(Ok(vec![
+            library_item("1", 10, 10),
+            library_item("2", 10, 5),
+            library_item("3", 10, 0),
+        ])));
+
+        let AsyncModel::Loaded(entries) = &detail.entries else {
+            panic!("the items should be the entries");
+        };
+        let states: Vec<_> = entries.iter().map(|entry| entry.read_state).collect();
+        use crate::models::series_entry::ReadState;
+        assert_eq!(
+            states,
+            vec![
+                ReadState::Read,
+                ReadState::InProgress(Some(0.5)),
+                ReadState::Unread
+            ]
+        );
+
+        let mut ui = simulator(detail.view());
+        assert!(ui.find("Series 1").is_ok());
+        assert!(ui.find("#2").is_ok());
+        // Library items can be read, but there's nothing to add.
+        assert!(ui.find("Read").is_ok());
+        assert!(ui.find("Add to library").is_err());
+    }
+
+    #[test]
+    fn a_library_series_shows_the_progress_synced_from_its_source() {
+        use crate::models::series_entry::ReadState;
+        let mut detail = library_detail();
+
+        // The sync task isn't run here.
+        assert!(matches!(
+            detail.update(Message::LibraryLoaded(Ok(vec![library_item("1", 10, 0)]))),
+            Action::Run(_)
+        ));
+        let _ = detail.update(Message::LibrarySynced(vec![library_item("1", 10, 10)]));
+
+        let AsyncModel::Loaded(entries) = &detail.entries else {
+            panic!("the items should be the entries");
+        };
+        assert_eq!(entries[0].read_state, ReadState::Read);
+    }
+
+    #[test]
+    fn a_sources_series_does_not_sync_its_library_items() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+
+        let action = detail.update(Message::LibraryLoaded(Ok(vec![library_item("1", 10, 0)])));
+
+        assert!(matches!(action, Action::None));
+    }
+
+    fn library_detail_with(items: Vec<LibraryItem>) -> SeriesDetail {
+        let mut detail = library_detail();
+        let _ = detail.update(Message::LibraryLoaded(Ok(items)));
+        detail
+    }
+
+    #[test]
+    fn only_downloaded_entries_outside_the_library_have_no_menu() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![
+            chapter_entry("1", "#1", None),
+            chapter_entry("2", "#2", None),
+            chapter_entry("3", "#3", None),
+        ]));
+        let _ = detail.update(Message::LibraryLoaded(Ok(vec![library_item("1", 10, 0)])));
+        let _ = detail.update(Message::DownloadsLoaded(HashSet::from([
+            "ch:1".to_string(),
+            "ch:2".to_string(),
+        ])));
+
+        // In the Library, so it can be deleted.
+        assert!(view_helper::has_menu(
+            detail.card_state(&chapter_entry("1", "#1", None))
+        ));
+        // Downloaded and not in the Library: nothing to offer.
+        assert!(!view_helper::has_menu(
+            detail.card_state(&chapter_entry("2", "#2", None))
+        ));
+        // Not downloaded, so it can be.
+        assert!(view_helper::has_menu(
+            detail.card_state(&chapter_entry("3", "#3", None))
+        ));
+    }
+
+    #[test]
+    fn an_entry_not_downloaded_offers_a_download_with_a_cloud_icon() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let entry = chapter_entry("1", "#1", None);
+        let state = detail.card_state(&entry);
+        assert_eq!(state.download, DownloadState::NotDownloaded);
+        assert_eq!(state.download.icon(), "cloud");
+
+        let _ = detail.update(Message::MenuToggled("ch:1".to_string()));
+        let mut ui = simulator(detail.view());
+        let _ = ui
+            .click("Download")
+            .expect("the download item should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert_eq!(messages, vec![Message::DownloadEntry(entry)]);
+    }
+
+    #[test]
+    fn downloading_an_entry_runs_once_then_shows_it_downloaded() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let entry = chapter_entry("1", "#1", None);
+
+        assert!(matches!(
+            detail.update(Message::DownloadEntry(entry.clone())),
+            Action::Run(_)
+        ));
+        assert_eq!(
+            detail.card_state(&entry).download,
+            DownloadState::Downloading
+        );
+        assert!(matches!(
+            detail.update(Message::DownloadEntry(entry.clone())),
+            Action::None
+        ));
+
+        let _ = detail.update(Message::EntryDownloaded("ch:1".to_string(), Ok(())));
+        let state = detail.card_state(&entry);
+        assert_eq!(state.download, DownloadState::Downloaded);
+        assert_eq!(state.download.icon(), "download");
+        assert!(matches!(
+            detail.update(Message::DownloadEntry(entry)),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn a_failed_entry_download_is_reported_and_can_be_retried() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let entry = chapter_entry("1", "#1", None);
+        let _ = detail.update(Message::DownloadEntry(entry.clone()));
+
+        let _ = detail.update(Message::EntryDownloaded(
+            "ch:1".to_string(),
+            Err("offline".to_string()),
+        ));
+
+        assert_eq!(
+            detail.launch_error.as_deref(),
+            Some("Could not download: offline")
+        );
+        assert_eq!(
+            detail.card_state(&entry).download,
+            DownloadState::NotDownloaded
+        );
+        assert!(matches!(
+            detail.update(Message::DownloadEntry(entry)),
+            Action::Run(_)
+        ));
+    }
+
+    #[test]
+    fn the_menu_toggles_and_closes_on_a_click_elsewhere() {
+        let mut detail = library_detail_with(vec![library_item("1", 10, 0)]);
+        let entry = chapter_entry("1", "#1", Some(10));
+
+        let _ = detail.update(Message::MenuToggled("ch:1".to_string()));
+        assert!(detail.card_state(&entry).menu_open);
+        let _ = detail.update(Message::MenuToggled("ch:1".to_string()));
+        assert!(!detail.card_state(&entry).menu_open);
+
+        let _ = detail.update(Message::MenuToggled("ch:1".to_string()));
+        let _ = detail.update(Message::MenuDismissed);
+        assert!(!detail.card_state(&entry).menu_open);
+    }
+
+    #[test]
+    fn the_open_menu_offers_to_delete_the_item() {
+        let mut detail = library_detail_with(vec![library_item("1", 10, 0)]);
+        let entry = library_item("1", 10, 0).as_entry();
+
+        let mut ui = simulator(detail.view());
+        assert!(ui.find("Delete").is_err());
+        drop(ui);
+
+        let _ = detail.update(Message::MenuToggled("ch:1".to_string()));
+        let mut ui = simulator(detail.view());
+        let _ = ui.click("Delete").expect("the delete item should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(messages, vec![Message::RemoveFromLibrary(entry.clone())]);
+        assert!(matches!(
+            detail.update(Message::RemoveFromLibrary(entry)),
+            Action::Run(_)
+        ));
+        // Choosing an item closes the menu.
+        assert_eq!(detail.menu, None);
+    }
+
+    #[test]
+    fn deleting_an_item_drops_it_from_a_library_series() {
+        let mut detail =
+            library_detail_with(vec![library_item("1", 10, 0), library_item("2", 10, 0)]);
+
+        let action = detail.update(Message::RemovedFromLibrary("ch:1".to_string(), Ok(())));
+
+        assert!(matches!(action, Action::None));
+        let AsyncModel::Loaded(entries) = &detail.entries else {
+            panic!("the entries should stay loaded");
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(!detail.library.contains_key("ch:1"));
+    }
+
+    #[test]
+    fn deleting_the_last_item_goes_back_to_the_library() {
+        let mut detail = library_detail_with(vec![library_item("1", 10, 0)]);
+
+        let action = detail.update(Message::RemovedFromLibrary("ch:1".to_string(), Ok(())));
+
+        assert!(matches!(action, Action::BackToLibrary));
+    }
+
+    #[test]
+    fn deleting_from_a_sources_series_offers_to_add_it_again() {
+        let mut detail = series_detail(AsyncModel::Loaded(vec![chapter_entry("1", "#1", None)]));
+        let _ = detail.update(Message::LibraryLoaded(Ok(vec![library_item("1", 10, 0)])));
+
+        let action = detail.update(Message::RemovedFromLibrary("ch:1".to_string(), Ok(())));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            detail.add_state(&chapter_entry("1", "#1", None)),
+            AddState::Available
+        );
+    }
+
+    #[test]
+    fn a_failed_delete_is_reported() {
+        let mut detail = library_detail_with(vec![library_item("1", 10, 0)]);
+
+        let _ = detail.update(Message::RemovedFromLibrary(
+            "ch:1".to_string(),
+            Err("locked".to_string()),
+        ));
+
+        assert!(detail.launch_error.as_deref().unwrap().contains("locked"));
+        assert!(detail.library.contains_key("ch:1"));
+    }
+
+    #[test]
+    fn a_library_series_goes_back_to_the_library() {
+        let mut detail = library_detail();
+
+        assert!(matches!(
+            detail.update(Message::BackPressed),
+            Action::BackToLibrary
+        ));
+    }
+
+    #[test]
+    fn closing_the_reader_reloads_a_library_series_progress() {
+        let mut detail = library_detail();
+
+        assert!(matches!(
+            detail.update(Message::LibraryReaderClosed),
+            Action::Run(_)
+        ));
     }
 }

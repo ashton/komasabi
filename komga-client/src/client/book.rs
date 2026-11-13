@@ -10,8 +10,24 @@ impl KomgaClient {
     /// The book that follows `book_id` in its series (by Komga's own
     /// `numberSort` ordering), or `None` when it's the series' last book.
     pub async fn next_book(&self, book_id: &str) -> Result<Option<Book>, reqwest::Error> {
+        self.sibling_book(book_id, "next").await
+    }
+
+    /// The book that precedes `book_id` in its series, or `None` when it's the
+    /// series' first book.
+    pub async fn previous_book(&self, book_id: &str) -> Result<Option<Book>, reqwest::Error> {
+        self.sibling_book(book_id, "previous").await
+    }
+
+    /// `GET /api/v1/books/{book_id}/{which}`, where Komga answers 404 when there
+    /// is no such neighbour.
+    async fn sibling_book(
+        &self,
+        book_id: &str,
+        which: &str,
+    ) -> Result<Option<Book>, reqwest::Error> {
         match self
-            .execute_json(self.get(&format!("/api/v1/books/{book_id}/next")))
+            .execute_json(self.get(&format!("/api/v1/books/{book_id}/{which}")))
             .await
         {
             Ok(book) => Ok(Some(book)),
@@ -109,6 +125,36 @@ mod tests {
         let next = client_for(&mock_server).next_book("B9").await.unwrap();
 
         assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn previous_book_returns_the_preceding_book_or_none() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B2/previous"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"id": "B1", "seriesId": "S1", "libraryId": "L1", "name": "Alpha Saga v01",
+                    "number": 1, "sizeBytes": 1024,
+                    "media": {"status": "READY", "mediaType": "application/zip",
+                              "pagesCount": 3, "mediaProfile": "DIVINA",
+                              "epubDivinaCompatible": false},
+                    "metadata": {"title": "Alpha Saga v01", "number": "1", "numberSort": 1.0},
+                    "deleted": false}"#,
+                "application/json",
+            ))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/books/B1/previous"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let client = client_for(&mock_server);
+        let previous = client.previous_book("B2").await.unwrap();
+        assert_eq!(previous.map(|book| book.id).as_deref(), Some("B1"));
+        assert!(client.previous_book("B1").await.unwrap().is_none());
     }
 
     #[tokio::test]

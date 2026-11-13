@@ -2,31 +2,27 @@ use suwayomi_client::models::{
     category::Category as SuwayomiCategory, chapter::Chapter as SuwayomiChapter,
     manga::Manga as SuwayomiManga,
 };
-use uuid::Uuid;
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
+    adapter::{CollectionAdapter, ItemAdapter},
     models::{
-        library::{Library, LibraryType},
-        library_item::LibraryItem,
+        collection::{Collection, CollectionKind},
+        collection_item::CollectionItem,
         series_entry::{EntryKind, ReadState, SeriesEntry},
     },
 };
 
-/// A library's external id: its category id, prefixed with the integration's
-/// id. Category ids are small integers on every server (the default category
-/// is always `0`), so on their own they'd collide with another server's, or
-/// with Kavita's numeric library ids, in the app-wide external id lookup.
-pub fn library_external_id(integration_id: &str, category_id: i32) -> String {
-    format!("{integration_id}:{category_id}")
+/// A category's collection id (`category:{id}`).
+pub fn collection_id(category_id: i32) -> String {
+    format!("category:{category_id}")
 }
 
-/// The category id back out of a [`library_external_id`].
-pub fn category_id(library_external_id: &str) -> Result<i32, String> {
-    library_external_id
-        .rsplit_once(':')
-        .and_then(|(_, id)| id.parse().ok())
-        .ok_or_else(|| format!("{library_external_id} is not a Suwayomi library id"))
+/// The category id back out of a [`collection_id`].
+pub fn category_id(collection_id: &str) -> Result<i32, String> {
+    collection_id
+        .strip_prefix("category:")
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| format!("{collection_id} is not a Suwayomi category id"))
 }
 
 /// A chapter entry's external id: its manga's id and its own, so a chapter
@@ -57,15 +53,12 @@ pub fn parse_page_chapter_id(chapter_id: &str) -> Result<(i32, i32), String> {
 
 pub struct SuwayomiItemAdapter;
 
-impl ItemAdapter<(SuwayomiManga, &str)> for SuwayomiItemAdapter {
-    /// Adapts a manga, paired with the external id of the library it's listed
-    /// under.
-    fn adapt_item((source, library_external_id): (SuwayomiManga, &str)) -> LibraryItem {
-        LibraryItem {
+impl ItemAdapter<SuwayomiManga> for SuwayomiItemAdapter {
+    fn adapt_item(source: SuwayomiManga) -> CollectionItem {
+        CollectionItem {
             external_id: source.id.to_string(),
             name: source.title,
             cover: String::new(),
-            library_id: library_external_id.to_string(),
             // Suwayomi counts a manga's chapters, not its pages.
             pages: None,
         }
@@ -111,21 +104,15 @@ pub fn chapter_entry(chapter: SuwayomiChapter) -> SeriesEntry {
     }
 }
 
-pub struct SuwayomiLibraryAdapter;
+pub struct SuwayomiCollectionAdapter;
 
-impl LibraryAdapter<SuwayomiCategory> for SuwayomiLibraryAdapter {
-    /// Suwayomi is a manga server, so its categories are imported as manga
-    /// libraries.
-    fn adapt_library(source: SuwayomiCategory, integration_id: &str) -> Library {
-        Library {
-            id: Uuid::new_v4().to_string(),
-            kind: LibraryType::Manga,
-            name: source.name,
-            external_id: Some(library_external_id(integration_id, source.id)),
-            folder: None,
-            cover: None,
-            integration_id: Some(integration_id.to_string()),
-        }
+impl CollectionAdapter<SuwayomiCategory> for SuwayomiCollectionAdapter {
+    fn adapt_collection(source: SuwayomiCategory) -> Collection {
+        Collection::new(
+            collection_id(source.id),
+            source.name,
+            CollectionKind::Category,
+        )
     }
 }
 
@@ -146,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn adapt_library_namespaces_the_category_id_by_integration() {
+    fn adapt_collection_makes_a_category() {
         let source = SuwayomiCategory {
             id: 0,
             name: "Default".to_string(),
@@ -154,22 +141,19 @@ mod tests {
             ..SuwayomiCategory::default()
         };
 
-        let library = SuwayomiLibraryAdapter::adapt_library(source, "integration-id");
+        let collection = SuwayomiCollectionAdapter::adapt_collection(source);
 
-        assert_eq!(library.name, "Default");
-        assert_eq!(library.external_id, Some("integration-id:0".to_string()));
-        assert_eq!(library.kind, LibraryType::Manga);
-        assert_eq!(library.integration_id, Some("integration-id".to_string()));
-        assert_eq!(library.folder, None);
+        assert_eq!(collection.name, "Default");
+        assert_eq!(collection.external_id, "category:0");
+        assert_eq!(collection.kind, CollectionKind::Category);
     }
 
     #[test]
     fn category_id_round_trips_and_rejects_foreign_ids() {
-        let external_id = library_external_id("3f2c-uuid", 7);
-
-        assert_eq!(category_id(&external_id), Ok(7));
+        assert_eq!(category_id(&collection_id(7)), Ok(7));
         assert!(category_id("7").is_err());
-        assert!(category_id("uuid:abc").is_err());
+        assert!(category_id("category:abc").is_err());
+        assert!(category_id("library:7").is_err());
     }
 
     #[test]
@@ -190,11 +174,10 @@ mod tests {
             ..SuwayomiManga::default()
         };
 
-        let item = SuwayomiItemAdapter::adapt_item((source, "integration-id:0"));
+        let item = SuwayomiItemAdapter::adapt_item(source);
 
         assert_eq!(item.external_id, "9");
         assert_eq!(item.name, "Voyeurs, Inc.");
-        assert_eq!(item.library_id, "integration-id:0");
         assert_eq!(item.pages, None);
     }
 

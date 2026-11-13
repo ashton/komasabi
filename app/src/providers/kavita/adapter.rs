@@ -1,16 +1,17 @@
 use kavita_client::models::{
     chapter::Chapter as KavitaChapter,
-    library::{KavitaLibrary, KavitaLibraryType},
+    collection::KavitaCollection,
+    library::KavitaLibrary,
+    reading_list::{ReadingList, ReadingListItem},
     series::Series as KavitaSeries,
     volume::{LOOSE_LEAF_VOLUME_NUMBER, SPECIAL_VOLUME_NUMBER, Volume as KavitaVolume},
 };
-use uuid::Uuid;
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
+    adapter::{CollectionAdapter, ItemAdapter},
     models::{
-        library::{Library, LibraryType},
-        library_item::LibraryItem,
+        collection::{Collection, CollectionKind},
+        collection_item::CollectionItem,
         series_entry::{EntryKind, ReadState, SeriesEntry},
     },
 };
@@ -18,11 +19,10 @@ use crate::{
 pub struct KavitaItemAdapter;
 
 impl ItemAdapter<KavitaSeries> for KavitaItemAdapter {
-    fn adapt_item(source: KavitaSeries) -> LibraryItem {
-        LibraryItem {
+    fn adapt_item(source: KavitaSeries) -> CollectionItem {
+        CollectionItem {
             external_id: source.id.to_string(),
             name: source.name,
-            library_id: source.library_id.to_string(),
             cover: source.cover_image,
             pages: (source.pages > 0).then_some(source.pages),
         }
@@ -141,30 +141,85 @@ fn is_number_like(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-pub struct KavitaLibraryAdapter;
+/// Which of Kavita's groupings of series a [`Collection`] is, encoded into its
+/// `external_id` (e.g. `library:5`), since libraries, collections and reading
+/// lists each have their own id space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KavitaCollectionId {
+    Library(u16),
+    Collection(u32),
+    ReadingList(u32),
+}
 
-impl LibraryAdapter<KavitaLibrary> for KavitaLibraryAdapter {
-    fn adapt_library(source: KavitaLibrary, integration_id: &str) -> Library {
-        Library {
-            id: Uuid::new_v4().to_string(),
-            kind: adapt_library_type(source.library_type),
-            name: source.name,
-            external_id: Some(source.id.to_string()),
-            folder: None,
-            cover: None,
-            integration_id: Some(integration_id.to_string()),
+impl KavitaCollectionId {
+    pub fn encode(&self) -> String {
+        match self {
+            KavitaCollectionId::Library(id) => format!("library:{id}"),
+            KavitaCollectionId::Collection(id) => format!("collection:{id}"),
+            KavitaCollectionId::ReadingList(id) => format!("reading-list:{id}"),
+        }
+    }
+
+    pub fn decode(external_id: &str) -> Result<Self, String> {
+        let invalid = || format!("{external_id} is not a Kavita collection id");
+        let (kind, id) = external_id.split_once(':').ok_or_else(invalid)?;
+
+        match kind {
+            "library" => id.parse().map(Self::Library).map_err(|_| invalid()),
+            "collection" => id.parse().map(Self::Collection).map_err(|_| invalid()),
+            "reading-list" => id.parse().map(Self::ReadingList).map_err(|_| invalid()),
+            _ => Err(invalid()),
         }
     }
 }
 
-fn adapt_library_type(source: KavitaLibraryType) -> LibraryType {
-    match source {
-        KavitaLibraryType::Manga => LibraryType::Manga,
-        KavitaLibraryType::Comic | KavitaLibraryType::ComicVine | KavitaLibraryType::Image => {
-            LibraryType::Comic
-        }
-        KavitaLibraryType::Book | KavitaLibraryType::LightNovel => LibraryType::Ebook,
+pub struct KavitaCollectionAdapter;
+
+impl CollectionAdapter<KavitaLibrary> for KavitaCollectionAdapter {
+    fn adapt_collection(source: KavitaLibrary) -> Collection {
+        Collection::new(
+            KavitaCollectionId::Library(source.id).encode(),
+            source.name,
+            CollectionKind::Library,
+        )
     }
+}
+
+impl CollectionAdapter<KavitaCollection> for KavitaCollectionAdapter {
+    fn adapt_collection(source: KavitaCollection) -> Collection {
+        Collection::new(
+            KavitaCollectionId::Collection(source.id).encode(),
+            source.title,
+            CollectionKind::Collection,
+        )
+    }
+}
+
+impl CollectionAdapter<ReadingList> for KavitaCollectionAdapter {
+    fn adapt_collection(source: ReadingList) -> Collection {
+        Collection::new(
+            KavitaCollectionId::ReadingList(source.id).encode(),
+            source.title,
+            CollectionKind::ReadingList,
+        )
+    }
+}
+
+/// The series a reading list's chapters come from, once each, in the order
+/// the list first reaches them.
+pub fn reading_list_series(items: Vec<ReadingListItem>) -> Vec<CollectionItem> {
+    let mut seen = std::collections::HashSet::new();
+
+    items
+        .into_iter()
+        .filter(|item| seen.insert(item.series_id))
+        .map(|item| CollectionItem {
+            external_id: item.series_id.to_string(),
+            name: item.series_name,
+            cover: String::new(),
+            pages: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -172,56 +227,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapt_library_type_maps_manga() {
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::Manga),
-            LibraryType::Manga
-        );
+    fn collection_ids_round_trip_and_reject_garbage() {
+        for id in [
+            KavitaCollectionId::Library(5),
+            KavitaCollectionId::Collection(7),
+            KavitaCollectionId::ReadingList(9),
+        ] {
+            assert_eq!(KavitaCollectionId::decode(&id.encode()), Ok(id));
+        }
+
+        assert!(KavitaCollectionId::decode("5").is_err());
+        assert!(KavitaCollectionId::decode("shelf:5").is_err());
+        assert!(KavitaCollectionId::decode("library:x").is_err());
     }
 
     #[test]
-    fn adapt_library_type_maps_comic_variants_to_comic() {
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::Comic),
-            LibraryType::Comic
-        );
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::ComicVine),
-            LibraryType::Comic
-        );
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::Image),
-            LibraryType::Comic
-        );
-    }
-
-    #[test]
-    fn adapt_library_type_maps_text_variants_to_ebook() {
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::Book),
-            LibraryType::Ebook
-        );
-        assert_eq!(
-            adapt_library_type(KavitaLibraryType::LightNovel),
-            LibraryType::Ebook
-        );
-    }
-
-    #[test]
-    fn adapt_library_maps_fields_and_type() {
-        let source = KavitaLibrary {
+    fn adapt_collection_encodes_each_kind_into_the_id() {
+        let library = KavitaCollectionAdapter::adapt_collection(KavitaLibrary {
             id: 7,
             name: "Comics".to_string(),
-            library_type: KavitaLibraryType::Manga,
             ..KavitaLibrary::default()
+        });
+        assert_eq!(library.name, "Comics");
+        assert_eq!(library.external_id, "library:7");
+        assert_eq!(library.kind, CollectionKind::Library);
+        assert!(!library.importable);
+
+        let collection = KavitaCollectionAdapter::adapt_collection(KavitaCollection {
+            id: 3,
+            title: "Favorites".to_string(),
+            ..KavitaCollection::default()
+        });
+        assert_eq!(collection.external_id, "collection:3");
+        assert_eq!(collection.kind, CollectionKind::Collection);
+
+        let list = KavitaCollectionAdapter::adapt_collection(ReadingList {
+            id: 2,
+            title: "Crossover".to_string(),
+            ..ReadingList::default()
+        });
+        assert_eq!(list.external_id, "reading-list:2");
+        assert_eq!(list.kind, CollectionKind::ReadingList);
+    }
+
+    #[test]
+    fn reading_list_series_keeps_each_series_once_in_list_order() {
+        let item = |series_id: u16, name: &str| ReadingListItem {
+            series_id,
+            series_name: name.to_string(),
+            ..ReadingListItem::default()
         };
 
-        let library = KavitaLibraryAdapter::adapt_library(source, "integration-id");
+        let series = reading_list_series(vec![item(2, "Saga"), item(1, "Batman"), item(2, "Saga")]);
 
-        assert_eq!(library.name, "Comics");
-        assert_eq!(library.external_id, Some("7".to_string()));
-        assert_eq!(library.kind, LibraryType::Manga);
-        assert_eq!(library.integration_id, Some("integration-id".to_string()));
+        let names: Vec<&str> = series.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["Saga", "Batman"]);
+        assert_eq!(series[0].external_id, "2");
     }
 
     #[test]
@@ -240,7 +301,6 @@ mod tests {
         assert_eq!(item.external_id, "1");
         assert_eq!(item.name, "One Piece");
         assert_eq!(item.cover, "1.png");
-        assert_eq!(item.library_id, "7");
         assert_eq!(item.pages, Some(42));
     }
 

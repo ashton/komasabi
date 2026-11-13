@@ -528,8 +528,12 @@ mod tests {
         let start = Instant::now();
         ui.simulate([
             Event::Window(window::Event::RedrawRequested(start)),
-            Event::Window(window::Event::RedrawRequested(start + Duration::from_millis(16))),
-            Event::Window(window::Event::RedrawRequested(start + Duration::from_millis(32))),
+            Event::Window(window::Event::RedrawRequested(
+                start + Duration::from_millis(16),
+            )),
+            Event::Window(window::Event::RedrawRequested(
+                start + Duration::from_millis(32),
+            )),
         ]);
 
         let messages: Vec<_> = ui.into_messages().collect();

@@ -8,11 +8,12 @@ Komasabi is a desktop app, built with Rust and [`iced`](https://iced.rs/) (not S
 originated from a Slint template, hence the stale `README.md` and the enabled `slint` plugin in
 `.claude/settings.json`, but the UI toolkit actually in use is `iced`). It lets a user aggregate
 comic/manga libraries from external services (currently Kavita, Komga, Suwayomi and OPDS catalogs) and from local folders into one
-place.
+place. Each of those is a **source** (called "Sources" in the UI, `Integration` in code), and a local folder is a
+source like any server.
 
 The workspace crates:
 - `app` (`komasabi`) — the iced desktop application: screens, local SQLite persistence (Diesel),
-  background jobs, and provider integrations.
+  and provider integrations.
 - `kavita-client` — a standalone, UI-agnostic HTTP client for the [Kavita](https://www.kavitareader.com/)
   API. Has no dependency on `app` and is tested against a mocked server (`wiremock`), not a live Kavita
   instance.
@@ -83,15 +84,14 @@ runs on Ubuntu 22.04 so the binary only needs glibc 2.35. Locally: `cd app && ca
 
 `schema.rs` is Diesel-generated but hand-patched: diesel-cli's codegen is piped through
 `app/diesel-schema-patches/schema.patch` (configured in `app/diesel.toml`) to inject the enum-mapping
-imports (`IntegrationTypeMapping`, `JobTypeMapping`, `JobStatusMapping`) that `diesel print-schema`
-doesn't know to add on its own. After adding a migration that introduces or changes a `diesel_derive_enum`
+import (`IntegrationTypeMapping`) that `diesel print-schema` doesn't know to add on its own. After adding a migration that introduces or changes a `diesel_derive_enum`
 column, update the patch file to match, or `schema.rs` will revert to plain `Text` columns the next
 time it's regenerated.
 
 ## Architecture (`app` crate)
 
-**Screens (`src/screen/`).** Each screen (`home`, `library`, `integrations`, `settings`) is a
-self-contained iced sub-application following the same shape:
+**Screens (`src/screen/`).** Each screen (`home`, `integration` (sources), `collections`,
+`browse`, `series_detail`, `settings`) is a self-contained iced sub-application following the same shape:
 - a `Message` enum for its own events
 - an `Action` enum (`None` / `Run(Task<Message>)`) returned from `update`, which the top-level
   `KomasabiApp::update` (in `src/main.rs`) matches on to decide whether to run a follow-up `Task`
@@ -101,34 +101,50 @@ self-contained iced sub-application following the same shape:
   (`ui.find("label")`) and emitted messages (`ui.click(...)`, `ui.into_messages()`)
 
 `src/main.rs` owns the top-level `Screen` enum/`Message` enum, routes navigation messages
-(`OpenHome`, `OpenLibrary`, ...) to swap `self.screen`, and forwards per-screen messages into the
+(`OpenHome`, `OpenIntegrations`, ...) and screens' navigation `Action`s to swap `self.screen`, and forwards per-screen messages into the
 active screen's `update`. `src/menu.rs` is the generic sidebar widget; it tracks which item is
 "active" by comparing message *discriminants*, not values — new nav messages must be unit-like
 variants (or the single discriminant will match multiple items).
+
+A screen's top-bar "back" control is `screen::back_button::back_button(msg)`, a chevron with no
+text, so tests click it by its container id (`back_button::ID`). The Back buttons beside a form's
+Save (`screen/integration/*`) stay labelled buttons.
 
 Wrap every `scrollable` in `touch_scroll::touch_scroll(...)`. iced only touch-scrolls when the content
 doesn't capture the finger press, and buttons (every card) do, so without the wrapper a touch screen
 can't scroll. The wrapper turns a drag into pixel wheel scrolls, with flick momentum.
 
-Some UI copy is in Portuguese (e.g. empty-state strings in `library.rs`/`integrations.rs`) — match
+Some UI copy is in Portuguese (e.g. empty-state strings in `integration.rs`/`collections.rs`) — match
 the existing language when adding sibling strings in the same view, don't translate unprompted.
 
-**Data flow for an integration (e.g. Kavita):**
-1. `screen/integrations.rs` collects connection details (name, URL, API key) through a `Step` state
-   machine (`List` → `ChooseType` → `KavitaForm`) and saves via `repository::integration::create`.
-2. On successful creation, it fires `jobs::sync_integration_libraries::spawn(integration_id)` —
-   this spawns a **dedicated OS thread** with its own single-threaded tokio runtime, deliberately
-   decoupled from iced's own async executor, so a slow/hanging sync can't stall the UI.
-3. The job (`src/jobs/sync_integration_libraries.rs`) looks up the integration, authenticates a
-   `providers::kavita::provider::KavitaProvider` (exchanges the stored API key for a JWT via
-   `kavita-client`), fetches remote libraries, and inserts any not already present (matched by
-   `external_id`) via `repository::library`. Job status/errors are persisted via
-   `repository::job::update_status` so failures are recorded rather than silently dropped.
-4. `providers::kavita::adapter` implements the generic `adapter::{ItemAdapter, LibraryAdapter}`
-   traits to convert `kavita-client` wire types (`KavitaLibrary`, `Series`) into this app's own
-   `models::library::Library` / `models::library_item::Item`. Adding a second provider means
-   implementing these same adapter traits plus a `providers::Provider` impl — don't let
-   Kavita-specific types leak past the adapter layer into `repository`/`screen` code.
+**Sources, collections and items.** Navigation is Sources → a source's collections → a collection's
+series (items) → a series' entries (volumes/chapters) → the reader:
+1. `screen/integration.rs` lists the sources and collects a new one's details through a `Step` state
+   machine (`List` → `ChooseType` → a per-type form under `screen/integration/`, e.g. `Kavita`,
+   `LocalFolder`). Saving stores only the `integrations` row (a local folder's path goes in its
+   `folder` column). Nothing is synced or copied: collections aren't stored anywhere. Each row's trash
+   button asks to confirm inline, then `repository::integration::remove` deletes the source and its
+   Library items in one transaction.
+2. Clicking a source opens `screen/collections.rs`, which resolves the source's provider
+   (`providers::provider_for_integration`) and calls `Provider::list_collections` live. A
+   **collection** (`models::collection::Collection`) is anything in a source that gathers series: a
+   Kavita/Komga library, collection or reading list, a Suwayomi category, an OPDS feed, or a local folder
+   (its one collection). The screen groups them by the generic `CollectionKind`.
+3. Opening a collection hands a `CollectionRef` (source id + collection) to `screen/browse.rs`, which
+   pages through `Provider::list_items(collection_id, …)` as `CollectionItem`s. `series_detail.rs`,
+   the reader launcher and the cover/page caches all key off the source's id (the cache namespace).
+   A collection with `importable` set (a local folder) also offers "Import items", which goes through
+   `Provider::import_files`.
+4. Screens only ever see `Collection`, `CollectionItem` and `SeriesEntry`. Each provider adapts its
+   client's wire types through `adapter::{CollectionAdapter, ItemAdapter}` and owns its collection id
+   format: a remote provider with several kinds of collection encodes the kind in the id (Kavita
+   `library:5` / `collection:4` / `reading-list:2`, Komga `library:<id>` / `collection:<id>` /
+   `read-list:<id>`, Suwayomi `category:<id>`, OPDS a base64url feed URL) and decodes it back in
+   `list_items`. Reading lists hold chapters/books, so their items are the distinct series those come
+   from, in list order, paginated client-side (`providers::paginate`). Collections and reading lists
+   are listed best-effort: if the server refuses them, the libraries still are. Adding a backend means
+   implementing the adapter traits plus a `providers::Provider` impl and a `providers::resolve` arm —
+   don't let backend-specific types leak past the adapter layer into `repository`/`screen` code.
 
 **Reading history.** While the reader is open, every `ReaderEvent::ShowingPage` it reports is
 forwarded by `reader_launch` to `reading_progress::report_progress`, which runs alongside the page
@@ -142,10 +158,10 @@ the last page of each chapter run, and failures are only logged.
 
 **Cargo features.** Each remote provider is a feature of the `app` crate: `kavita`, `komga`, `opds`,
 `suwayomi`, all on by default. A feature pulls in its client crate, its `providers::<name>` and
-`screen::integration::<name>` modules, its `Step`/`Message`/`ResolvedProvider` variants, its match arms
-in `providers::provider_for_library` and the sync job, and its tests. `IntegrationType` keeps every
+`screen::integration::<name>` modules, its `Step`/`Message`/`ResolvedProvider` variants, its match arm
+in `providers::resolve`, and its tests. `IntegrationType` keeps every
 variant regardless, so a database written by a fuller build still loads; a left-out type resolves to
-`providers::not_built_in`. Local folders are always built in. Check new provider code with
+`providers::not_built_in`. Local folders (`IntegrationType::LocalFolder`, `providers::file_system`) are always built in. Check new provider code with
 `cargo check -p komasabi --tests --no-default-features --features=<name>` as well as the default
 build.
 
@@ -160,15 +176,66 @@ before the first connection, so new migrations reach users without `diesel`. Rep
 is the standard wrapper screens use to represent not-loaded/loading/loaded/error state for data
 fetched this way.
 
-Enum columns (`IntegrationType`, `JobType`, `JobStatus`) use `diesel_derive_enum::DbEnum`, stored as
-`Text` in sqlite — see the schema-regeneration note above when touching these.
+The app tables are `integrations` (sources) and `library_items` (the user's Library, see below).
+The legacy `servers` table is unused. The enum column `IntegrationType` uses
+`diesel_derive_enum::DbEnum`, stored as `Text` in sqlite — see the schema-regeneration note above
+when touching it (`library_items.kind` is plain `Text`, `volume`/`chapter`, mapped by
+`models::library_item`).
+
+**The Library.** There's a single Library, made of the volumes/chapters the user added. In
+`series_detail.rs`, hovering an entry's cover (iced's `hover` widget) shades it and offers "Add to
+library" and "Read". Adding runs `library::add_to_library`, which downloads nothing: it only saves a
+`library_items` row (source id, entry id/kind/name, series id/name, page count when known, pages
+read). Adding an entry that's already there keeps its progress. `browse.rs` series cards get the same
+hover shade (`screen::cover_overlay`, shared with `series_detail.rs`), offering "Add to library", which
+runs `library::add_series_to_library` to save every entry the source lists for the series, and "Open".
+Under each series cover is the same bar as an entry card's (`screen::card`, also shared), with the
+title as a link to the series. A series with any item in the Library (`repository::library::series_ids`,
+loaded when the screen opens) shows "In library" and gets the "⋮" menu, whose "Remove from library"
+runs `repository::library::remove_series`. Adding never downloads anything: that's the separate
+download feature (see below). Each entry card has a bar under its cover (download icon, name,
+page count) with a "⋮" button. It toggles a menu stacked over the cover (iced has no context menu; a
+`mouse_area` over the screen closes it on an outside click) offering "Download" until the entry is
+downloaded (`downloads::download_one`) and, when the entry is in the Library, "Delete"
+(`repository::library::remove`). A downloaded entry outside the Library has no "⋮". A Library series that loses its last item goes back
+home. `screen/home.rs` lists the Library's series
+(`library_item::group_into_series`), with covers fetched from their sources. Each series card has the
+same bar (`screen::card`), whose "⋮" menu always offers "Remove from library"
+(`repository::library::remove_series`). Opening one opens
+`SeriesDetail::from_library` (`Origin::Library`), the same grid with the items as entries (covers from
+the source, read state from `pages_read`). "Read" there runs `reader_launch::launch_library_item`,
+which reads the item through its source like any source entry, but opens it on the last page read
+and tells the screen when the reader closes, so the grid reloads. While reading a source entry that's
+in the Library, each page shown is saved as the item's progress (`repository::library::record_progress`,
+which also stores the page count, as an item added without one only learns it then). Progress only
+moves forward there. Whenever the Library's items are loaded (home, a Library series), they're shown
+as saved and `library::sync_progress` runs in the background: for sources whose
+`Provider::tracks_reading_progress` is true (Kavita, Komga, Suwayomi), it lists each series' entries
+and copies their read state onto the items (the source wins, even backwards), then the screen shows
+the synced items.
+
+**Downloads (`src/downloads.rs`, `screen/downloads.rs`).** A series card's "⋮" menu (browse and
+home) offers "Download" until the series is downloaded; `screen::card::DownloadState` drives that
+item and the bar's leading icon (`cloud`, then `download`). `downloads::download_series` lists the
+series' entries through its provider and saves each one not yet downloaded to
+`<data dir>/downloads/<source>/<series>/<entry>/` (names escaped by `cache::file_name`): its pages as
+`reader_launch::page_file` names, filled in a `.part` folder that's renamed into place once its
+`manifest.json` (entry, series and `PageRef`s) is written. A single entry is downloaded from its card's menu
+(`downloads::download_one`), and `downloads::downloaded_entries` tells a series screen which are. A
+`series.json` marks a series whose every entry downloaded (written by either path once all are);
+removing any entry drops it. Nothing is in the database: the folders are the
+record. The sidebar's Downloads screen lists every downloaded entry under its series (first page as
+cover); clicking reads it, and its "⋮" menu's "Remove download" runs `downloads::remove`. Reading
+any entry (`reader_launch`) first checks `downloads::local_entry`: a downloaded one opens on its
+folder with its saved pages, so nothing is streamed, and when its source can't even be resolved it's
+served through `reader_launch::Offline` (no adjacent entries or reading history).
 
 **OPDS provider (`providers::opds`).** Added via the integrations screen's "OPDS" type (catalog URL +
 optional basic-auth username/password, stored in `integrations.username`/`password`). OPDS has no
-numeric ids, so library/item/entry ids are `OpdsId`s: a feed URL, or (feed page URL, index, key) for a
-publication, base64url-encoded. `list_libraries` turns each root navigation link into a library, but
-expands a "catalog of catalogs" (e.g. Kavita's "All Libraries") into one library per entry. A library's
-items are its feed's navigation links + publications; an item's entries are the publications of the
+numeric ids, so collection/item/entry ids are `OpdsId`s: a feed URL, or (feed page URL, index, key) for a
+publication, base64url-encoded. `list_collections` turns each root navigation link into a catalog
+collection, but expands a "catalog of catalogs" (e.g. Kavita's "All Libraries") into one library
+collection per entry. A collection's items are its feed's navigation links + publications; an item's entries are the publications of the
 feed it links to. Reading goes only through the OPDS provider and `opds-client`, with no other
 provider's code involved. The file is downloaded from the publication's `…/acquisition/open-access`
 link (plain `…/acquisition` as a fallback) and fully extracted, CBZ or CBR, by `providers::opds::archive`
@@ -178,8 +245,9 @@ not used for reading. Live check: `OPDS_LIVE_URL=<catalog> cargo test -p komasab
 
 **Komga provider (`providers::komga`).** Added via the integrations screen's "Komga" type (server URL
 plus either an API key, stored in `integrations.api_key`, or the account email/password, stored in
-`username`/`password`; the API key wins when both are set). Komga's library → series → book maps
-directly onto library → item → entry, using Komga's string ids as-is. Every book is a chapter card
+`username`/`password`; the API key wins when both are set). Komga's libraries, collections and
+read lists are the source's collections; its series → book map onto item → entry, using Komga's string
+ids as-is. Every book is a chapter card
 labelled with its title, since Komga doesn't say whether a book is a volume or an issue. Reading
 uses the page endpoint (`/api/v1/books/{id}/pages/{n}`, 1-based), so nothing is downloaded up front.
 Text-only EPUBs and books Komga hasn't analyzed yet are refused. Live check:
@@ -187,9 +255,8 @@ Text-only EPUBs and books Komga hasn't analyzed yet are refused. Live check:
 
 **Suwayomi provider (`providers::suwayomi`).** Added via the integrations screen's "Suwayomi" type
 (server URL plus optional basic-auth username/password; Suwayomi runs unauthenticated by default).
-Categories map to libraries, mangas to items and chapters to chapter entries. Category ids are small
-integers on every server, so a library's `external_id` is `{integration_id}:{category_id}`, which keeps
-it from colliding in the global external-id lookup. An empty default category is skipped. A category's
+Categories map to collections (`category:{id}`), mangas to items and chapters to chapter entries.
+An empty default category is skipped. A category's
 mangas aren't paged by the server, so `list_items` slices the full list. A chapter entry's id is
 `{manga_id}-{chapter_id}`. Chapters have no images of their own, so a chapter card shows the manga
 cover. Reading runs the `fetchChapterPages` mutation, which makes the server fetch the page list from
@@ -200,7 +267,7 @@ the source. The pages are then fetched from `/api/v1/manga/{manga}/chapter/{sour
 ## Architecture (`kavita-client` crate)
 
 A thin `reqwest`-based wrapper over the Kavita REST API. `KavitaClient` (`src/client.rs`) holds the
-base URL and an `http_client: reqwest::Client`; endpoint groups (`account`, `chapter`, `library`,
+base URL and an `http_client: reqwest::Client`; endpoint groups (`account`, `chapter`, `collection`, `library`, `reader`, `reading_list`,
 `series`, `volume`) are implemented as `impl KavitaClient` blocks in separate files under
 `src/client/`, each just building a request and deserializing the JSON response — no retry/caching
 logic. Models mirror Kavita's wire format under `src/models/` (e.g. `series_filter.rs` encodes

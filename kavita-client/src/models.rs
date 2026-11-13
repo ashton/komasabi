@@ -1,9 +1,11 @@
 pub mod chapter;
+pub mod collection;
 pub mod file;
 pub mod genre;
 pub mod library;
 pub mod person;
 pub mod reader;
+pub mod reading_list;
 pub mod series;
 pub mod series_filter;
 pub mod tag;

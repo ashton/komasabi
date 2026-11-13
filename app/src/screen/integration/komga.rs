@@ -49,7 +49,8 @@ pub enum Action {
     None,
     Run(Task<Message>),
     BackPressed,
-    Created(IntegrationModel),
+    /// The source was saved.
+    Created,
 }
 
 impl Komga {
@@ -95,7 +96,7 @@ impl Komga {
                 Message::Created,
             )),
 
-            Message::Created(Ok(integration)) => Action::Created(integration),
+            Message::Created(Ok(_)) => Action::Created,
             Message::Created(Err(_)) => Action::None,
 
             Message::TestConnectionPressed => {
@@ -264,6 +265,7 @@ mod tests {
             api_key: Some("api-key".to_string()),
             username: None,
             password: None,
+            folder: None,
         }
     }
 
@@ -340,7 +342,7 @@ mod tests {
 
         assert!(matches!(
             komga.update(Message::Created(Ok(integration_model("My Komga")))),
-            Action::Created(_)
+            Action::Created
         ));
         assert!(matches!(
             komga.update(Message::Created(Err("boom".to_string()))),

@@ -2575,6 +2575,7 @@ dependencies = [
  "opds-client",
  "reqwest",
  "rfd",
+ "serde",
  "serde_json",
  "suwayomi-client",
  "tokio",

@@ -13,7 +13,4 @@ pub const KAVITA: &[u8] = include_bytes!("../assets/kavita.svg");
 pub const KOMGA: &[u8] = include_bytes!("../assets/komga.svg");
 pub const SUWAYOMI: &[u8] = include_bytes!("../assets/suwayomi.svg");
 pub const OPDS: &[u8] = include_bytes!("../assets/opds.svg");
-
-pub const MANGA: &[u8] = include_bytes!("../assets/manga.svg");
-pub const COMIC: &[u8] = include_bytes!("../assets/comic.svg");
-pub const EBOOK: &[u8] = include_bytes!("../assets/ebook.svg");
+pub const FOLDER: &[u8] = include_bytes!("../assets/folder.svg");

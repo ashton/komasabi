@@ -12,37 +12,22 @@ diesel::table! {
         api_key -> Nullable<Text>,
         username -> Nullable<Text>,
         password -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{Nullable, Text, Timestamp};
-    use crate::models::job::{JobStatusMapping, JobTypeMapping};
-
-    jobs (id) {
-        id -> Text,
-        job_type -> JobTypeMapping,
-        status -> JobStatusMapping,
-        integration_id -> Nullable<Text>,
-        error -> Nullable<Text>,
-        created_at -> Timestamp,
-        started_at -> Nullable<Timestamp>,
-        finished_at -> Nullable<Timestamp>,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::{Nullable, Text};
-    use crate::models::library::LibraryTypeMapping;
-
-    libraries (id) {
-        id -> Text,
-        name -> Text,
-        external_id -> Nullable<Text>,
         folder -> Nullable<Text>,
-        cover -> Nullable<Text>,
-        kind -> LibraryTypeMapping,
-        integration_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    library_items (id) {
+        id -> Text,
+        integration_id -> Text,
+        external_id -> Text,
+        kind -> Text,
+        name -> Text,
+        series_external_id -> Text,
+        series_name -> Text,
+        pages -> Nullable<Integer>,
+        pages_read -> Integer,
+        added_at -> Text,
     }
 }
 
@@ -55,6 +40,4 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(libraries -> integrations (integration_id));
-
-diesel::allow_tables_to_appear_in_same_query!(integrations, jobs, libraries, servers,);
+diesel::allow_tables_to_appear_in_same_query!(integrations, library_items, servers,);

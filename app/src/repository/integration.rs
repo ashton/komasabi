@@ -49,6 +49,7 @@ pub async fn create(
         api_key,
         username: None,
         password: None,
+        folder: None,
     })
     .await
 }
@@ -72,6 +73,7 @@ pub async fn create_with_credentials(
         api_key: None,
         username: username.filter(|value| !value.is_empty()),
         password: password.filter(|value| !value.is_empty()),
+        folder: None,
     })
     .await
 }
@@ -95,6 +97,22 @@ pub async fn create_with_auth(
         api_key: api_key.filter(|value| !value.is_empty()),
         username: username.filter(|value| !value.is_empty()),
         password: password.filter(|value| !value.is_empty()),
+        folder: None,
+    })
+    .await
+}
+
+/// Creates a local-folder source reading the folder at `path`.
+pub async fn create_local_folder(name: String, path: String) -> Result<Integration, String> {
+    insert(Integration {
+        id: Uuid::new_v4().to_string(),
+        name,
+        integration_type: IntegrationType::LocalFolder,
+        url: None,
+        api_key: None,
+        username: None,
+        password: None,
+        folder: Some(path),
     })
     .await
 }
@@ -112,4 +130,32 @@ async fn insert(new_integration: Integration) -> Result<Integration, String> {
         .map_err(crate::error::log_and_stringify)?;
 
     Ok(new_integration)
+}
+
+/// Removes the source `source_id`, along with the items added from it to
+/// the Library, which can't be read without it. Both go in one transaction.
+pub async fn remove(source_id: String) -> Result<(), String> {
+    use crate::schema::{integrations, library_items};
+    use diesel_async::AsyncConnection;
+    use diesel_async::scoped_futures::ScopedFutureExt;
+
+    let mut conn = database::connect()
+        .await
+        .map_err(crate::error::log_and_stringify)?;
+    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        async move {
+            diesel::delete(
+                library_items::table.filter(library_items::integration_id.eq(&source_id)),
+            )
+            .execute(conn)
+            .await?;
+            diesel::delete(integrations::table.filter(integrations::id.eq(&source_id)))
+                .execute(conn)
+                .await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+    .map_err(crate::error::log_and_stringify)
 }

@@ -15,37 +15,3 @@
          url -> Nullable<Text>,
          api_key -> Nullable<Text>,
          username -> Nullable<Text>,
-@@ -13,10 +16,13 @@
- }
- 
- diesel::table! {
-+    use diesel::sql_types::{Nullable, Text, Timestamp};
-+    use crate::models::job::{JobStatusMapping, JobTypeMapping};
-+
-     jobs (id) {
-         id -> Text,
--        job_type -> Text,
--        status -> Text,
-+        job_type -> JobTypeMapping,
-+        status -> JobStatusMapping,
-         integration_id -> Nullable<Text>,
-         error -> Nullable<Text>,
-         created_at -> Timestamp,
-@@ -26,13 +32,16 @@
- }
- 
- diesel::table! {
-+    use diesel::sql_types::{Nullable, Text};
-+    use crate::models::library::LibraryTypeMapping;
-+
-     libraries (id) {
-         id -> Text,
-         name -> Text,
-         external_id -> Nullable<Text>,
-         folder -> Nullable<Text>,
-         cover -> Nullable<Text>,
--        kind -> Text,
-+        kind -> LibraryTypeMapping,
-         integration_id -> Nullable<Text>,
-     }
- }

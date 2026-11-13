@@ -4,7 +4,9 @@ use serde::de::DeserializeOwned;
 use tracing::debug;
 
 mod book;
+mod collection;
 mod library;
+mod read_list;
 mod series;
 mod user;
 

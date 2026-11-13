@@ -69,6 +69,7 @@ komasabi-reader.workspace = true
 # link against, and every platform then runs the same version.
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 suwayomi-client = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = { version = "0.17.2", features = ["xdg-portal"] }
 tokio = { version = "1", features = ["macros", "rt", "sync"] }

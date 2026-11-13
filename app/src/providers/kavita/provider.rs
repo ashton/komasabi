@@ -6,15 +6,19 @@ use kavita_client::models::reader::{ChapterInfo, Progress};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
 use crate::{
-    adapter::{ItemAdapter, LibraryAdapter},
+    adapter::{CollectionAdapter, ItemAdapter},
     models::{
-        library::Library,
-        library_item::LibraryItem,
+        collection::Collection,
+        collection_item::CollectionItem,
         series_entry::{EntryKind, SeriesEntry},
     },
     providers::{
         PageRef, Provider, ReadingProgress,
-        kavita::adapter::{KavitaItemAdapter, KavitaLibraryAdapter, series_entries},
+        kavita::adapter::{
+            KavitaCollectionAdapter, KavitaCollectionId, KavitaItemAdapter, reading_list_series,
+            series_entries,
+        },
+        paginate,
     },
 };
 
@@ -74,16 +78,72 @@ impl KavitaProvider {
         Self::authenticate(url, api_key).await.map(|_| ())
     }
 
-    pub async fn list_libraries(&self, integration_id: &str) -> Result<Vec<Library>, String> {
+    /// Lists the server's libraries, then the user's collections and reading
+    /// lists. Collections and reading lists are extras: a server that refuses
+    /// them (an older Kavita, a restricted user) still lists its libraries.
+    pub async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         let libraries = self
             .client
             .list_libraries()
             .await
             .map_err(crate::error::log_and_stringify)?;
-
-        Ok(libraries
+        let mut collections: Vec<Collection> = libraries
             .into_iter()
-            .map(|library| KavitaLibraryAdapter::adapt_library(library, integration_id))
+            .map(KavitaCollectionAdapter::adapt_collection)
+            .collect();
+
+        match self.client.list_collections().await {
+            Ok(tags) => collections.extend(
+                tags.into_iter()
+                    .map(KavitaCollectionAdapter::adapt_collection),
+            ),
+            Err(error) => tracing::debug!("could not list Kavita collections: {error}"),
+        }
+        match self.client.list_reading_lists().await {
+            Ok(lists) => collections.extend(
+                lists
+                    .into_iter()
+                    .map(KavitaCollectionAdapter::adapt_collection),
+            ),
+            Err(error) => tracing::debug!("could not list Kavita reading lists: {error}"),
+        }
+
+        Ok(collections)
+    }
+
+    /// Lists one page of a collection's series, whichever kind it is.
+    pub async fn list_collection_series(
+        &self,
+        collection_id: &str,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Vec<CollectionItem>, String> {
+        let series = match KavitaCollectionId::decode(collection_id)? {
+            KavitaCollectionId::Library(id) => {
+                return self
+                    .list_series_of_library(id.to_string(), page, page_size)
+                    .await;
+            }
+            KavitaCollectionId::Collection(id) => self
+                .client
+                .list_series_of_collection_paginated(id.to_string(), page, page_size)
+                .await
+                .map_err(crate::error::log_and_stringify)?,
+            // A reading list holds chapters; its series are the ones they come
+            // from, and Kavita hands the whole list over at once.
+            KavitaCollectionId::ReadingList(id) => {
+                let items = self
+                    .client
+                    .reading_list_items(id)
+                    .await
+                    .map_err(crate::error::log_and_stringify)?;
+                return Ok(paginate(reading_list_series(items), page, page_size));
+            }
+        };
+
+        Ok(series
+            .into_iter()
+            .map(KavitaItemAdapter::adapt_item)
             .collect())
     }
 
@@ -92,7 +152,7 @@ impl KavitaProvider {
         library_id: String,
         page_number: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
+    ) -> Result<Vec<CollectionItem>, String> {
         let series = self
             .client
             .list_series_of_library_paginated(library_id, page_number, page_size)
@@ -307,13 +367,22 @@ fn chapter_pages(chapter_id: u16, pages: u16) -> Vec<PageRef> {
 /// [`ResolvedProvider`](crate::providers::ResolvedProvider) treat every backend
 /// uniformly.
 impl Provider for KavitaProvider {
+    /// Entries carry the user's read state on the server.
+    fn tracks_reading_progress(&self) -> bool {
+        true
+    }
+
+    async fn list_collections(&self) -> Result<Vec<Collection>, String> {
+        self.list_collections().await
+    }
+
     async fn list_items(
         &self,
-        library_external_id: &str,
+        collection_id: &str,
         page: Option<u32>,
         page_size: Option<u32>,
-    ) -> Result<Vec<LibraryItem>, String> {
-        self.list_series_of_library(library_external_id.to_string(), page, page_size)
+    ) -> Result<Vec<CollectionItem>, String> {
+        self.list_collection_series(collection_id, page, page_size)
             .await
     }
 
@@ -331,6 +400,15 @@ impl Provider for KavitaProvider {
     ) -> Result<Option<SeriesEntry>, String> {
         let entries = Provider::list_series_entries(self, series_id).await?;
         Ok(crate::providers::entry_after(entries, current))
+    }
+
+    async fn previous_entry(
+        &self,
+        series_id: &str,
+        current: &SeriesEntry,
+    ) -> Result<Option<SeriesEntry>, String> {
+        let entries = Provider::list_series_entries(self, series_id).await?;
+        Ok(crate::providers::entry_before(entries, current))
     }
 
     async fn cover(&self, integration_id: &str, series_id: &str) -> Result<Vec<u8>, String> {
@@ -385,6 +463,89 @@ mod tests {
             api_key: "key".to_string(),
             chapter_info: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn list_collections_lists_libraries_collections_and_reading_lists() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/Library/libraries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1, "name": "Manga", "type": 0}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/Collection"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 4, "title": "Favorites"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/ReadingList/lists"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 2, "title": "Crossover"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let collections = provider_for(&server).list_collections().await.unwrap();
+
+        let ids: Vec<&str> = collections.iter().map(|c| c.external_id.as_str()).collect();
+        assert_eq!(ids, vec!["library:1", "collection:4", "reading-list:2"]);
+    }
+
+    #[tokio::test]
+    async fn list_collections_still_lists_libraries_when_the_extras_fail() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/Library/libraries"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 1, "name": "Manga", "type": 0}
+            ])))
+            .mount(&server)
+            .await;
+
+        let collections = provider_for(&server).list_collections().await.unwrap();
+
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].name, "Manga");
+    }
+
+    #[tokio::test]
+    async fn list_items_of_a_reading_list_pages_its_distinct_series() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ReadingList/items"))
+            .and(query_param("readingListId", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"chapterId": 1, "seriesId": 7, "seriesName": "Saga"},
+                {"chapterId": 2, "seriesId": 7, "seriesName": "Saga"},
+                {"chapterId": 3, "seriesId": 8, "seriesName": "Paper Girls"}
+            ])))
+            .mount(&server)
+            .await;
+        let provider = provider_for(&server);
+
+        let first = Provider::list_items(&provider, "reading-list:2", Some(1), Some(1))
+            .await
+            .unwrap();
+        let second = Provider::list_items(&provider, "reading-list:2", Some(2), Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(first[0].name, "Saga");
+        assert_eq!(second[0].name, "Paper Girls");
+    }
+
+    #[tokio::test]
+    async fn list_items_rejects_an_id_that_is_not_a_kavita_collection() {
+        let server = MockServer::start().await;
+
+        let result = Provider::list_items(&provider_for(&server), "7", Some(1), Some(20)).await;
+
+        assert!(result.is_err());
     }
 
     fn progress(chapter_id: &str, page: u16, chapter_pages: u16) -> ReadingProgress {
