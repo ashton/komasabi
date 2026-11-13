@@ -39,9 +39,11 @@ use uuid::Uuid;
 use komasabi_reader::{AdjacentEntry, Direction, ReaderCommand, ReaderEvent};
 
 use crate::cache;
+use crate::models::library_item::LibraryItem;
 use crate::models::series_entry::{EntryKind, SeriesEntry};
 use crate::providers::{PageRef, Provider, provider_for_integration};
 use crate::reading_progress;
+use crate::repository::library as library_repository;
 
 /// The first argument that makes `main` run the reader (`komasabi read <dir> …`)
 /// instead of the library window. Shipping the reader inside the app binary
@@ -58,6 +60,10 @@ struct SessionSpec {
     series: String,
     entry: SeriesEntry,
     dir: PathBuf,
+    /// The page (0-based) to open the entry on.
+    start_page: usize,
+    /// Told once the reader has closed, when someone wants to know.
+    closed: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Resolves `entry` to its cache folder, launches the reader on it immediately,
@@ -79,9 +85,37 @@ pub async fn prepare_and_launch(
         series: series_name,
         entry,
         dir: dir.clone(),
+        start_page: 0,
+        closed: None,
     })?;
 
     spawn_reader(&dir, &socket_name)
+}
+
+/// Opens an item of the user's Library in the reader. Library items aren't
+/// downloaded, so it's read from its source like any of the source's entries
+/// (whose pages it shows are then saved as the item's progress), but starting
+/// where the user left off. The returned receiver resolves once the reader
+/// has closed, so the progress shown can be reloaded.
+pub fn launch_library_item(
+    item: LibraryItem,
+) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+    let entry = item.as_entry();
+    let dir = entry_dir(&item.integration_id, &entry)?;
+    let (done, closed) = tokio::sync::oneshot::channel();
+
+    let socket_name = bind_and_serve(SessionSpec {
+        integration_id: item.integration_id.clone(),
+        series_id: item.series_external_id.clone(),
+        series: item.series_name.clone(),
+        start_page: resume_page(item.pages_read, item.pages),
+        entry,
+        dir: dir.clone(),
+        closed: Some(done),
+    })?;
+
+    spawn_reader(&dir, &socket_name)?;
+    Ok(closed)
 }
 
 /// Creates (if need be) and returns the cache folder `entry`'s pages are
@@ -115,11 +149,42 @@ fn bind_and_serve(spec: SessionSpec) -> Result<String, String> {
     Ok(socket_name)
 }
 
+/// The page to reopen a Library item on: the last one read, or the first once
+/// it's read through (or not started). Without a page count, a read-through
+/// item can't be told apart, so it starts over too.
+fn resume_page(pages_read: i32, pages: Option<i32>) -> usize {
+    match pages {
+        Some(pages) if pages_read > 0 && pages_read < pages => (pages_read - 1) as usize,
+        _ => 0,
+    }
+}
+
+/// Saves that page `page` (0-based) of an entry's `pages` was shown, if the
+/// entry is in the Library. Failures are only logged.
+async fn record_library_progress(
+    integration_id: &str,
+    kind: EntryKind,
+    entry_id: &str,
+    page: usize,
+    pages: usize,
+) {
+    let read = i32::try_from(page + 1).unwrap_or(i32::MAX);
+    let total = i32::try_from(pages).unwrap_or(i32::MAX);
+    if let Err(error) =
+        library_repository::record_progress(integration_id, kind, entry_id, read, total).await
+    {
+        tracing::debug!("could not save library progress: {error}");
+    }
+}
+
 /// The worker thread: runs the session to completion on a dedicated
 /// single-threaded Tokio runtime (so its `reqwest`-based downloads have a
 /// reactor and never touch iced's executor). Errors just end the session; the
 /// reader keeps whatever pages already arrived.
-fn serve_session(listener: Listener, spec: SessionSpec) {
+fn serve_session(listener: Listener, mut spec: SessionSpec) {
+    // Dropped (or sent) whichever way the session ends, which tells the
+    // receiver the reader has closed.
+    let closed = spec.closed.take();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -133,6 +198,9 @@ fn serve_session(listener: Listener, spec: SessionSpec) {
 
     if let Err(error) = runtime.block_on(run_session(listener, spec)) {
         tracing::debug!("reader session ended: {error}");
+    }
+    if let Some(closed) = closed {
+        let _ = closed.send(());
     }
 }
 
@@ -162,7 +230,7 @@ async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String
     // How to announce the next `OpenSession`: no folder for the first entry,
     // whose folder the reader was launched on, then each adjacent entry's
     // folder and the page to start it on.
-    let mut open_session = Some((None, 0));
+    let mut open_session = Some((None, spec.start_page.min(plan.len() - 1)));
     loop {
         if let Some((new_dir, start_page)) = open_session.take() {
             send_command(
@@ -179,9 +247,13 @@ async fn run_session(listener: Listener, spec: SessionSpec) -> Result<(), String
             .map_err(|error| format!("could not open the reader session: {error}"))?;
         }
 
+        let in_library = library_repository::contains(&namespace, entry.kind, &entry.external_id)
+            .await
+            .unwrap_or(false);
         let session = EntrySession {
             series_id: &spec.series_id,
             namespace: &namespace,
+            in_library,
             entry: &entry,
             plan: &plan,
             dir: &dir,
@@ -246,7 +318,11 @@ async fn prepare_entry(
 struct EntrySession<'a> {
     series_id: &'a str,
     /// The provider's cache namespace, to fetch adjacent entries' covers with.
+    /// It's the source's id.
     namespace: &'a str,
+    /// Whether the entry is also in the user's Library, whose progress then
+    /// follows the pages read here.
+    in_library: bool,
     entry: &'a SeriesEntry,
     plan: &'a [PageRef],
     dir: &'a Path,
@@ -309,6 +385,17 @@ async fn serve_entry(
                 ReaderEvent::ShowingPage { page } => {
                     current.store(page, Ordering::Relaxed);
                     let _ = shown_pages.send(page);
+                    // Reading the source's copy also moves the Library's on.
+                    if session.in_library {
+                        record_library_progress(
+                            session.namespace,
+                            session.entry.kind,
+                            &session.entry.external_id,
+                            page,
+                            session.plan.len(),
+                        )
+                        .await;
+                    }
 
                     let mut ends = Vec::new();
                     if page == 0 {
@@ -707,6 +794,7 @@ mod tests {
         let session = EntrySession {
             series_id: "series",
             namespace: "integration",
+            in_library: false,
             entry: &entry,
             plan: &plan,
             dir: &dir,
@@ -827,6 +915,16 @@ mod tests {
         assert_eq!(next_page(&behind, 5), Some(1));
 
         assert_eq!(next_page(&BTreeSet::new(), 0), None);
+    }
+
+    #[test]
+    fn library_items_reopen_on_the_last_page_read() {
+        assert_eq!(resume_page(0, Some(20)), 0);
+        assert_eq!(resume_page(5, Some(20)), 4);
+        // Read through: start over.
+        assert_eq!(resume_page(20, Some(20)), 0);
+        // No page count yet.
+        assert_eq!(resume_page(5, None), 0);
     }
 
     #[test]

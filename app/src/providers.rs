@@ -105,6 +105,13 @@ pub trait Provider {
     async fn update_reading_progress(&self, _progress: &ReadingProgress) -> Result<(), String> {
         Ok(())
     }
+    /// Whether the [`SeriesEntry::read_state`]s this backend lists come from
+    /// the user's reading history on it, so the Library can sync its items'
+    /// progress from them. The default says no, for backends whose entries
+    /// are always unread (e.g. local folders and OPDS catalogs).
+    fn tracks_reading_progress(&self) -> bool {
+        false
+    }
     /// The entry to read after `current` in the series `series_id`, offered to
     /// the user when the reader reaches `current`'s last page. `None` when
     /// `current` is the last one the backend has. Each backend decides what
@@ -247,6 +254,20 @@ impl Provider for ResolvedProvider {
 
     async fn update_reading_progress(&self, progress: &ReadingProgress) -> Result<(), String> {
         dispatch!(self, update_reading_progress(progress))
+    }
+
+    fn tracks_reading_progress(&self) -> bool {
+        match self {
+            #[cfg(feature = "kavita")]
+            ResolvedProvider::Kavita(provider) => provider.tracks_reading_progress(),
+            #[cfg(feature = "komga")]
+            ResolvedProvider::Komga(provider) => provider.tracks_reading_progress(),
+            ResolvedProvider::FileSystem(provider) => provider.tracks_reading_progress(),
+            #[cfg(feature = "opds")]
+            ResolvedProvider::Opds(provider) => provider.tracks_reading_progress(),
+            #[cfg(feature = "suwayomi")]
+            ResolvedProvider::Suwayomi(provider) => provider.tracks_reading_progress(),
+        }
     }
 
     async fn next_entry(

@@ -84,13 +84,13 @@ runs on Ubuntu 22.04 so the binary only needs glibc 2.35. Locally: `cd app && ca
 
 `schema.rs` is Diesel-generated but hand-patched: diesel-cli's codegen is piped through
 `app/diesel-schema-patches/schema.patch` (configured in `app/diesel.toml`) to inject the enum-mapping
-imports (`IntegrationTypeMapping`, `LibraryTypeMapping`) that `diesel print-schema` doesn't know to add on its own. After adding a migration that introduces or changes a `diesel_derive_enum`
+import (`IntegrationTypeMapping`) that `diesel print-schema` doesn't know to add on its own. After adding a migration that introduces or changes a `diesel_derive_enum`
 column, update the patch file to match, or `schema.rs` will revert to plain `Text` columns the next
 time it's regenerated.
 
 ## Architecture (`app` crate)
 
-**Screens (`src/screen/`).** Each screen (`home`, `library`, `integration` (sources), `collections`,
+**Screens (`src/screen/`).** Each screen (`home`, `integration` (sources), `collections`,
 `browse`, `series_detail`, `settings`) is a self-contained iced sub-application following the same shape:
 - a `Message` enum for its own events
 - an `Action` enum (`None` / `Run(Task<Message>)`) returned from `update`, which the top-level
@@ -174,10 +174,41 @@ before the first connection, so new migrations reach users without `diesel`. Rep
 is the standard wrapper screens use to represent not-loaded/loading/loaded/error state for data
 fetched this way.
 
-The app tables are `integrations` (sources) and `libraries` (the user's own Library, listed by
-`screen/library.rs`; sources don't sync anything into it, and `LibraryItem` is its counterpart to
-`CollectionItem`). The legacy `servers` table is unused. The enum columns (`IntegrationType`,
-`LibraryType`) use `diesel_derive_enum::DbEnum`, stored as `Text` in sqlite — see the schema-regeneration note above when touching these.
+The app tables are `integrations` (sources) and `library_items` (the user's Library, see below).
+The legacy `servers` table is unused. The enum column `IntegrationType` uses
+`diesel_derive_enum::DbEnum`, stored as `Text` in sqlite — see the schema-regeneration note above
+when touching it (`library_items.kind` is plain `Text`, `volume`/`chapter`, mapped by
+`models::library_item`).
+
+**The Library.** There's a single Library, made of the volumes/chapters the user added. In
+`series_detail.rs`, hovering an entry's cover (iced's `hover` widget) shades it and offers "Add to
+library" and "Read". Adding runs `library::add_to_library`, which downloads nothing: it only saves a
+`library_items` row (source id, entry id/kind/name, series id/name, page count when known, pages
+read). Adding an entry that's already there keeps its progress. `browse.rs` series cards get the same
+hover shade (`screen::cover_overlay`, shared with `series_detail.rs`), offering "Add to library", which
+runs `library::add_series_to_library` to save every entry the source lists for the series, and "Open".
+Under each series cover is the same bar as an entry card's (`screen::card`, also shared), with the
+title as a link to the series. A series with any item in the Library (`repository::library::series_ids`,
+loaded when the screen opens) shows "In library" and gets the "⋮" menu, whose "Remove from library"
+runs `repository::library::remove_series`. Adding never downloads anything. Each entry card has a
+bar under its cover (name, page count) with, when the entry is in the Library, a "⋮" button. It
+toggles a menu stacked over the cover (iced has no context menu; a `mouse_area` over the screen closes
+it on an outside click) offering "Delete" (`repository::library::remove`). A Library series that loses
+its last item goes back home. `screen/home.rs` lists the Library's series
+(`library_item::group_into_series`), with covers fetched from their sources. Each series card has the
+same bar (`screen::card`), whose "⋮" menu always offers "Remove from library"
+(`repository::library::remove_series`). Opening one opens
+`SeriesDetail::from_library` (`Origin::Library`), the same grid with the items as entries (covers from
+the source, read state from `pages_read`). "Read" there runs `reader_launch::launch_library_item`,
+which reads the item through its source like any source entry, but opens it on the last page read
+and tells the screen when the reader closes, so the grid reloads. While reading a source entry that's
+in the Library, each page shown is saved as the item's progress (`repository::library::record_progress`,
+which also stores the page count, as an item added without one only learns it then). Progress only
+moves forward there. Whenever the Library's items are loaded (home, a Library series), they're shown
+as saved and `library::sync_progress` runs in the background: for sources whose
+`Provider::tracks_reading_progress` is true (Kavita, Komga, Suwayomi), it lists each series' entries
+and copies their read state onto the items (the source wins, even backwards), then the screen shows
+the synced items.
 
 **OPDS provider (`providers::opds`).** Added via the integrations screen's "OPDS" type (catalog URL +
 optional basic-auth username/password, stored in `integrations.username`/`password`). OPDS has no

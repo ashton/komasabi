@@ -18,6 +18,7 @@ mod cache;
 pub mod database;
 mod error;
 mod icons;
+mod library;
 mod menu;
 mod models;
 mod providers;
@@ -32,7 +33,7 @@ mod touch_scroll;
 use crate::{
     menu::{Menu, MenuItem},
     models::collection::CollectionRef,
-    screen::{Home, browse, collections, home, integration, library, series_detail, settings},
+    screen::{Home, browse, collections, home, integration, series_detail, settings},
 };
 use iced::{
     Element,
@@ -50,11 +51,9 @@ enum Message {
     TabPressed { shift: bool },
     OpenSettings,
     OpenHome,
-    OpenLibrary,
     OpenIntegrations,
     Settings(settings::Message),
     Home(home::Message),
-    Library(library::Message),
     Collections(collections::Message),
     Browse(browse::Message),
     SeriesDetail(series_detail::Message),
@@ -68,14 +67,14 @@ struct KomasabiApp {
 
 impl KomasabiApp {
     pub fn new() -> (Self, Task<Message>) {
+        let (home, home_task) = Home::new();
         (
             Self {
-                screen: Screen::Home(Home {}),
+                screen: Screen::Home(home),
                 menu: Menu::new(
                     vec![
                         MenuItem::new("bars", "", false, Some(Message::ExpandMenu)),
                         MenuItem::new("house", "Home", true, Some(Message::OpenHome)),
-                        MenuItem::new("book_open", "Library", false, Some(Message::OpenLibrary)),
                         MenuItem::new("cloud", "Sources", false, Some(Message::OpenIntegrations)),
                         MenuItem::new("magnifying_glass", "Search", false, None),
                         MenuItem::new("download", "Downloads", false, None),
@@ -88,7 +87,7 @@ impl KomasabiApp {
                     )],
                 ),
             },
-            Task::none(),
+            home_task.map(Message::Home),
         )
     }
 
@@ -110,16 +109,14 @@ impl KomasabiApp {
                     return Task::none();
                 };
 
-                match home.update(msg) {}
-            }
-
-            Message::Library(msg) => {
-                let Screen::Library(library) = &mut self.screen else {
-                    return Task::none();
-                };
-
-                match library.update(msg) {
-                    library::Action::None => Task::none(),
+                match home.update(msg) {
+                    home::Action::None => Task::none(),
+                    home::Action::Run(task) => task.map(Message::Home),
+                    home::Action::OpenSeries {
+                        integration_id,
+                        series_external_id,
+                        series_name,
+                    } => self.open_library_series(integration_id, series_external_id, series_name),
                 }
             }
 
@@ -170,6 +167,7 @@ impl KomasabiApp {
                     series_detail::Action::None => Task::none(),
                     series_detail::Action::Run(task) => task.map(Message::SeriesDetail),
                     series_detail::Action::Back(location) => self.open_browse(location),
+                    series_detail::Action::BackToLibrary => self.open_home(),
                 }
             }
 
@@ -222,7 +220,6 @@ impl KomasabiApp {
 
             Message::OpenSettings => self.open_settings(),
             Message::OpenHome => self.open_home(),
-            Message::OpenLibrary => self.open_library(),
             Message::OpenIntegrations => self.open_integrations(),
         }
     }
@@ -230,7 +227,6 @@ impl KomasabiApp {
     pub fn view(&self) -> Element<'_, Message> {
         let screen = match &self.screen {
             Screen::Home(home) => home.view().map(Message::Home),
-            Screen::Library(library) => library.view().map(Message::Library),
             Screen::Collections(collections) => collections.view().map(Message::Collections),
             Screen::Browse(browse) => browse.view().map(Message::Browse),
             Screen::SeriesDetail(series_detail) => series_detail.view().map(Message::SeriesDetail),
@@ -268,12 +264,20 @@ impl KomasabiApp {
         task.map(Message::Home)
     }
 
-    fn open_library(&mut self) -> Task<Message> {
-        let (params, task) = screen::Library::new();
-        self.screen = Screen::Library(params);
-        self.menu.set_active(&Message::OpenLibrary);
+    /// Opens a series of the Library. The home menu item stays active, as
+    /// that's where the Library is.
+    fn open_library_series(
+        &mut self,
+        integration_id: String,
+        series_external_id: String,
+        series_name: String,
+    ) -> Task<Message> {
+        let (params, task) =
+            screen::SeriesDetail::from_library(integration_id, series_external_id, series_name);
+        self.screen = Screen::SeriesDetail(params);
+        self.menu.set_active(&Message::OpenHome);
 
-        task.map(Message::Library)
+        task.map(Message::SeriesDetail)
     }
 
     /// Opens a source's collections. The sources menu item stays active

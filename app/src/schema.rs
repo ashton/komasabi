@@ -17,17 +17,17 @@ diesel::table! {
 }
 
 diesel::table! {
-    use diesel::sql_types::{Nullable, Text};
-    use crate::models::library::LibraryTypeMapping;
-
-    libraries (id) {
+    library_items (id) {
         id -> Text,
+        integration_id -> Text,
+        external_id -> Text,
+        kind -> Text,
         name -> Text,
-        external_id -> Nullable<Text>,
-        folder -> Nullable<Text>,
-        cover -> Nullable<Text>,
-        kind -> LibraryTypeMapping,
-        integration_id -> Nullable<Text>,
+        series_external_id -> Text,
+        series_name -> Text,
+        pages -> Nullable<Integer>,
+        pages_read -> Integer,
+        added_at -> Text,
     }
 }
 
@@ -40,6 +40,4 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(libraries -> integrations (integration_id));
-
-diesel::allow_tables_to_appear_in_same_query!(integrations, libraries, servers,);
+diesel::allow_tables_to_appear_in_same_query!(integrations, library_items, servers,);

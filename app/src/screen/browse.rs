@@ -7,6 +7,7 @@ use iced::{Element, Task};
 
 use crate::models::{AsyncModel, collection::CollectionRef, collection_item::CollectionItem};
 use crate::providers::{Provider, provider_for_integration};
+use crate::repository::library as library_repository;
 
 /// Number of items fetched per page, and the unit eviction operates on:
 /// pages are dropped from (or re-fetched back into) memory as a whole,
@@ -44,6 +45,36 @@ pub struct Browse {
     /// `external_id`s whose cover is currently being fetched, so a page isn't
     /// requested more than once per session.
     covers_in_flight: HashSet<String>,
+    /// `external_id`s of the series being saved in the Library.
+    adding_series: HashSet<String>,
+    /// `external_id`s of this source's series that have items in the Library,
+    /// loaded when the screen opens and kept up to date as series are added
+    /// and removed.
+    library_series: HashSet<String>,
+    /// The last add-to/remove-from-library failure, shown as a status banner
+    /// until the next attempt.
+    add_error: Option<String>,
+    /// The `external_id` of the series whose card menu is open, if any.
+    menu: Option<String>,
+}
+
+/// Whether a series card offers to add the whole series to the Library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddState {
+    /// Not in the Library: offer to add it.
+    Available,
+    /// Its volumes/chapters are being saved in the Library.
+    Adding,
+    /// It has items in the Library.
+    Added,
+}
+
+/// How a series' card is drawn, beyond the series itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CardState {
+    pub add: AddState,
+    /// Whether the card's menu is open.
+    pub menu_open: bool,
 }
 
 #[derive(Debug)]
@@ -68,8 +99,28 @@ pub enum Message {
     CoversLoaded(Vec<(String, Vec<u8>)>),
     Scrolled(ScrollMetrics),
     ContentOverflowChecked(bool),
-    /// A series card was clicked; carries the item's `external_id`.
+    /// A series' title, or "Open" on its cover, was clicked; carries the
+    /// item's `external_id`.
     SeriesSelected(String),
+    /// "Add to library" was chosen on a series' cover (by `external_id`):
+    /// save each of its volumes/chapters in the Library.
+    AddSeriesToLibrary(String),
+    /// A series (by `external_id`) was saved in the Library, carrying how many
+    /// of its entries were newly added, or it failed to be.
+    SeriesAddedToLibrary(String, Result<usize, String>),
+    /// The ids of this source's series that have items in the Library.
+    LibrarySeriesLoaded(Result<Vec<String>, String>),
+    /// The "⋮" button of a series' card (by `external_id`) was pressed: open
+    /// its menu, or close it if it's the one open.
+    MenuToggled(String),
+    /// A click landed outside the open menu, closing it.
+    MenuDismissed,
+    /// "Remove from library" was chosen in a series' menu: remove all of its
+    /// items from the Library.
+    RemoveSeriesFromLibrary(String),
+    /// A series (by `external_id`) was removed from the Library, carrying how
+    /// many items went with it, or it failed to be.
+    SeriesRemovedFromLibrary(String, Result<usize, String>),
     BackPressed,
     /// The "Import items" button was pressed; opens the file picker.
     ImportPressed,
@@ -117,10 +168,16 @@ impl Browse {
     /// that's [`importable`](crate::models::collection::Collection::importable)
     /// also offers importing files into it.
     pub fn new(location: CollectionRef) -> (Self, Task<Message>) {
-        let task = Task::perform(
-            crate::runtime::on_tokio(fetch_items_page(location.clone(), 1, PAGE_SIZE)),
-            Message::ItemsLoaded,
-        );
+        let task = Task::batch([
+            Task::perform(
+                crate::runtime::on_tokio(fetch_items_page(location.clone(), 1, PAGE_SIZE)),
+                Message::ItemsLoaded,
+            ),
+            Task::perform(
+                library_repository::series_ids(location.integration_id.clone()),
+                Message::LibrarySeriesLoaded,
+            ),
+        ]);
 
         (
             Self {
@@ -135,12 +192,29 @@ impl Browse {
                 }),
                 covers: HashMap::new(),
                 covers_in_flight: HashSet::new(),
+                adding_series: HashSet::new(),
+                library_series: HashSet::new(),
+                add_error: None,
+                menu: None,
             },
             task,
         )
     }
 
     pub fn update(&mut self, message: Message) -> Action {
+        // Doing anything else on the screen closes an open card menu.
+        if matches!(
+            message,
+            Message::SeriesSelected(_)
+                | Message::BackPressed
+                | Message::ImportPressed
+                | Message::AddSeriesToLibrary(_)
+                | Message::RemoveSeriesFromLibrary(_)
+                | Message::MenuDismissed
+        ) {
+            self.menu = None;
+        }
+
         match message {
             Message::ItemsLoaded(result) => {
                 let result = result.map(|items| {
@@ -327,6 +401,84 @@ impl Browse {
                 }
             }
 
+            Message::AddSeriesToLibrary(external_id) => {
+                let Some(item) = self.loaded_item(&external_id) else {
+                    return Action::None;
+                };
+                let series_name = item.name.clone();
+                if self.library_series.contains(&external_id)
+                    || !self.adding_series.insert(external_id.clone())
+                {
+                    return Action::None;
+                }
+                self.add_error = None;
+
+                Action::Run(Task::perform(
+                    crate::runtime::on_tokio(crate::library::add_series_to_library(
+                        self.location.integration_id.clone(),
+                        external_id.clone(),
+                        series_name,
+                    )),
+                    move |result| Message::SeriesAddedToLibrary(external_id.clone(), result),
+                ))
+            }
+
+            Message::SeriesAddedToLibrary(external_id, result) => {
+                self.adding_series.remove(&external_id);
+                match result {
+                    Ok(added) => {
+                        tracing::debug!("added {added} item(s) of {external_id} to the library");
+                        self.library_series.insert(external_id);
+                    }
+                    Err(error) => {
+                        tracing::debug!("failed to add {external_id} to the library: {error}");
+                        self.add_error = Some(format!("Could not add to library: {error}"));
+                    }
+                }
+                Action::None
+            }
+
+            Message::LibrarySeriesLoaded(Ok(series)) => {
+                self.library_series.extend(series);
+                Action::None
+            }
+            Message::LibrarySeriesLoaded(Err(error)) => {
+                tracing::debug!("failed to load the library's series: {error}");
+                Action::None
+            }
+
+            Message::MenuToggled(external_id) => {
+                self.menu = (self.menu.as_ref() != Some(&external_id)).then_some(external_id);
+                Action::None
+            }
+            Message::MenuDismissed => Action::None,
+
+            Message::RemoveSeriesFromLibrary(external_id) => {
+                if !self.library_series.contains(&external_id) {
+                    return Action::None;
+                }
+                self.add_error = None;
+
+                Action::Run(Task::perform(
+                    library_repository::remove_series(
+                        self.location.integration_id.clone(),
+                        external_id.clone(),
+                    ),
+                    move |result| Message::SeriesRemovedFromLibrary(external_id.clone(), result),
+                ))
+            }
+
+            Message::SeriesRemovedFromLibrary(external_id, Ok(removed)) => {
+                tracing::debug!("removed {removed} item(s) of {external_id} from the library");
+                self.library_series.remove(&external_id);
+                Action::None
+            }
+            Message::SeriesRemovedFromLibrary(external_id, Err(error)) => {
+                tracing::debug!("failed to remove {external_id} from the library: {error}");
+                self.add_error = Some(format!("Could not remove from library: {error}"));
+                Action::None
+            }
+
             Message::BackPressed => Action::BackPressed(self.location.integration_id.clone()),
 
             Message::ImportPressed => {
@@ -391,8 +543,31 @@ impl Browse {
             &self.location.collection.name,
             &self.items,
             &self.covers,
+            &|external_id: &str| self.card_state(external_id),
             self.location.collection.importable,
+            self.add_error.as_deref(),
+            self.menu.is_some(),
         )
+    }
+
+    /// How the series `external_id`'s card is drawn.
+    fn card_state(&self, external_id: &str) -> CardState {
+        CardState {
+            add: self.add_state(external_id),
+            menu_open: self.menu.as_deref() == Some(external_id),
+        }
+    }
+
+    /// Whether the series `external_id`'s card offers to add it to the
+    /// Library.
+    fn add_state(&self, external_id: &str) -> AddState {
+        if self.adding_series.contains(external_id) {
+            AddState::Adding
+        } else if self.library_series.contains(external_id) {
+            AddState::Added
+        } else {
+            AddState::Available
+        }
     }
 
     /// Requests the next page, if pagination is set up for it, there isn't
@@ -776,25 +951,50 @@ mod view_helper {
 
     use iced::{
         Background, Border, Center, ContentFit, Element,
-        Length::Fill,
-        Theme,
-        widget::{button, column, container, grid, image, row, scrollable, text},
+        Length::{Fill, Shrink},
+        Theme, border,
+        widget::{
+            button, column, container, grid, hover, image, mouse_area, row, scrollable, stack, text,
+        },
     };
 
+    use super::{AddState, CardState};
     use crate::models::{AsyncModel, collection_item::CollectionItem};
+    use crate::screen::card::{self, COVER_RADIUS};
+    use crate::screen::cover_overlay;
 
     type Covers = HashMap<String, image::Handle>;
+    /// How a series' card (by `external_id`) is drawn (see [`CardState`]).
+    type CardStateOf<'b> = &'b dyn Fn(&str) -> CardState;
 
     pub fn view<'a>(
         title: &'a str,
         items: &'a AsyncModel<Vec<Option<CollectionItem>>, String>,
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
         importable: bool,
+        status: Option<&'a str>,
+        menu_open: bool,
     ) -> Element<'a, super::Message> {
-        column![top_bar(title, importable), body(items, covers)]
+        let mut screen = column![top_bar(title, importable)];
+        if let Some(status) = status {
+            screen = screen.push(container(text(status).size(13)).padding([0, 20]));
+        }
+
+        let screen = screen
+            .push(body(items, covers, card_state))
             .width(Fill)
-            .height(Fill)
-            .into()
+            .height(Fill);
+
+        // With a card's menu open, a click anywhere the menu (or another
+        // button) doesn't take closes it.
+        if menu_open {
+            mouse_area(screen)
+                .on_press(super::Message::MenuDismissed)
+                .into()
+        } else {
+            screen.into()
+        }
     }
 
     fn top_bar<'a>(title: &'a str, importable: bool) -> Element<'a, super::Message> {
@@ -816,10 +1016,11 @@ mod view_helper {
     fn body<'a>(
         items: &'a AsyncModel<Vec<Option<CollectionItem>>, String>,
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
     ) -> Element<'a, super::Message> {
         match items {
             AsyncModel::Loaded(items) if items.is_empty() => empty_state(),
-            AsyncModel::Loaded(items) => items_scrollable(items, covers),
+            AsyncModel::Loaded(items) => items_scrollable(items, covers, card_state),
             AsyncModel::Error(error) => error_state(error),
             AsyncModel::NotLoaded | AsyncModel::Loading => container(row![]).into(),
         }
@@ -828,9 +1029,10 @@ mod view_helper {
     fn items_scrollable<'a>(
         items: &'a [Option<CollectionItem>],
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
     ) -> Element<'a, super::Message> {
         crate::touch_scroll::touch_scroll(
-            scrollable(items_grid(items, covers))
+            scrollable(items_grid(items, covers, card_state))
                 .id(iced::advanced::widget::Id::new(super::ITEMS_SCROLLABLE_ID))
                 .width(Fill)
                 .height(Fill)
@@ -849,9 +1051,14 @@ mod view_helper {
     fn items_grid<'a>(
         items: &'a [Option<CollectionItem>],
         covers: &'a Covers,
+        card_state: CardStateOf<'_>,
     ) -> Element<'a, super::Message> {
         let cards = items.iter().map(|item| match item {
-            Some(item) => item_card(item, covers.get(&item.external_id)),
+            Some(item) => item_card(
+                item,
+                covers.get(&item.external_id),
+                card_state(&item.external_id),
+            ),
             None => evicted_card(),
         });
 
@@ -866,26 +1073,108 @@ mod view_helper {
         .into()
     }
 
+    /// A series' card: its cover, which offers the series' actions while
+    /// hovered, over a bar holding its title, a link to the series, and its
+    /// menu while it's in the Library.
     fn item_card<'a>(
         item: &'a CollectionItem,
         cover: Option<&image::Handle>,
+        state: CardState,
     ) -> Element<'a, super::Message> {
-        let content = column![
-            thumbnail(cover),
-            text(&item.name).size(13),
-            pages_label(item.pages)
-        ]
-        .width(Fill)
-        .height(Fill)
-        .spacing(4)
-        .align_x(Center);
+        // Only its top corners are rounded: the bar carries on below it.
+        let cover = hover(
+            thumbnail(cover, border::top(COVER_RADIUS)),
+            cover_actions(item, state.add),
+        );
 
-        button(content)
-            .on_press(super::Message::SeriesSelected(item.external_id.clone()))
-            .padding(0)
+        // The open menu sits over the cover, just above its "⋮" button.
+        let cover: Element<'a, super::Message> = if state.menu_open {
+            stack![cover, series_menu(item, state)].into()
+        } else {
+            cover
+        };
+
+        column![cover, card_bar(item, state)]
             .width(Fill)
             .height(Fill)
-            .style(button::text)
+            .into()
+    }
+
+    /// The bar under a series' cover: its title and page count, and the "⋮"
+    /// button opening its menu, when the series is in the Library.
+    fn card_bar<'a>(item: &'a CollectionItem, state: CardState) -> Element<'a, super::Message> {
+        let name = column![title_link(item), pages_label(item.pages)].spacing(2);
+
+        card::bar(
+            "cloud",
+            name.into(),
+            has_menu(state).then(|| super::Message::MenuToggled(item.external_id.clone())),
+        )
+    }
+
+    /// Whether a series' menu has anything to offer: removing it from the
+    /// Library, if it's in it.
+    pub(super) fn has_menu(state: CardState) -> bool {
+        state.add == AddState::Added
+    }
+
+    /// A series' open menu, laid over the bottom-right of its cover.
+    fn series_menu<'a>(item: &CollectionItem, state: CardState) -> Element<'a, super::Message> {
+        let mut items: Vec<Element<'a, super::Message>> = Vec::new();
+        if state.add == AddState::Added {
+            items.push(card::menu_item(
+                "trash",
+                "Remove from library",
+                super::Message::RemoveSeriesFromLibrary(item.external_id.clone()),
+            ));
+        }
+        card::menu(items)
+    }
+
+    /// The shade laid over a hovered series cover, with its actions side by
+    /// side: adding all of its volumes/chapters to the Library, and opening it.
+    fn cover_actions<'a>(
+        item: &CollectionItem,
+        add_state: AddState,
+    ) -> Element<'a, super::Message> {
+        let add = match add_state {
+            AddState::Available => cover_overlay::action(
+                "circle-plus",
+                "Add to library",
+                Some(super::Message::AddSeriesToLibrary(item.external_id.clone())),
+            ),
+            AddState::Adding => cover_overlay::action("download", "Adding…", None),
+            AddState::Added => cover_overlay::action("circle-check", "In library", None),
+        };
+        let open = cover_overlay::action(
+            "folder-open",
+            "Open",
+            Some(super::Message::SeriesSelected(item.external_id.clone())),
+        );
+
+        cover_overlay::shade(vec![add, open], border::top(COVER_RADIUS))
+    }
+
+    /// A series' title, as a link to the series: plain text that takes the
+    /// primary color while hovered.
+    fn title_link<'a>(item: &'a CollectionItem) -> Element<'a, super::Message> {
+        // A title too long for the card is cut off (by the bar), not wrapped.
+        button(text(&item.name).size(13).wrapping(text::Wrapping::None))
+            .on_press(super::Message::SeriesSelected(item.external_id.clone()))
+            .padding(0)
+            .width(Shrink)
+            .style(|theme: &Theme, status| {
+                let palette = theme.extended_palette();
+                let text_color = match status {
+                    button::Status::Hovered | button::Status::Pressed => palette.primary.base.color,
+                    _ => palette.background.weak.text,
+                };
+
+                button::Style {
+                    text_color,
+                    ..button::Style::default()
+                }
+            })
             .into()
     }
 
@@ -893,17 +1182,24 @@ mod view_helper {
     /// because it was scrolled far off-screen; keeps the grid's item count
     /// (and thus its scroll geometry) stable.
     fn evicted_card<'a>() -> Element<'a, super::Message> {
-        container(thumbnail(None)).width(Fill).height(Fill).into()
+        container(thumbnail(None, COVER_RADIUS.into()))
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     /// Renders an item's cover if it has loaded, otherwise the same styled
     /// grey box used as a placeholder (and for evicted items).
-    fn thumbnail<'a>(handle: Option<&image::Handle>) -> Element<'a, super::Message> {
+    fn thumbnail<'a>(
+        handle: Option<&image::Handle>,
+        radius: border::Radius,
+    ) -> Element<'a, super::Message> {
         let inner: Element<'a, super::Message> = match handle {
             Some(handle) => image(handle.clone())
                 .width(Fill)
                 .height(Fill)
                 .content_fit(ContentFit::Cover)
+                .border_radius(radius)
                 .into(),
             None => row![].into(),
         };
@@ -912,12 +1208,12 @@ mod view_helper {
             .width(Fill)
             .height(Fill)
             .clip(true)
-            .style(|theme: &Theme| container::Style {
+            .style(move |theme: &Theme| container::Style {
                 background: Some(Background::Color(
                     theme.extended_palette().background.strong.color,
                 )),
                 border: Border {
-                    radius: 8.0.into(),
+                    radius,
                     ..Border::default()
                 },
                 ..container::Style::default()
@@ -987,6 +1283,10 @@ mod tests {
             pagination,
             covers: HashMap::new(),
             covers_in_flight: HashSet::new(),
+            adding_series: HashSet::new(),
+            library_series: HashSet::new(),
+            add_error: None,
+            menu: None,
         }
     }
 
@@ -1151,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_an_item_card_sends_series_selected() {
+    fn clicking_a_series_title_sends_series_selected() {
         let browse = browse(
             AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
             Some(pagination(true, false)),
@@ -1166,6 +1466,215 @@ mod tests {
             messages,
             vec![Message::SeriesSelected("One Piece".to_string())]
         );
+    }
+
+    #[test]
+    fn hovering_a_cover_offers_to_add_the_series_or_open_it() {
+        let browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", Some(42)))]),
+            Some(pagination(true, false)),
+        );
+
+        let mut ui = simulator(browse.view());
+        let _ = ui
+            .click("Add to library")
+            .expect("the add action should be found");
+        let _ = ui.click("Open").expect("the open action should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::AddSeriesToLibrary("One Piece".to_string()),
+                Message::SeriesSelected("One Piece".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_a_series_saves_it_once_and_records_the_result() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+
+        // The task isn't run here, so nothing is saved.
+        assert!(matches!(
+            browse.update(Message::AddSeriesToLibrary("One Piece".to_string())),
+            Action::Run(_)
+        ));
+        assert_eq!(browse.add_state("One Piece"), AddState::Adding);
+        // A second click while it's saved does nothing.
+        assert!(matches!(
+            browse.update(Message::AddSeriesToLibrary("One Piece".to_string())),
+            Action::None
+        ));
+
+        let _ = browse.update(Message::SeriesAddedToLibrary(
+            "One Piece".to_string(),
+            Ok(3),
+        ));
+        assert_eq!(browse.add_state("One Piece"), AddState::Added);
+
+        let mut ui = simulator(browse.view());
+        assert!(ui.find("In library").is_ok());
+        assert!(ui.find("Add to library").is_err());
+    }
+
+    #[test]
+    fn adding_an_unknown_series_does_nothing() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+
+        let action = browse.update(Message::AddSeriesToLibrary("Berserk".to_string()));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(browse.add_state("Berserk"), AddState::Available);
+    }
+
+    #[test]
+    fn a_failed_series_add_is_reported_and_can_be_retried() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::AddSeriesToLibrary("One Piece".to_string()));
+
+        let _ = browse.update(Message::SeriesAddedToLibrary(
+            "One Piece".to_string(),
+            Err("offline".to_string()),
+        ));
+
+        assert_eq!(browse.add_state("One Piece"), AddState::Available);
+        let mut ui = simulator(browse.view());
+        assert!(ui.find("Could not add to library: offline").is_ok());
+    }
+
+    #[test]
+    fn series_already_in_the_library_show_as_in_it_with_a_menu() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![
+                Some(collection_item("One Piece", None)),
+                Some(collection_item("Berserk", None)),
+            ]),
+            Some(pagination(false, false)),
+        );
+
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+
+        assert_eq!(browse.add_state("One Piece"), AddState::Added);
+        assert_eq!(browse.add_state("Berserk"), AddState::Available);
+        assert!(view_helper::has_menu(browse.card_state("One Piece")));
+        // Re-adding a series that's in the Library isn't offered.
+        assert!(matches!(
+            browse.update(Message::AddSeriesToLibrary("One Piece".to_string())),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn the_menu_toggles_and_closes_on_a_click_elsewhere() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+        assert!(browse.card_state("One Piece").menu_open);
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+        assert!(!browse.card_state("One Piece").menu_open);
+
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+        let _ = browse.update(Message::MenuDismissed);
+        assert!(!browse.card_state("One Piece").menu_open);
+    }
+
+    #[test]
+    fn the_open_menu_offers_to_remove_the_series() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+
+        let mut ui = simulator(browse.view());
+        assert!(ui.find("Remove from library").is_err());
+        drop(ui);
+
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+        let mut ui = simulator(browse.view());
+        let _ = ui
+            .click("Remove from library")
+            .expect("the remove item should be found");
+        let messages: Vec<_> = ui.into_messages().collect();
+
+        assert!(messages.contains(&Message::RemoveSeriesFromLibrary("One Piece".to_string())));
+    }
+
+    #[test]
+    fn removing_a_series_from_the_library_offers_adding_it_again() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+        let _ = browse.update(Message::MenuToggled("One Piece".to_string()));
+
+        // The task isn't run here, so nothing is removed.
+        assert!(matches!(
+            browse.update(Message::RemoveSeriesFromLibrary("One Piece".to_string())),
+            Action::Run(_)
+        ));
+        assert!(!browse.card_state("One Piece").menu_open);
+
+        let _ = browse.update(Message::SeriesRemovedFromLibrary(
+            "One Piece".to_string(),
+            Ok(3),
+        ));
+        assert_eq!(browse.add_state("One Piece"), AddState::Available);
+    }
+
+    #[test]
+    fn a_failed_removal_is_reported_and_keeps_the_series() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+        let _ = browse.update(Message::LibrarySeriesLoaded(Ok(vec![
+            "One Piece".to_string(),
+        ])));
+
+        let _ = browse.update(Message::SeriesRemovedFromLibrary(
+            "One Piece".to_string(),
+            Err("locked".to_string()),
+        ));
+
+        assert_eq!(browse.add_state("One Piece"), AddState::Added);
+        let mut ui = simulator(browse.view());
+        assert!(ui.find("Could not remove from library: locked").is_ok());
+    }
+
+    #[test]
+    fn removing_a_series_not_in_the_library_does_nothing() {
+        let mut browse = browse(
+            AsyncModel::Loaded(vec![Some(collection_item("One Piece", None))]),
+            Some(pagination(false, false)),
+        );
+
+        let action = browse.update(Message::RemoveSeriesFromLibrary("One Piece".to_string()));
+
+        assert!(matches!(action, Action::None));
     }
 
     #[test]

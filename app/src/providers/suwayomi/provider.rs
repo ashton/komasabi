@@ -125,6 +125,11 @@ impl SuwayomiProvider {
 }
 
 impl Provider for SuwayomiProvider {
+    /// Entries carry the user's read state on the server.
+    fn tracks_reading_progress(&self) -> bool {
+        true
+    }
+
     async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         self.list_collections().await
     }

@@ -367,6 +367,11 @@ fn chapter_pages(chapter_id: u16, pages: u16) -> Vec<PageRef> {
 /// [`ResolvedProvider`](crate::providers::ResolvedProvider) treat every backend
 /// uniformly.
 impl Provider for KavitaProvider {
+    /// Entries carry the user's read state on the server.
+    fn tracks_reading_progress(&self) -> bool {
+        true
+    }
+
     async fn list_collections(&self) -> Result<Vec<Collection>, String> {
         self.list_collections().await
     }

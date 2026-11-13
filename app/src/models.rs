@@ -1,7 +1,6 @@
 pub mod collection;
 pub mod collection_item;
 pub mod integration;
-pub mod library;
 pub mod library_item;
 pub mod series_entry;
 
