@@ -46,7 +46,11 @@ fn database_url() -> ConnectionResult<String> {
 }
 
 fn data_dir() -> Option<PathBuf> {
-    Some(ProjectDirs::from("", "", "komasabi")?.data_dir().to_path_buf())
+    Some(
+        ProjectDirs::from("", "", "komasabi")?
+            .data_dir()
+            .to_path_buf(),
+    )
 }
 
 #[cfg(test)]

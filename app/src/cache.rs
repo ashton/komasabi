@@ -67,14 +67,15 @@ fn file_name(key: &str) -> String {
 fn escape(key: &str) -> String {
     use std::fmt::Write;
 
-    key.bytes().fold(String::with_capacity(key.len()), |mut out, byte| {
-        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
-            out.push(char::from(byte));
-        } else {
-            let _ = write!(out, "%{byte:02X}");
-        }
-        out
-    })
+    key.bytes()
+        .fold(String::with_capacity(key.len()), |mut out, byte| {
+            if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
+                out.push(char::from(byte));
+            } else {
+                let _ = write!(out, "%{byte:02X}");
+            }
+            out
+        })
 }
 
 /// 64-bit FNV-1a: tiny, and stable across Rust versions and runs (unlike
