@@ -47,12 +47,21 @@ enum Step {
 #[derive(Debug)]
 pub struct Integrations {
     step: Step,
+    /// The id of the source whose removal is waiting to be confirmed, if any.
+    confirming_removal: Option<String>,
+    /// Whether a removal is running, so it isn't asked for twice.
+    removing: bool,
+    /// The last removal failure, shown above the list until the next attempt.
+    error: Option<String>,
 }
 
 impl Default for Integrations {
     fn default() -> Self {
         Self {
             step: Step::List(AsyncModel::Loading),
+            confirming_removal: None,
+            removing: false,
+            error: None,
         }
     }
 }
@@ -64,6 +73,15 @@ pub enum Message {
     TypeSelected(IntegrationType),
     /// A source in the list was clicked; carries its id.
     SourceSelected(String),
+    /// A source's remove button was pressed (by id): ask to confirm.
+    RemovePressed(String),
+    /// The removal waiting to be confirmed was cancelled.
+    RemoveCancelled,
+    /// The removal of a source (by id) was confirmed: remove it, and the items
+    /// added from it to the Library.
+    RemoveConfirmed(String),
+    /// A source was removed, or failed to be.
+    Removed(Result<(), String>),
     LocalFolder(local_folder::Message),
     #[cfg(feature = "kavita")]
     Kavita(kavita::Message),
@@ -104,6 +122,36 @@ impl Integrations {
             }
 
             Message::SourceSelected(integration_id) => Action::OpenSource(integration_id),
+
+            Message::RemovePressed(integration_id) => {
+                self.error = None;
+                self.confirming_removal = Some(integration_id);
+                Action::None
+            }
+            Message::RemoveCancelled => {
+                self.confirming_removal = None;
+                Action::None
+            }
+            Message::RemoveConfirmed(integration_id) => {
+                if self.removing || self.confirming_removal.as_ref() != Some(&integration_id) {
+                    return Action::None;
+                }
+                self.removing = true;
+
+                Action::Run(Task::perform(
+                    integration_repository::remove(integration_id),
+                    Message::Removed,
+                ))
+            }
+            Message::Removed(result) => {
+                self.removing = false;
+                self.confirming_removal = None;
+                if let Err(error) = result {
+                    tracing::debug!("failed to remove the source: {error}");
+                    self.error = Some(format!("Could not remove the source: {error}"));
+                }
+                self.reload_list()
+            }
 
             Message::TypeSelected(IntegrationType::LocalFolder) => {
                 self.step = Step::LocalFolder(LocalFolder::default());
@@ -221,7 +269,12 @@ impl Integrations {
 
     pub fn view<'a>(&'a self) -> Element<'a, Message> {
         match &self.step {
-            Step::List(AsyncModel::Loaded(integrations)) => view_helper::list(integrations),
+            Step::List(AsyncModel::Loaded(integrations)) => view_helper::list(
+                integrations,
+                self.confirming_removal.as_deref(),
+                self.removing,
+                self.error.as_deref(),
+            ),
             Step::List(_) => container(iced::widget::row![]).into(),
             Step::ChooseType => view_helper::choose_type(),
             Step::LocalFolder(form) => form.view().map(Message::LocalFolder),
@@ -249,20 +302,35 @@ mod view_helper {
     };
     use iced_font_awesome::fa_icon_solid;
 
-    pub fn list<'a>(integrations: &'a [IntegrationModel]) -> Element<'a, Message> {
-        if integrations.is_empty() {
+    pub fn list<'a>(
+        integrations: &'a [IntegrationModel],
+        confirming_removal: Option<&str>,
+        removing: bool,
+        error: Option<&'a str>,
+    ) -> Element<'a, Message> {
+        if integrations.is_empty() && error.is_none() {
             return empty_list();
         }
 
-        let rows = integrations.iter().map(integration_row);
-
-        container(
-            column![
-                add_integration_button(),
-                touch_scroll(scrollable(column(rows).spacing(8)).height(Fill))
+        let rows = integrations.iter().map(|integration| {
+            let confirming = confirming_removal == Some(integration.id.as_str());
+            row![
+                integration_row(integration),
+                removal_controls(integration, confirming, removing),
             ]
-            .spacing(20),
-        )
+            .spacing(8)
+            .align_y(Center)
+            .into()
+        });
+
+        let mut content = column![add_integration_button()].spacing(20);
+        if let Some(error) = error {
+            content = content.push(text(error).size(13));
+        }
+
+        container(content.push(touch_scroll(
+            scrollable(column(rows).spacing(8)).height(Fill),
+        )))
         .width(Fill)
         .height(Fill)
         .padding(20)
@@ -321,6 +389,43 @@ mod view_helper {
                 ..button::Style::default()
             }
         })
+        .into()
+    }
+
+    /// Beside a source's row: a trash button, or, once pressed, the question
+    /// whether to remove the source, with buttons to confirm or cancel.
+    fn removal_controls<'a>(
+        integration: &IntegrationModel,
+        confirming: bool,
+        removing: bool,
+    ) -> Element<'a, Message> {
+        if !confirming {
+            return button(
+                fa_icon_solid("trash")
+                    .size(14.0_f32)
+                    .style(|theme: &Theme| text::Style {
+                        color: Some(theme.extended_palette().background.base.text),
+                    }),
+            )
+            .on_press(Message::RemovePressed(integration.id.clone()))
+            .padding([10, 12])
+            .style(button::text)
+            .into();
+        }
+
+        row![
+            text("Remove it and its library items?").size(13),
+            button(text(if removing { "Removing…" } else { "Remove" }))
+                .on_press_maybe(
+                    (!removing).then(|| Message::RemoveConfirmed(integration.id.clone()))
+                )
+                .style(button::danger),
+            button(text("Cancel"))
+                .on_press_maybe((!removing).then_some(Message::RemoveCancelled))
+                .style(button::secondary),
+        ]
+        .spacing(8)
+        .align_y(Center)
         .into()
     }
 
@@ -454,6 +559,7 @@ mod tests {
     fn view_renders_empty_container_while_not_loaded() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loading),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -465,6 +571,7 @@ mod tests {
     fn view_renders_call_to_action_when_loaded_without_integrations() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loaded(vec![])),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -476,6 +583,7 @@ mod tests {
     fn view_renders_integration_names_when_loaded() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -491,6 +599,7 @@ mod tests {
                     .map(|index| integration_model(&format!("Integration {index}")))
                     .collect(),
             )),
+            ..Integrations::default()
         };
 
         let mut ui = iced_test::Simulator::with_size(
@@ -517,6 +626,7 @@ mod tests {
     fn view_renders_add_integration_button_when_integrations_exist() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -533,6 +643,7 @@ mod tests {
     fn clicking_add_integration_sends_add_integration_pressed_message() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loaded(vec![])),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -549,6 +660,7 @@ mod tests {
     fn clicking_a_source_sends_source_selected() {
         let integrations = Integrations {
             step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -558,6 +670,91 @@ mod tests {
             ui.into_messages().collect::<Vec<_>>(),
             vec![Message::SourceSelected("id".to_string())]
         );
+    }
+
+    #[test]
+    fn removing_a_source_asks_to_confirm_first() {
+        let integrations = Integrations {
+            step: Step::List(AsyncModel::Loaded(vec![integration_model("My Kavita")])),
+            ..Integrations::default()
+        };
+        let mut ui = simulator(integrations.view());
+        assert!(ui.find("Remove").is_err());
+        drop(ui);
+
+        let mut integrations = integrations;
+        assert!(matches!(
+            integrations.update(Message::RemovePressed("id".to_string())),
+            Action::None
+        ));
+
+        let mut ui = simulator(integrations.view());
+        let _ = ui
+            .click("Remove")
+            .expect("the confirm button should be found");
+        let _ = ui
+            .click("Cancel")
+            .expect("the cancel button should be found");
+        assert_eq!(
+            ui.into_messages().collect::<Vec<_>>(),
+            vec![
+                Message::RemoveConfirmed("id".to_string()),
+                Message::RemoveCancelled
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelling_a_removal_removes_nothing() {
+        let mut integrations = Integrations::default();
+        let _ = integrations.update(Message::RemovePressed("id".to_string()));
+
+        let _ = integrations.update(Message::RemoveCancelled);
+
+        assert_eq!(integrations.confirming_removal, None);
+        // Nothing to confirm any more.
+        assert!(matches!(
+            integrations.update(Message::RemoveConfirmed("id".to_string())),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn a_confirmed_removal_runs_once_then_reloads_the_list() {
+        let mut integrations = Integrations::default();
+        let _ = integrations.update(Message::RemovePressed("id".to_string()));
+
+        assert!(matches!(
+            integrations.update(Message::RemoveConfirmed("id".to_string())),
+            Action::Run(_)
+        ));
+        assert!(matches!(
+            integrations.update(Message::RemoveConfirmed("id".to_string())),
+            Action::None
+        ));
+
+        assert!(matches!(
+            integrations.update(Message::Removed(Ok(()))),
+            Action::Run(_)
+        ));
+        assert!(!integrations.removing);
+        assert_eq!(integrations.confirming_removal, None);
+        assert!(matches!(integrations.step, Step::List(AsyncModel::Loading)));
+    }
+
+    #[test]
+    fn a_failed_removal_is_reported() {
+        let mut integrations = Integrations::default();
+        let _ = integrations.update(Message::RemovePressed("id".to_string()));
+        let _ = integrations.update(Message::RemoveConfirmed("id".to_string()));
+
+        let _ = integrations.update(Message::Removed(Err("locked".to_string())));
+        let _ = integrations.update(Message::IntegrationsLoaded(Ok(vec![integration_model(
+            "My Kavita",
+        )])));
+
+        let mut ui = simulator(integrations.view());
+        assert!(ui.find("Could not remove the source: locked").is_ok());
     }
 
     #[test]
@@ -573,6 +770,7 @@ mod tests {
     fn view_choose_type_always_offers_local_folders() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -600,6 +798,7 @@ mod tests {
     fn update_local_folder_created_returns_to_the_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::LocalFolder(LocalFolder::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::LocalFolder(local_folder::Message::Created(Ok(
@@ -625,6 +824,7 @@ mod tests {
     fn view_choose_type_renders_kavita_option() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -637,6 +837,7 @@ mod tests {
     fn clicking_kavita_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -666,6 +867,7 @@ mod tests {
     fn clicking_opds_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -692,6 +894,7 @@ mod tests {
     fn update_opds_back_pressed_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Opds(Opds::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Opds(opds::Message::BackPressed));
@@ -705,6 +908,7 @@ mod tests {
     fn update_opds_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Opds(Opds::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Opds(opds::Message::Created(Ok(
@@ -720,6 +924,7 @@ mod tests {
     fn clicking_komga_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -749,6 +954,7 @@ mod tests {
     fn update_komga_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Komga(Komga::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Komga(komga::Message::Created(Ok(
@@ -764,6 +970,7 @@ mod tests {
     fn clicking_suwayomi_square_sends_type_selected_message() {
         let integrations = Integrations {
             step: Step::ChooseType,
+            ..Integrations::default()
         };
 
         let mut ui = simulator(integrations.view());
@@ -795,6 +1002,7 @@ mod tests {
     fn update_suwayomi_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Suwayomi(Suwayomi::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Suwayomi(suwayomi::Message::Created(Ok(
@@ -810,6 +1018,7 @@ mod tests {
     fn update_kavita_back_pressed_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Kavita(Kavita::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Kavita(kavita::Message::BackPressed));
@@ -823,6 +1032,7 @@ mod tests {
     fn update_kavita_created_returns_to_list_and_reloads() {
         let mut integrations = Integrations {
             step: Step::Kavita(Kavita::default()),
+            ..Integrations::default()
         };
 
         let action = integrations.update(Message::Kavita(kavita::Message::Created(Ok(

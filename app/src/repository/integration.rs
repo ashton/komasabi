@@ -131,3 +131,31 @@ async fn insert(new_integration: Integration) -> Result<Integration, String> {
 
     Ok(new_integration)
 }
+
+/// Removes the source `source_id`, along with the items added from it to
+/// the Library, which can't be read without it. Both go in one transaction.
+pub async fn remove(source_id: String) -> Result<(), String> {
+    use crate::schema::{integrations, library_items};
+    use diesel_async::AsyncConnection;
+    use diesel_async::scoped_futures::ScopedFutureExt;
+
+    let mut conn = database::connect()
+        .await
+        .map_err(crate::error::log_and_stringify)?;
+    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        async move {
+            diesel::delete(
+                library_items::table.filter(library_items::integration_id.eq(&source_id)),
+            )
+            .execute(conn)
+            .await?;
+            diesel::delete(integrations::table.filter(integrations::id.eq(&source_id)))
+                .execute(conn)
+                .await?;
+            Ok(())
+        }
+        .scope_boxed()
+    })
+    .await
+    .map_err(crate::error::log_and_stringify)
+}

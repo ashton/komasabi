@@ -122,7 +122,9 @@ series (items) → a series' entries (volumes/chapters) → the reader:
 1. `screen/integration.rs` lists the sources and collects a new one's details through a `Step` state
    machine (`List` → `ChooseType` → a per-type form under `screen/integration/`, e.g. `Kavita`,
    `LocalFolder`). Saving stores only the `integrations` row (a local folder's path goes in its
-   `folder` column). Nothing is synced or copied: collections aren't stored anywhere.
+   `folder` column). Nothing is synced or copied: collections aren't stored anywhere. Each row's trash
+   button asks to confirm inline, then `repository::integration::remove` deletes the source and its
+   Library items in one transaction.
 2. Clicking a source opens `screen/collections.rs`, which resolves the source's provider
    (`providers::provider_for_integration`) and calls `Provider::list_collections` live. A
    **collection** (`models::collection::Collection`) is anything in a source that gathers series: a
